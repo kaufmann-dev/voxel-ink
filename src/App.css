@@ -175,6 +175,11 @@ button:disabled {
   background: #72343a;
 }
 
+.button-danger:hover:not(:disabled) {
+  border-color: #c86067;
+  background: #8c3f46;
+}
+
 .icon-button {
   width: 36px;
   padding: 0;
