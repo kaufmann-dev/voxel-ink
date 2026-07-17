@@ -20,6 +20,13 @@ interface FocusResult {
   readonly error: string | null;
 }
 
+interface EditFeedbackResult {
+  readonly dirty: boolean;
+  readonly feedbackMs: number;
+  readonly responsiveMs: number;
+  readonly error: string | null;
+}
+
 describe("VoxelInk native shell", () => {
   it("opens the editor and navigates the prepared reference volume at 30 fps", async () => {
     const app = browser.$("[data-testid='voxel-editor']");
@@ -121,4 +128,44 @@ describe("VoxelInk native shell", () => {
     );
     assert.ok(result.fps >= 30, `Expected at least 30 fps, observed ${result.fps.toFixed(2)} fps`);
   }).timeout(180_000);
+
+  it("keeps brush feedback responsive while the 3D mesh catches up", async () => {
+    const result = await browser.executeAsync<EditFeedbackResult, []>((done) => {
+      const brush = [...document.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent === "Brush");
+      const axial = document.querySelector<HTMLCanvasElement>("[aria-label='Axial slice']");
+      const save = [...document.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent === "Save");
+      if (!brush || !axial || !save) {
+        done({ dirty: false, feedbackMs: 0, responsiveMs: 0, error: "Brush controls are missing" });
+        return;
+      }
+
+      brush.click();
+      axial.focus();
+      requestAnimationFrame(() => {
+        const started = performance.now();
+        let feedbackMs = Number.POSITIVE_INFINITY;
+        requestAnimationFrame(() => { feedbackMs = performance.now() - started; });
+        axial.dispatchEvent(new KeyboardEvent("keydown", {
+          key: " ",
+          bubbles: true,
+          cancelable: true,
+        }));
+        window.setTimeout(() => {
+          done({
+            dirty: !save.disabled,
+            feedbackMs,
+            responsiveMs: performance.now() - started,
+            error: null,
+          });
+        }, 250);
+      });
+    });
+
+    assert.equal(result.error, null);
+    assert.equal(result.dirty, true, "The brush edit did not update the document");
+    assert.ok(result.feedbackMs < 100, `Expected edit feedback under 100 ms, observed ${result.feedbackMs.toFixed(1)} ms`);
+    assert.ok(result.responsiveMs < 1_000, `The UI stopped responding after the brush edit for ${result.responsiveMs.toFixed(1)} ms`);
+  }).timeout(30_000);
 });

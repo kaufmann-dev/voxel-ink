@@ -55,4 +55,5 @@ export function installWdioReferenceFixture(): void {
     extension: ".binvox",
     size: occupancy.byteLength,
   });
+  useEditorStore.getState().setCursor([450, 450, 127]);
 }

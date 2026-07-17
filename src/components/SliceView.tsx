@@ -229,6 +229,41 @@ export function SliceView({ axis, label, shortLabel }: SliceViewProps) {
     cancelStroke();
   };
 
+  useEffect(() => {
+    const finishWindowStroke = (event: globalThis.PointerEvent) => {
+      if (activePointer.current !== event.pointerId) return;
+      activePointer.current = null;
+      previousCoordinate.current = null;
+      finishStroke();
+    };
+    const cancelWindowStroke = (event: globalThis.PointerEvent) => {
+      if (activePointer.current !== event.pointerId) return;
+      activePointer.current = null;
+      previousCoordinate.current = null;
+      cancelStroke();
+    };
+    const cancelInterruptedStroke = () => {
+      if (activePointer.current === null) return;
+      activePointer.current = null;
+      previousCoordinate.current = null;
+      cancelStroke();
+    };
+    const handleVisibilityChange = () => {
+      if (window.document.visibilityState !== "visible") cancelInterruptedStroke();
+    };
+
+    window.addEventListener("pointerup", finishWindowStroke, true);
+    window.addEventListener("pointercancel", cancelWindowStroke, true);
+    window.addEventListener("blur", cancelInterruptedStroke);
+    window.document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      window.removeEventListener("pointerup", finishWindowStroke, true);
+      window.removeEventListener("pointercancel", cancelWindowStroke, true);
+      window.removeEventListener("blur", cancelInterruptedStroke);
+      window.document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [cancelStroke, finishStroke]);
+
   const handleKeyDown = (event: KeyboardEvent<HTMLCanvasElement>) => {
     if (busy || strokeActive) {
       if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "PageUp", "PageDown", " ", "Enter"].includes(event.key)) {
