@@ -436,6 +436,13 @@ impl VolumeDocument {
         Ok(changed)
     }
 
+    #[must_use]
+    pub(crate) fn active_stroke_indices(&self) -> Option<&[u32]> {
+        self.active_stroke
+            .as_ref()
+            .map(|stroke| stroke.indices.as_slice())
+    }
+
     pub fn finish_stroke(&mut self) -> Option<u64> {
         let stroke = self.active_stroke.take()?;
         if stroke.indices.is_empty() {

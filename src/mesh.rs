@@ -213,14 +213,15 @@ impl ChunkInput {
     }
 
     fn occupied(&self, local: [i32; 3]) -> bool {
-        debug_assert!(
-            local
-                .iter()
-                .zip(self.extent)
-                .all(|(&coordinate, extent)| (-1..=extent.cast_signed()).contains(&coordinate))
-        );
-        let halo = local.map(|coordinate| (coordinate + HALO_WIDTH.cast_signed()).cast_unsigned());
-        self.occupancy[halo_index(self.halo_dimensions, halo)] != 0
+        debug_assert!(local[0] >= -1 && local[0] <= self.extent[0] as i32);
+        debug_assert!(local[1] >= -1 && local[1] <= self.extent[1] as i32);
+        debug_assert!(local[2] >= -1 && local[2] <= self.extent[2] as i32);
+        let x = (local[0] + HALO_WIDTH as i32) as usize;
+        let y = (local[1] + HALO_WIDTH as i32) as usize;
+        let z = (local[2] + HALO_WIDTH as i32) as usize;
+        let width = self.halo_dimensions[0] as usize;
+        let plane = width * self.halo_dimensions[1] as usize;
+        self.occupancy[x + width * y + plane * z] != 0
     }
 }
 
@@ -367,10 +368,17 @@ impl CompactQuad {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MeshUpdatePriority {
+    Background,
+    Live,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct MeshJobTag {
     pub document_epoch: u64,
     pub revision: u64,
     pub chunk_generation: u64,
+    pub edit_generation: u64,
     pub chunk: ChunkCoord,
 }
 
@@ -507,20 +515,20 @@ fn mesh_axis(
             plane,
         };
         let active_mask = &mut mask[..u_extent * v_extent];
-        fill_face_mask(input, layout, active_mask)?;
+        fill_face_mask(input, layout, active_mask);
         emit_greedy_quads(input, layout, active_mask, quads, exposed_voxel_faces)?;
     }
     Ok(())
 }
 
-fn fill_face_mask(input: &ChunkInput, layout: PlaneLayout, mask: &mut [i8]) -> Result<()> {
+fn fill_face_mask(input: &ChunkInput, layout: PlaneLayout, mask: &mut [i8]) {
     mask.fill(0);
     for v in 0..layout.v_extent {
         for u in 0..layout.u_extent {
             let mut positive_voxel = [0_i32; 3];
-            positive_voxel[layout.normal_axis_index] = chunk_i32(layout.plane)?;
-            positive_voxel[layout.u_axis] = chunk_i32(u)?;
-            positive_voxel[layout.v_axis] = chunk_i32(v)?;
+            positive_voxel[layout.normal_axis_index] = layout.plane as i32;
+            positive_voxel[layout.u_axis] = u as i32;
+            positive_voxel[layout.v_axis] = v as i32;
             let mut negative_voxel = positive_voxel;
             negative_voxel[layout.normal_axis_index] -= 1;
             let occupied_negative = input.occupied(negative_voxel);
@@ -535,7 +543,6 @@ fn fill_face_mask(input: &ChunkInput, layout: PlaneLayout, mask: &mut [i8]) -> R
             };
         }
     }
-    Ok(())
 }
 
 fn emit_greedy_quads(
@@ -600,11 +607,6 @@ fn emit_greedy_quads(
         v += 1;
     }
     Ok(())
-}
-
-fn chunk_i32(value: usize) -> Result<i32> {
-    i32::try_from(value)
-        .map_err(|_| AppError::InvalidDimensions("chunk coordinate exceeds i32".into()))
 }
 
 fn chunk_u32(value: usize) -> Result<u32> {
@@ -847,6 +849,7 @@ pub struct MeshMemoryBudget {
     cap: usize,
     used: usize,
     chunks: HashMap<ChunkCoord, usize>,
+    reservations: HashMap<ChunkCoord, usize>,
 }
 
 impl Default for MeshMemoryBudget {
@@ -862,6 +865,7 @@ impl MeshMemoryBudget {
             cap: cap_bytes,
             used: 0,
             chunks: HashMap::new(),
+            reservations: HashMap::new(),
         }
     }
 
@@ -893,20 +897,23 @@ impl MeshMemoryBudget {
         replacement_bytes: usize,
     ) -> std::result::Result<(), MeshBudgetError> {
         let previous_bytes = self.chunks.get(&chunk).copied().unwrap_or(0);
-        let retained_bytes = self.used - previous_bytes;
+        let reserved_bytes = self.reservations.get(&chunk).copied().unwrap_or(0);
+        let previous_accounted = previous_bytes.max(reserved_bytes);
+        let replacement_accounted = replacement_bytes.max(reserved_bytes);
+        let retained_bytes = self.used - previous_accounted;
         let next_bytes =
             retained_bytes
-                .checked_add(replacement_bytes)
+                .checked_add(replacement_accounted)
                 .ok_or(MeshBudgetError::Limit {
                     cap_bytes: self.cap,
                     retained_bytes,
-                    replacement_bytes,
+                    replacement_bytes: replacement_accounted,
                 })?;
         if next_bytes > self.cap {
             return Err(MeshBudgetError::Limit {
                 cap_bytes: self.cap,
                 retained_bytes,
-                replacement_bytes,
+                replacement_bytes: replacement_accounted,
             });
         }
         if replacement_bytes == 0 {
@@ -921,6 +928,40 @@ impl MeshMemoryBudget {
         }
         self.used = next_bytes;
         Ok(())
+    }
+
+    /// Reserves the currently resident byte count as a rollback floor.
+    /// Repeated reservations preserve the first pre-edit value.
+    pub fn reserve_current_if_absent(
+        &mut self,
+        chunk: ChunkCoord,
+    ) -> std::result::Result<(), MeshBudgetError> {
+        if self.reservations.contains_key(&chunk) {
+            return Ok(());
+        }
+        self.reservations
+            .try_reserve(1)
+            .map_err(|_| MeshBudgetError::Allocation)?;
+        let current = self.chunks.get(&chunk).copied().unwrap_or(0);
+        self.reservations.insert(chunk, current);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn reserved_bytes(&self, chunk: ChunkCoord) -> Option<usize> {
+        self.reservations.get(&chunk).copied()
+    }
+
+    pub fn release_reservation(&mut self, chunk: ChunkCoord) -> Option<usize> {
+        let reservation = self.reservations.remove(&chunk)?;
+        let actual = self.chunks.get(&chunk).copied().unwrap_or(0);
+        self.used -= reservation.saturating_sub(actual);
+        Some(reservation)
+    }
+
+    pub fn clear_reservations(&mut self) {
+        self.reservations.clear();
+        self.used = self.chunks.values().copied().sum();
     }
 
     /// Accounts for the compact GPU instances in a replacement chunk mesh.
@@ -959,12 +1000,14 @@ impl MeshMemoryBudget {
 
     pub fn remove(&mut self, chunk: ChunkCoord) -> usize {
         let removed = self.chunks.remove(&chunk).unwrap_or(0);
-        self.used -= removed;
+        let reserved = self.reservations.get(&chunk).copied().unwrap_or(0);
+        self.used -= removed.saturating_sub(reserved);
         removed
     }
 
     pub fn clear(&mut self) {
         self.chunks.clear();
+        self.reservations.clear();
         self.used = 0;
     }
 }
@@ -988,6 +1031,7 @@ mod tests {
             document_epoch: 7,
             revision: 11,
             chunk_generation: 3,
+            edit_generation: 0,
             chunk,
         }
     }
@@ -1304,5 +1348,26 @@ mod tests {
         assert_eq!(budget.remaining_bytes(), 60);
         assert_eq!(budget.remove(chunk), 40);
         assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn mesh_budget_reservation_preserves_rollback_capacity() {
+        let edited = ChunkCoord::new(0, 0, 0);
+        let background = ChunkCoord::new(1, 0, 0);
+        let mut budget = MeshMemoryBudget::new(150);
+        budget.try_replace(edited, 100).unwrap();
+        budget.reserve_current_if_absent(edited).unwrap();
+
+        budget.try_replace(edited, 40).unwrap();
+        assert_eq!(budget.used_bytes(), 100);
+        assert!(matches!(
+            budget.try_replace(background, 60),
+            Err(MeshBudgetError::Limit { .. })
+        ));
+
+        assert_eq!(budget.release_reservation(edited), Some(100));
+        assert_eq!(budget.used_bytes(), 40);
+        budget.try_replace(background, 60).unwrap();
+        assert_eq!(budget.used_bytes(), 100);
     }
 }

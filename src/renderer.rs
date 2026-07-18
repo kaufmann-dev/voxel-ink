@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -13,7 +13,7 @@ use wgpu::util::DeviceExt;
 
 use crate::{
     brush::Ray,
-    mesh::{ChunkCoord, CompactQuad, MeshJobTag},
+    mesh::{ChunkCoord, CompactQuad, MeshJobTag, MeshUpdatePriority},
     volume::Matrix4,
 };
 
@@ -24,6 +24,8 @@ struct Uniforms {
     world_to_view: mat4x4<f32>,
     index_normal_to_view: mat4x4<f32>,
     material_color: vec4<f32>,
+    near_surface_depth: f32,
+    inverse_scene_depth_span: f32,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -95,7 +97,9 @@ fn vertex_main(
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let view_direction = normalize(-input.view_position);
     var normal = normalize(input.view_normal);
-    if (dot(normal, view_direction) < 0.0) {
+    let geometric_back_facing = dot(normal, view_direction) < 0.0;
+    let surface_factor = select(1.0, 0.68, geometric_back_facing);
+    if (geometric_back_facing) {
         normal = -normal;
     }
 
@@ -107,22 +111,32 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let facing = clamp(dot(normal, view_direction), 0.0, 1.0);
     let rim = (1.0 - facing) * (1.0 - facing);
     let sky = normal.y * 0.5 + 0.5;
-    let lighting = clamp(
-        0.22 + 0.52 * key + 0.22 * fill + 0.10 * sky + 0.18 * rim,
-        0.26,
+    let base_lighting = clamp(
+        0.16 + 0.52 * key + 0.22 * fill + 0.10 * sky + 0.18 * rim,
+        0.12,
         1.08,
     );
+    let scene_depth = -input.view_position.z;
+    let normalized_scene_depth = clamp(
+        (scene_depth - uniforms.near_surface_depth) * uniforms.inverse_scene_depth_span,
+        0.0,
+        1.0,
+    );
+    let depth_factor = mix(1.0, 0.62, normalized_scene_depth);
+    let lighting = base_lighting * depth_factor * surface_factor;
     return vec4<f32>(uniforms.material_color.rgb * lighting, 1.0);
 }
 "#;
 
-const VOXEL_PREVIEW_SHADER: &str = r#"
+const VOXEL_HIGHLIGHT_SHADER: &str = r#"
 struct Uniforms {
     view_projection: mat4x4<f32>,
     index_to_world: mat4x4<f32>,
     world_to_view: mat4x4<f32>,
     index_normal_to_view: mat4x4<f32>,
     material_color: vec4<f32>,
+    near_surface_depth: f32,
+    inverse_scene_depth_span: f32,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -130,13 +144,11 @@ struct Uniforms {
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) face_uv: vec2<f32>,
-    @location(1) view_normal: vec3<f32>,
-    @location(2) view_position: vec3<f32>,
-    @location(3) @interpolate(flat) preview_kind: u32,
+    @location(1) @interpolate(flat) highlight_kind: u32,
 };
 
 @vertex
-fn preview_vertex_main(
+fn highlight_vertex_main(
     @builtin(vertex_index) vertex_index: u32,
     @location(0) origin: vec3<u32>,
     @location(1) packed_face: u32,
@@ -151,7 +163,7 @@ fn preview_vertex_main(
     );
     let axis = packed_face & 3u;
     let positive = ((packed_face >> 2u) & 1u) != 0u;
-    let preview_kind = packed_face >> 3u;
+    let highlight_kind = packed_face >> 3u;
     let face_uv = triangle_corners[vertex_index];
 
     // Depth bias keeps this exact voxel boundary visible over resident geometry.
@@ -172,51 +184,39 @@ fn preview_vertex_main(
     index_position[u_axis] += face_uv.x * cube_size;
     index_position[v_axis] += face_uv.y * cube_size;
 
-    var index_normal = vec3<f32>(0.0);
-    index_normal[axis] = select(-1.0, 1.0, positive);
     let world_position = uniforms.index_to_world * vec4<f32>(index_position, 1.0);
-    let view_position = uniforms.world_to_view * world_position;
 
     var output: VertexOutput;
     output.clip_position = uniforms.view_projection * world_position;
     output.face_uv = face_uv;
-    output.view_normal = normalize(
-        (uniforms.index_normal_to_view * vec4<f32>(index_normal, 0.0)).xyz,
-    );
-    output.view_position = view_position.xyz;
-    output.preview_kind = preview_kind;
+    output.highlight_kind = highlight_kind;
     return output;
 }
 
 @fragment
-fn preview_fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    var base_color = vec3<f32>(0.0, 0.82, 1.0);
-    if (input.preview_kind == 1u) {
-        base_color = vec3<f32>(1.0, 0.12, 0.015);
-    } else if (input.preview_kind == 2u) {
-        base_color = vec3<f32>(0.48, 1.0, 0.03);
+fn highlight_fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    var base_color = vec3<f32>(66.0, 214.0, 124.0) / 255.0;
+    var fill_alpha = 20.0 / 255.0;
+    if (input.highlight_kind == 1u) {
+        base_color = vec3<f32>(255.0, 91.0, 69.0) / 255.0;
+        fill_alpha = 56.0 / 255.0;
+    } else if (input.highlight_kind == 2u) {
+        base_color = vec3<f32>(244.0, 166.0, 42.0) / 255.0;
+    } else if (input.highlight_kind == 3u) {
+        base_color = vec3<f32>(255.0, 216.0, 77.0) / 255.0;
+        fill_alpha = 56.0 / 255.0;
     }
-
-    let view_direction = normalize(-input.view_position);
-    var normal = normalize(input.view_normal);
-    if (dot(normal, view_direction) < 0.0) {
-        normal = -normal;
-    }
-    let key_direction = normalize(vec3<f32>(-0.45, 0.55, 0.70));
-    let diffuse = max(dot(normal, key_direction), 0.0);
-    let lighting = 0.68 + 0.32 * diffuse;
 
     // A one-pixel-ish antialiased edge on every exposed voxel face keeps adjacent
-    // candidates visibly discrete instead of turning the preview into a smooth blob.
+    // candidates visibly discrete instead of turning the highlight into a smooth blob.
     let edge_distance = min(
         min(input.face_uv.x, 1.0 - input.face_uv.x),
         min(input.face_uv.y, 1.0 - input.face_uv.y),
     );
     let edge_width = max(fwidth(edge_distance) * 1.35, 0.006);
     let edge_mix = 1.0 - smoothstep(0.0, edge_width, edge_distance);
-    let face_color = base_color * lighting;
-    let edge_color = mix(base_color * 0.32, vec3<f32>(1.0), 0.18);
-    return vec4<f32>(mix(face_color, edge_color, edge_mix), 1.0);
+    let alpha = mix(fill_alpha, 230.0 / 255.0, edge_mix);
+    return vec4<f32>(base_color, alpha);
 }
 "#;
 
@@ -225,23 +225,23 @@ pub const MSAA_SAMPLES: u32 = 4;
 // These independent caps keep CPU adjacency work and GPU boundary work bounded.
 // Four million 16-byte faces occupy 64 MB and invoke at most 24 million vertices;
 // the sample scan's 50 mm volume is about 1.64 M voxels but only 92,160 faces.
-pub const MAX_VOXEL_PREVIEW_VOXELS: usize = 2_000_000;
-pub const MAX_VOXEL_PREVIEW_FACES: usize = 4_000_000;
-const PREVIEW_ALLOCATION_CHUNK: usize = 65_536;
-const PREVIEW_CANCELLATION_INTERVAL: usize = 1_024;
+pub const MAX_VOXEL_HIGHLIGHT_VOXELS: usize = 2_000_000;
+pub const MAX_VOXEL_HIGHLIGHT_FACES: usize = 4_000_000;
+const HIGHLIGHT_ALLOCATION_CHUNK: usize = 65_536;
+const HIGHLIGHT_CANCELLATION_INTERVAL: usize = 1_024;
 
-fn preview_color_target(format: wgpu::TextureFormat) -> wgpu::ColorTargetState {
+fn highlight_color_target(format: wgpu::TextureFormat) -> wgpu::ColorTargetState {
     wgpu::ColorTargetState {
         format,
-        blend: Some(wgpu::BlendState::REPLACE),
+        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
         write_mask: wgpu::ColorWrites::ALL,
     }
 }
 
-fn preview_depth_stencil_state() -> wgpu::DepthStencilState {
+fn highlight_depth_stencil_state() -> wgpu::DepthStencilState {
     wgpu::DepthStencilState {
         format: wgpu::TextureFormat::Depth24Plus,
-        depth_write_enabled: Some(true),
+        depth_write_enabled: Some(false),
         depth_compare: Some(wgpu::CompareFunction::LessEqual),
         stencil: wgpu::StencilState::default(),
         bias: wgpu::DepthBiasState {
@@ -254,21 +254,47 @@ fn preview_depth_stencil_state() -> wgpu::DepthStencilState {
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum VoxelPreviewKind {
+pub enum VoxelHighlightKind {
     Paint = 0,
     Erase = 1,
-    Bridge = 2,
+    BridgePath = 2,
+    BridgeAnchor = 3,
+}
+
+impl VoxelHighlightKind {
+    #[must_use]
+    pub const fn color(self) -> [u8; 3] {
+        match self {
+            Self::Paint => [0x42, 0xd6, 0x7c],
+            Self::Erase => [0xff, 0x5b, 0x45],
+            Self::BridgePath => [0xf4, 0xa6, 0x2a],
+            Self::BridgeAnchor => [0xff, 0xd8, 0x4d],
+        }
+    }
+
+    #[must_use]
+    pub const fn fill_alpha(self) -> u8 {
+        match self {
+            Self::Paint | Self::BridgePath => 20,
+            Self::Erase | Self::BridgeAnchor => 56,
+        }
+    }
+
+    #[must_use]
+    pub const fn outline_alpha(self) -> u8 {
+        230
+    }
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
-struct PreviewFace {
+struct HighlightFace {
     origin: [u32; 3],
     packed: u32,
 }
 
-impl PreviewFace {
-    const fn new(origin: [u32; 3], axis: usize, positive: bool, kind: VoxelPreviewKind) -> Self {
+impl HighlightFace {
+    const fn new(origin: [u32; 3], axis: usize, positive: bool, kind: VoxelHighlightKind) -> Self {
         Self {
             origin,
             packed: (axis as u32) | ((positive as u32) << 2) | ((kind as u32) << 3),
@@ -292,84 +318,85 @@ impl PreviewFace {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum VoxelPreviewFailure {
+pub enum VoxelHighlightFailure {
     TooManyVoxels,
     TooManyFaces,
     Allocation,
 }
 
-impl std::fmt::Display for VoxelPreviewFailure {
+impl std::fmt::Display for VoxelHighlightFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TooManyVoxels => write!(
                 formatter,
-                "Brush preview exceeds the {MAX_VOXEL_PREVIEW_VOXELS}-voxel limit; reduce the brush size"
+                "Voxel highlight exceeds the {MAX_VOXEL_HIGHLIGHT_VOXELS}-voxel limit; reduce the brush size"
             ),
             Self::TooManyFaces => write!(
                 formatter,
-                "Brush preview exceeds the {MAX_VOXEL_PREVIEW_FACES}-face limit; reduce the brush size"
+                "Voxel highlight exceeds the {MAX_VOXEL_HIGHLIGHT_FACES}-face limit; reduce the brush size"
             ),
             Self::Allocation => write!(
                 formatter,
-                "There is not enough memory to display this brush preview; reduce the brush size"
+                "There is not enough memory to display this voxel highlight; reduce the brush size"
             ),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PreviewBuildError {
+enum HighlightBuildError {
     Cancelled,
-    Failed(VoxelPreviewFailure),
+    Failed(VoxelHighlightFailure),
 }
 
 #[cfg(test)]
-fn build_preview_faces(
+fn build_highlight_faces(
     dimensions: [u32; 3],
-    coordinates: Vec<[u32; 3]>,
-    kind: VoxelPreviewKind,
+    highlights: Vec<([u32; 3], VoxelHighlightKind)>,
     max_voxels: usize,
     max_faces: usize,
-) -> Result<Vec<PreviewFace>, PreviewBuildError> {
-    build_preview_faces_cancellable(dimensions, coordinates, kind, max_voxels, max_faces, || {
-        true
-    })
+) -> Result<Vec<HighlightFace>, HighlightBuildError> {
+    build_highlight_faces_cancellable(dimensions, highlights, max_voxels, max_faces, || true)
 }
 
-fn build_preview_faces_cancellable(
+fn build_highlight_faces_cancellable(
     dimensions: [u32; 3],
-    coordinates: Vec<[u32; 3]>,
-    kind: VoxelPreviewKind,
+    highlights: Vec<([u32; 3], VoxelHighlightKind)>,
     max_voxels: usize,
     max_faces: usize,
     is_current: impl Fn() -> bool,
-) -> Result<Vec<PreviewFace>, PreviewBuildError> {
+) -> Result<Vec<HighlightFace>, HighlightBuildError> {
     if !is_current() {
-        return Err(PreviewBuildError::Cancelled);
+        return Err(HighlightBuildError::Cancelled);
     }
-    let mut voxels = HashSet::new();
-    let initial_voxels = coordinates
+    let mut voxels = HashMap::new();
+    let initial_voxels = highlights
         .len()
         .min(max_voxels)
-        .min(PREVIEW_ALLOCATION_CHUNK);
+        .min(HIGHLIGHT_ALLOCATION_CHUNK);
     voxels
         .try_reserve(initial_voxels)
-        .map_err(|_| PreviewBuildError::Failed(VoxelPreviewFailure::Allocation))?;
+        .map_err(|_| HighlightBuildError::Failed(VoxelHighlightFailure::Allocation))?;
 
-    for (coordinate_index, coordinate) in coordinates.into_iter().enumerate() {
-        if coordinate_index.is_multiple_of(PREVIEW_CANCELLATION_INTERVAL) && !is_current() {
-            return Err(PreviewBuildError::Cancelled);
+    for (highlight_index, (coordinate, kind)) in highlights.into_iter().enumerate() {
+        if highlight_index.is_multiple_of(HIGHLIGHT_CANCELLATION_INTERVAL) && !is_current() {
+            return Err(HighlightBuildError::Cancelled);
         }
         if coordinate[0] >= dimensions[0]
             || coordinate[1] >= dimensions[1]
             || coordinate[2] >= dimensions[2]
-            || voxels.contains(&coordinate)
         {
             continue;
         }
+        if let Some(existing) = voxels.get_mut(&coordinate) {
+            if kind == VoxelHighlightKind::BridgeAnchor {
+                *existing = kind;
+            }
+            continue;
+        }
         if voxels.len() >= max_voxels {
-            return Err(PreviewBuildError::Failed(
-                VoxelPreviewFailure::TooManyVoxels,
+            return Err(HighlightBuildError::Failed(
+                VoxelHighlightFailure::TooManyVoxels,
             ));
         }
         if voxels.len() == voxels.capacity() {
@@ -377,68 +404,70 @@ fn build_preview_faces_cancellable(
             let additional = voxels.capacity().max(1_024).min(remaining.max(1));
             voxels
                 .try_reserve(additional)
-                .map_err(|_| PreviewBuildError::Failed(VoxelPreviewFailure::Allocation))?;
+                .map_err(|_| HighlightBuildError::Failed(VoxelHighlightFailure::Allocation))?;
         }
-        voxels.insert(coordinate);
+        voxels.insert(coordinate, kind);
     }
 
     let mut faces = Vec::new();
     faces
-        .try_reserve_exact(voxels.len().min(max_faces).min(PREVIEW_ALLOCATION_CHUNK))
-        .map_err(|_| PreviewBuildError::Failed(VoxelPreviewFailure::Allocation))?;
-    for (coordinate_index, coordinate) in voxels.iter().copied().enumerate() {
-        if coordinate_index.is_multiple_of(PREVIEW_CANCELLATION_INTERVAL) && !is_current() {
-            return Err(PreviewBuildError::Cancelled);
+        .try_reserve_exact(voxels.len().min(max_faces).min(HIGHLIGHT_ALLOCATION_CHUNK))
+        .map_err(|_| HighlightBuildError::Failed(VoxelHighlightFailure::Allocation))?;
+    for (highlight_index, (&coordinate, &kind)) in voxels.iter().enumerate() {
+        if highlight_index.is_multiple_of(HIGHLIGHT_CANCELLATION_INTERVAL) && !is_current() {
+            return Err(HighlightBuildError::Cancelled);
         }
         for axis in 0..3 {
             for positive in [false, true] {
-                let neighbor_is_previewed = if positive {
+                let neighbor_is_highlighted = if positive {
                     let neighbor_axis = coordinate[axis] + 1;
                     if neighbor_axis >= dimensions[axis] {
                         false
                     } else {
                         let mut neighbor = coordinate;
                         neighbor[axis] = neighbor_axis;
-                        voxels.contains(&neighbor)
+                        voxels.contains_key(&neighbor)
                     }
                 } else if coordinate[axis] == 0 {
                     false
                 } else {
                     let mut neighbor = coordinate;
                     neighbor[axis] -= 1;
-                    voxels.contains(&neighbor)
+                    voxels.contains_key(&neighbor)
                 };
-                if neighbor_is_previewed {
+                if neighbor_is_highlighted {
                     continue;
                 }
-                try_push_preview_face(
+                try_push_highlight_face(
                     &mut faces,
-                    PreviewFace::new(coordinate, axis, positive, kind),
+                    HighlightFace::new(coordinate, axis, positive, kind),
                     max_faces,
                 )?;
             }
         }
     }
     if !is_current() {
-        return Err(PreviewBuildError::Cancelled);
+        return Err(HighlightBuildError::Cancelled);
     }
     Ok(faces)
 }
 
-fn try_push_preview_face(
-    faces: &mut Vec<PreviewFace>,
-    face: PreviewFace,
+fn try_push_highlight_face(
+    faces: &mut Vec<HighlightFace>,
+    face: HighlightFace,
     max_faces: usize,
-) -> Result<(), PreviewBuildError> {
+) -> Result<(), HighlightBuildError> {
     if faces.len() >= max_faces {
-        return Err(PreviewBuildError::Failed(VoxelPreviewFailure::TooManyFaces));
+        return Err(HighlightBuildError::Failed(
+            VoxelHighlightFailure::TooManyFaces,
+        ));
     }
     if faces.len() == faces.capacity() {
         let remaining = max_faces - faces.len();
         let additional = faces.capacity().max(1_024).min(remaining.max(1));
         faces
             .try_reserve_exact(additional)
-            .map_err(|_| PreviewBuildError::Failed(VoxelPreviewFailure::Allocation))?;
+            .map_err(|_| HighlightBuildError::Failed(VoxelHighlightFailure::Allocation))?;
     }
     faces.push(face);
     Ok(())
@@ -452,6 +481,9 @@ struct Uniforms {
     world_to_view: [[f32; 4]; 4],
     index_normal_to_view: [[f32; 4]; 4],
     material_color: [f32; 4],
+    near_surface_depth: f32,
+    inverse_scene_depth_span: f32,
+    _padding: [f32; 2],
 }
 
 impl Default for Uniforms {
@@ -462,6 +494,9 @@ impl Default for Uniforms {
             world_to_view: Mat4::IDENTITY.to_cols_array_2d(),
             index_normal_to_view: Mat4::IDENTITY.to_cols_array_2d(),
             material_color: [0.80, 0.81, 0.82, 1.0],
+            near_surface_depth: 0.0,
+            inverse_scene_depth_span: 1.0,
+            _padding: [0.0; 2],
         }
     }
 }
@@ -479,13 +514,14 @@ enum SceneUpdate {
     Chunk {
         tag: MeshJobTag,
         quads: Vec<CompactQuad>,
+        priority: MeshUpdatePriority,
     },
-    Preview {
+    Highlight {
         epoch: u64,
         revision: u64,
-        faces: Vec<PreviewFace>,
+        faces: Vec<HighlightFace>,
     },
-    ClearPreview,
+    ClearHighlight,
 }
 
 struct SceneState {
@@ -528,8 +564,8 @@ pub struct SceneBridge {
     state: Arc<Mutex<SceneState>>,
     needs_remesh: Arc<AtomicBool>,
     repaint: Arc<Mutex<Option<egui::Context>>>,
-    preview_generation: Arc<AtomicU64>,
-    preview_failure: Arc<Mutex<Option<VoxelPreviewFailure>>>,
+    highlight_generation: Arc<AtomicU64>,
+    highlight_failure: Arc<Mutex<Option<VoxelHighlightFailure>>>,
 }
 
 impl SceneBridge {
@@ -539,7 +575,7 @@ impl SceneBridge {
 
     pub fn reset(&self, epoch: u64, revision: u64, dimensions: [u32; 3], affine: Matrix4) {
         let mut state = self.state.lock().expect("3D scene state poisoned");
-        self.cancel_preview_build_locked();
+        self.cancel_highlight_build_locked();
         if state.epoch != epoch {
             reset_navigation(&mut state);
         }
@@ -563,9 +599,9 @@ impl SceneBridge {
         if state.epoch != epoch {
             return;
         }
-        self.cancel_preview_build_locked();
+        self.cancel_highlight_build_locked();
         state.revision = revision;
-        remove_queued_preview_updates(&mut state.updates);
+        remove_queued_highlight_updates(&mut state.updates);
         state
             .updates
             .push_back(SceneUpdate::Invalidate { revision });
@@ -573,60 +609,72 @@ impl SceneBridge {
         self.request_repaint();
     }
 
-    pub fn insert_chunk(&self, tag: MeshJobTag, quads: Vec<CompactQuad>) {
+    pub fn insert_chunk(
+        &self,
+        tag: MeshJobTag,
+        quads: Vec<CompactQuad>,
+        priority: MeshUpdatePriority,
+    ) {
         let mut state = self.state.lock().expect("3D scene state poisoned");
         if state.epoch == tag.document_epoch && state.revision == tag.revision {
-            state.updates.push_back(SceneUpdate::Chunk { tag, quads });
+            queue_chunk_update(
+                &mut state.updates,
+                SceneUpdate::Chunk {
+                    tag,
+                    quads,
+                    priority,
+                },
+                priority,
+            );
             drop(state);
             self.request_repaint();
         }
     }
 
-    /// Replaces the transient 3D preview with the exact supplied voxel footprint.
+    /// Replaces the transient 3D highlight with the exact supplied voxel set.
     ///
     /// This only schedules bounded background work, so even the largest supported
     /// brush never blocks the UI thread. `false` means the document tag was already
     /// stale; later cap or allocation failures are available through
-    /// [`Self::take_preview_failure`]. Out-of-bounds coordinates are discarded,
-    /// duplicates are collapsed, and adjacent candidates share no internal faces.
-    pub fn set_voxel_preview(
+    /// [`Self::take_highlight_failure`]. Out-of-bounds coordinates are discarded,
+    /// duplicates are collapsed with bridge anchors taking precedence, and adjacent
+    /// candidates share no internal faces even when their highlight kinds differ.
+    pub fn set_voxel_highlight(
         &self,
         epoch: u64,
         revision: u64,
-        coordinates: Vec<[u32; 3]>,
-        kind: VoxelPreviewKind,
+        highlights: Vec<([u32; 3], VoxelHighlightKind)>,
     ) -> bool {
         let (dimensions, generation) = {
             let mut state = self.state.lock().expect("3D scene state poisoned");
             if state.epoch != epoch || state.revision != revision {
                 return false;
             }
-            let generation = self.next_preview_generation_locked();
-            remove_queued_preview_updates(&mut state.updates);
-            queue_latest_preview_update(&mut state.updates, SceneUpdate::ClearPreview);
+            let generation = self.next_highlight_generation_locked();
+            remove_queued_highlight_updates(&mut state.updates);
+            queue_latest_highlight_update(&mut state.updates, SceneUpdate::ClearHighlight);
             (state.dimensions, generation)
         };
         self.request_repaint();
         let scene = self.clone();
         rayon::spawn(move || {
-            let faces = build_preview_faces_cancellable(
+            let faces = build_highlight_faces_cancellable(
                 dimensions,
-                coordinates,
-                kind,
-                MAX_VOXEL_PREVIEW_VOXELS,
-                MAX_VOXEL_PREVIEW_FACES,
-                || scene.preview_generation.load(Ordering::Acquire) == generation,
+                highlights,
+                MAX_VOXEL_HIGHLIGHT_VOXELS,
+                MAX_VOXEL_HIGHLIGHT_FACES,
+                || scene.highlight_generation.load(Ordering::Acquire) == generation,
             );
-            scene.finish_preview_build(epoch, revision, generation, faces);
+            scene.finish_highlight_build(epoch, revision, generation, faces);
         });
         true
     }
 
-    pub fn clear_voxel_preview(&self) {
+    pub fn clear_voxel_highlight(&self) {
         let mut state = self.state.lock().expect("3D scene state poisoned");
-        self.cancel_preview_build_locked();
-        remove_queued_preview_updates(&mut state.updates);
-        queue_latest_preview_update(&mut state.updates, SceneUpdate::ClearPreview);
+        self.cancel_highlight_build_locked();
+        remove_queued_highlight_updates(&mut state.updates);
+        queue_latest_highlight_update(&mut state.updates, SceneUpdate::ClearHighlight);
         drop(state);
         self.request_repaint();
     }
@@ -635,12 +683,12 @@ impl SceneBridge {
         self.reset(0, 0, [1; 3], SceneState::default().affine);
     }
 
-    /// Returns and clears the latest failure from a current preview request.
+    /// Returns and clears the latest failure from a current highlight request.
     /// Cancelled or stale builds never report a failure.
-    pub fn take_preview_failure(&self) -> Option<VoxelPreviewFailure> {
-        self.preview_failure
+    pub fn take_highlight_failure(&self) -> Option<VoxelHighlightFailure> {
+        self.highlight_failure
             .lock()
-            .expect("3D preview failure state poisoned")
+            .expect("3D highlight failure state poisoned")
             .take()
     }
 
@@ -684,7 +732,7 @@ impl SceneBridge {
     #[must_use]
     pub fn ray_for_pointer(&self, normalized: [f32; 2]) -> Ray {
         let state = self.state.lock().expect("3D scene state poisoned");
-        let (view, projection, _) = scene_camera(&state);
+        let (view, projection, _, _, _) = scene_camera(&state);
         let inverse = (projection * view).inverse();
         let near = inverse.project_point3(Vec3::new(normalized[0], normalized[1], 0.0));
         let far = inverse.project_point3(Vec3::new(normalized[0], normalized[1], 1.0));
@@ -711,31 +759,31 @@ impl SceneBridge {
         }
     }
 
-    fn next_preview_generation_locked(&self) -> u64 {
+    fn next_highlight_generation_locked(&self) -> u64 {
         *self
-            .preview_failure
+            .highlight_failure
             .lock()
-            .expect("3D preview failure state poisoned") = None;
-        self.preview_generation.fetch_add(1, Ordering::AcqRel) + 1
+            .expect("3D highlight failure state poisoned") = None;
+        self.highlight_generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
-    fn cancel_preview_build_locked(&self) {
-        let _ = self.next_preview_generation_locked();
+    fn cancel_highlight_build_locked(&self) {
+        let _ = self.next_highlight_generation_locked();
     }
 
-    fn finish_preview_build(
+    fn finish_highlight_build(
         &self,
         epoch: u64,
         revision: u64,
         generation: u64,
-        result: Result<Vec<PreviewFace>, PreviewBuildError>,
+        result: Result<Vec<HighlightFace>, HighlightBuildError>,
     ) {
-        if matches!(result, Err(PreviewBuildError::Cancelled)) {
+        if matches!(result, Err(HighlightBuildError::Cancelled)) {
             return;
         }
 
         let mut state = self.state.lock().expect("3D scene state poisoned");
-        if self.preview_generation.load(Ordering::Acquire) != generation
+        if self.highlight_generation.load(Ordering::Acquire) != generation
             || state.epoch != epoch
             || state.revision != revision
         {
@@ -744,42 +792,93 @@ impl SceneBridge {
         match result {
             Ok(faces) if faces.is_empty() => {}
             Ok(faces) => {
-                queue_latest_preview_update(
+                queue_latest_highlight_update(
                     &mut state.updates,
-                    SceneUpdate::Preview {
+                    SceneUpdate::Highlight {
                         epoch,
                         revision,
                         faces,
                     },
                 );
             }
-            Err(PreviewBuildError::Failed(failure)) => {
+            Err(HighlightBuildError::Failed(failure)) => {
                 *self
-                    .preview_failure
+                    .highlight_failure
                     .lock()
-                    .expect("3D preview failure state poisoned") = Some(failure);
+                    .expect("3D highlight failure state poisoned") = Some(failure);
             }
-            Err(PreviewBuildError::Cancelled) => return,
+            Err(HighlightBuildError::Cancelled) => return,
         }
         drop(state);
         self.request_repaint();
     }
 }
 
-fn remove_queued_preview_updates(updates: &mut VecDeque<SceneUpdate>) {
+fn remove_queued_highlight_updates(updates: &mut VecDeque<SceneUpdate>) {
     updates.retain(|update| {
         !matches!(
             update,
-            SceneUpdate::Preview { .. } | SceneUpdate::ClearPreview
+            SceneUpdate::Highlight { .. } | SceneUpdate::ClearHighlight
         )
     });
 }
 
-fn queue_latest_preview_update(updates: &mut VecDeque<SceneUpdate>, update: SceneUpdate) {
-    // Preserve producer order. In particular, a replacement chunk submitted just
-    // before a reduced stroke overlay must reach the GPU before those preview voxels
-    // disappear, otherwise the edited surface visibly blinks out for one frame.
+fn queue_latest_highlight_update(updates: &mut VecDeque<SceneUpdate>, update: SceneUpdate) {
     updates.push_back(update);
+}
+
+fn queue_chunk_update(
+    updates: &mut VecDeque<SceneUpdate>,
+    update: SceneUpdate,
+    priority: MeshUpdatePriority,
+) {
+    if priority == MeshUpdatePriority::Background {
+        updates.push_back(update);
+        return;
+    }
+
+    let barrier_end = updates
+        .iter()
+        .rposition(|queued| {
+            matches!(
+                queued,
+                SceneUpdate::Reset { .. } | SceneUpdate::Invalidate { .. }
+            )
+        })
+        .map_or(0, |index| index + 1);
+    let incoming_tag = match &update {
+        SceneUpdate::Chunk { tag, .. } => *tag,
+        _ => unreachable!("only mesh chunks use the prioritized update queue"),
+    };
+
+    for index in (barrier_end..updates.len()).rev() {
+        let remove = matches!(
+            &updates[index],
+            SceneUpdate::Chunk { tag, .. }
+                if tag.chunk == incoming_tag.chunk
+                    && tag.chunk_generation <= incoming_tag.chunk_generation
+        );
+        if remove {
+            let _ = updates.remove(index);
+        }
+    }
+
+    let insertion_index = updates
+        .iter()
+        .enumerate()
+        .skip(barrier_end)
+        .find_map(|(index, queued)| {
+            matches!(
+                queued,
+                SceneUpdate::Chunk {
+                    priority: MeshUpdatePriority::Background,
+                    ..
+                }
+            )
+            .then_some(index)
+        })
+        .unwrap_or(updates.len());
+    updates.insert(insertion_index, update);
 }
 
 fn reset_navigation(state: &mut SceneState) {
@@ -860,11 +959,11 @@ impl CallbackTrait for VolumePaintCallback {
             render_pass.set_vertex_buffer(0, chunk.buffer.slice(..));
             render_pass.draw(0..6, 0..chunk.instances);
         }
-        if let Some(preview) = renderer.preview.as_ref() {
-            render_pass.set_pipeline(&renderer.preview_pipeline);
+        if let Some(highlight) = renderer.highlight.as_ref() {
+            render_pass.set_pipeline(&renderer.highlight_pipeline);
             render_pass.set_bind_group(0, &renderer.bind_group, &[]);
-            render_pass.set_vertex_buffer(0, preview.buffer.slice(..));
-            render_pass.draw(0..6, 0..preview.faces);
+            render_pass.set_vertex_buffer(0, highlight.buffer.slice(..));
+            render_pass.draw(0..6, 0..highlight.faces);
         }
     }
 }
@@ -872,21 +971,21 @@ impl CallbackTrait for VolumePaintCallback {
 struct GpuChunk {
     buffer: wgpu::Buffer,
     instances: u32,
-    generation: u64,
 }
 
-struct GpuPreview {
+struct GpuHighlight {
     buffer: wgpu::Buffer,
     faces: u32,
 }
 
 struct GpuVolumeRenderer {
     pipeline: wgpu::RenderPipeline,
-    preview_pipeline: wgpu::RenderPipeline,
+    highlight_pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     chunks: HashMap<ChunkCoord, GpuChunk>,
-    preview: Option<GpuPreview>,
+    chunk_generations: HashMap<ChunkCoord, u64>,
+    highlight: Option<GpuHighlight>,
     epoch: u64,
     revision: u64,
     dimensions: [u32; 3],
@@ -984,19 +1083,19 @@ impl GpuVolumeRenderer {
             multiview_mask: None,
             cache: None,
         });
-        let preview_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("VoxelInk voxel preview shader"),
-            source: wgpu::ShaderSource::Wgsl(VOXEL_PREVIEW_SHADER.into()),
+        let highlight_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("VoxelInk voxel highlight shader"),
+            source: wgpu::ShaderSource::Wgsl(VOXEL_HIGHLIGHT_SHADER.into()),
         });
-        let preview_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("VoxelInk voxel preview pipeline"),
+        let highlight_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("VoxelInk voxel highlight pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &preview_shader,
-                entry_point: Some("preview_vertex_main"),
+                module: &highlight_shader,
+                entry_point: Some("highlight_vertex_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: size_of::<PreviewFace>() as u64,
+                    array_stride: size_of::<HighlightFace>() as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &[
                         wgpu::VertexAttribute {
@@ -1013,17 +1112,17 @@ impl GpuVolumeRenderer {
                 }],
             },
             fragment: Some(wgpu::FragmentState {
-                module: &preview_shader,
-                entry_point: Some("preview_fragment_main"),
+                module: &highlight_shader,
+                entry_point: Some("highlight_fragment_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(preview_color_target(target_format))],
+                targets: &[Some(highlight_color_target(target_format))],
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 cull_mode: None,
                 ..Default::default()
             },
-            depth_stencil: Some(preview_depth_stencil_state()),
+            depth_stencil: Some(highlight_depth_stencil_state()),
             multisample: wgpu::MultisampleState {
                 count: MSAA_SAMPLES,
                 mask: !0,
@@ -1034,11 +1133,12 @@ impl GpuVolumeRenderer {
         });
         Self {
             pipeline,
-            preview_pipeline,
+            highlight_pipeline,
             uniform_buffer,
             bind_group,
             chunks: HashMap::new(),
-            preview: None,
+            chunk_generations: HashMap::new(),
+            highlight: None,
             epoch: 0,
             revision: 0,
             dimensions: [1; 3],
@@ -1055,7 +1155,8 @@ impl GpuVolumeRenderer {
                 affine,
             } => {
                 self.chunks.clear();
-                self.preview = None;
+                self.chunk_generations.clear();
+                self.highlight = None;
                 self.epoch = epoch;
                 self.revision = revision;
                 self.dimensions = dimensions;
@@ -1063,19 +1164,21 @@ impl GpuVolumeRenderer {
             }
             SceneUpdate::Invalidate { revision } => {
                 self.revision = revision;
-                self.preview = None;
+                self.highlight = None;
             }
-            SceneUpdate::Chunk { tag, quads } => {
+            SceneUpdate::Chunk { tag, quads, .. } => {
                 if tag.document_epoch != self.epoch || tag.revision != self.revision {
                     return;
                 }
                 if self
-                    .chunks
+                    .chunk_generations
                     .get(&tag.chunk)
-                    .is_some_and(|chunk| chunk.generation > tag.chunk_generation)
+                    .is_some_and(|generation| *generation > tag.chunk_generation)
                 {
                     return;
                 }
+                self.chunk_generations
+                    .insert(tag.chunk, tag.chunk_generation);
                 if quads.is_empty() {
                     self.chunks.remove(&tag.chunk);
                     return;
@@ -1090,11 +1193,10 @@ impl GpuVolumeRenderer {
                     GpuChunk {
                         buffer,
                         instances: quads.len() as u32,
-                        generation: tag.chunk_generation,
                     },
                 );
             }
-            SceneUpdate::Preview {
+            SceneUpdate::Highlight {
                 epoch,
                 revision,
                 faces,
@@ -1105,35 +1207,38 @@ impl GpuVolumeRenderer {
                 if epoch != self.epoch
                     || revision != self.revision
                     || faces.is_empty()
-                    || faces.len() > MAX_VOXEL_PREVIEW_FACES
+                    || faces.len() > MAX_VOXEL_HIGHLIGHT_FACES
                 {
                     return;
                 }
                 let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("VoxelInk preview boundary-face instances"),
+                    label: Some("VoxelInk highlight boundary-face instances"),
                     contents: bytemuck::cast_slice(&faces),
                     usage: wgpu::BufferUsages::VERTEX,
                 });
-                self.preview = Some(GpuPreview {
+                self.highlight = Some(GpuHighlight {
                     buffer,
                     faces: face_count,
                 });
             }
-            SceneUpdate::ClearPreview => {
-                self.preview = None;
+            SceneUpdate::ClearHighlight => {
+                self.highlight = None;
             }
         }
     }
 }
 
 fn scene_uniforms(state: &SceneState) -> Uniforms {
-    let (view, projection, affine) = scene_camera(state);
+    let (view, projection, affine, near_surface_depth, inverse_scene_depth_span) =
+        scene_camera(state);
     let model_view = view * affine;
     Uniforms {
         view_projection: (projection * view).to_cols_array_2d(),
         index_to_world: affine.to_cols_array_2d(),
         world_to_view: view.to_cols_array_2d(),
         index_normal_to_view: normal_matrix(model_view).to_cols_array_2d(),
+        near_surface_depth,
+        inverse_scene_depth_span,
         ..Uniforms::default()
     }
 }
@@ -1149,7 +1254,7 @@ fn normal_matrix(model_view: Mat4) -> Mat4 {
     Mat4::IDENTITY
 }
 
-fn scene_camera(state: &SceneState) -> (Mat4, Mat4, Mat4) {
+fn scene_camera(state: &SceneState) -> (Mat4, Mat4, Mat4, f32, f32) {
     let affine = affine_mat4(state.affine);
     let mut corners = Vec::with_capacity(8);
     for z in [-0.5, state.dimensions[2] as f32 - 0.5] {
@@ -1172,6 +1277,9 @@ fn scene_camera(state: &SceneState) -> (Mat4, Mat4, Mat4) {
     );
     let eye = center + direction * radius * 2.6 / state.zoom;
     let view = Mat4::look_at_rh(eye, center, Vec3::Z);
+    let center_view_depth = -view.transform_point3(center).z;
+    let near_surface_depth = center_view_depth - radius;
+    let inverse_scene_depth_span = 1.0 / (2.0 * radius);
     let projection = Mat4::from_translation(Vec3::new(state.pan_ndc.x, state.pan_ndc.y, 0.0))
         * Mat4::perspective_rh(
             45_f32.to_radians(),
@@ -1179,7 +1287,13 @@ fn scene_camera(state: &SceneState) -> (Mat4, Mat4, Mat4) {
             radius * 0.01,
             radius * 12.0,
         );
-    (view, projection, affine)
+    (
+        view,
+        projection,
+        affine,
+        near_surface_depth,
+        inverse_scene_depth_span,
+    )
 }
 
 fn affine_mat4(matrix: Matrix4) -> Mat4 {
@@ -1253,19 +1367,61 @@ mod tests {
     fn production_renderer_uses_four_sample_msaa() {
         assert_eq!(MSAA_SAMPLES, 4);
         assert!(MSAA_SAMPLES.is_power_of_two());
+        assert_eq!(size_of::<Uniforms>(), 288);
     }
 
     #[test]
-    fn preview_pipeline_is_opaque_and_writes_depth() {
+    fn highlight_pipeline_alpha_blends_without_writing_depth() {
         assert_eq!(
-            preview_color_target(wgpu::TextureFormat::Bgra8UnormSrgb).blend,
-            Some(wgpu::BlendState::REPLACE)
+            highlight_color_target(wgpu::TextureFormat::Bgra8UnormSrgb).blend,
+            Some(wgpu::BlendState::ALPHA_BLENDING)
         );
         assert_eq!(
-            preview_depth_stencil_state().depth_write_enabled,
-            Some(true)
+            highlight_depth_stencil_state().depth_write_enabled,
+            Some(false)
         );
-        assert!(VOXEL_PREVIEW_SHADER.contains("), 1.0);"));
+        assert!(VOXEL_HIGHLIGHT_SHADER.contains("230.0 / 255.0"));
+        assert!(!VOXEL_HIGHLIGHT_SHADER.contains("0.0, 0.82, 1.0"));
+    }
+
+    #[test]
+    fn highlight_palette_exposes_exact_colors_and_alphas() {
+        assert_eq!(VoxelHighlightKind::Paint.color(), [0x42, 0xd6, 0x7c]);
+        assert_eq!(VoxelHighlightKind::Erase.color(), [0xff, 0x5b, 0x45]);
+        assert_eq!(VoxelHighlightKind::BridgePath.color(), [0xf4, 0xa6, 0x2a]);
+        assert_eq!(VoxelHighlightKind::BridgeAnchor.color(), [0xff, 0xd8, 0x4d]);
+        assert_eq!(VoxelHighlightKind::Paint.fill_alpha(), 20);
+        assert_eq!(VoxelHighlightKind::Erase.fill_alpha(), 56);
+        assert_eq!(VoxelHighlightKind::BridgePath.fill_alpha(), 20);
+        assert_eq!(VoxelHighlightKind::BridgeAnchor.fill_alpha(), 56);
+        for kind in [
+            VoxelHighlightKind::Paint,
+            VoxelHighlightKind::Erase,
+            VoxelHighlightKind::BridgePath,
+            VoxelHighlightKind::BridgeAnchor,
+        ] {
+            assert_eq!(kind.outline_alpha(), 230);
+        }
+    }
+
+    #[test]
+    fn equal_normal_fragments_darken_with_depth_and_internal_facing() {
+        let depth_factor = |depth: f32, near: f32, inverse_span: f32| {
+            let normalized = ((depth - near) * inverse_span).clamp(0.0, 1.0);
+            1.0 + (0.62 - 1.0) * normalized
+        };
+        let near = 10.0;
+        let inverse_span = 0.05;
+        let nearest = depth_factor(near, near, inverse_span);
+        let middle = depth_factor(20.0, near, inverse_span);
+        let farthest = depth_factor(30.0, near, inverse_span);
+
+        assert!((nearest - 1.0).abs() < f32::EPSILON);
+        assert!(nearest > middle && middle > farthest);
+        assert!((farthest - 0.62).abs() < f32::EPSILON);
+        assert!(0.68 * nearest < nearest);
+        assert!(SHADER.contains("mix(1.0, 0.62, normalized_scene_depth)"));
+        assert!(SHADER.contains("select(1.0, 0.68, geometric_back_facing)"));
     }
 
     #[test]
@@ -1283,23 +1439,27 @@ mod tests {
     }
 
     #[test]
-    fn preview_replaces_pending_preview_and_removes_shared_internal_faces() {
+    fn highlight_replaces_pending_highlight_and_removes_shared_internal_faces() {
         let bridge = SceneBridge::default();
         bridge.reset(4, 8, [4, 5, 6], SceneState::default().affine);
-        assert!(bridge.set_voxel_preview(
+        assert!(bridge.set_voxel_highlight(
             4,
             8,
-            vec![[0, 0, 0], [0, 0, 0], [3, 4, 5], [4, 0, 0]],
-            VoxelPreviewKind::Paint,
+            typed_highlights(
+                vec![[0, 0, 0], [0, 0, 0], [3, 4, 5], [4, 0, 0]],
+                VoxelHighlightKind::Paint,
+            ),
         ));
-        assert!(bridge.set_voxel_preview(
+        assert!(bridge.set_voxel_highlight(
             4,
             8,
-            vec![[1, 2, 3], [2, 2, 3], [1, 2, 3]],
-            VoxelPreviewKind::Erase,
+            typed_highlights(
+                vec![[1, 2, 3], [2, 2, 3], [1, 2, 3]],
+                VoxelHighlightKind::Erase,
+            ),
         ));
 
-        wait_for_preview_kind(&bridge, VoxelPreviewKind::Erase);
+        wait_for_highlight_kind(&bridge, VoxelHighlightKind::Erase);
 
         let state = bridge.state.lock().unwrap();
         assert_eq!(state.updates.len(), 3);
@@ -1309,22 +1469,22 @@ mod tests {
         ));
         assert!(matches!(
             state.updates.get(1),
-            Some(SceneUpdate::ClearPreview)
+            Some(SceneUpdate::ClearHighlight)
         ));
-        let Some(SceneUpdate::Preview {
+        let Some(SceneUpdate::Highlight {
             epoch,
             revision,
             faces,
         }) = state.updates.back()
         else {
-            panic!("latest voxel preview should follow the pending reset");
+            panic!("latest voxel highlight should follow the pending reset");
         };
         assert_eq!((*epoch, *revision), (4, 8));
         assert_eq!(faces.len(), 10);
         assert!(
             faces
                 .iter()
-                .all(|face| face.kind() == VoxelPreviewKind::Erase as u32)
+                .all(|face| face.kind() == VoxelHighlightKind::Erase as u32)
         );
         assert!(
             !faces
@@ -1339,9 +1499,14 @@ mod tests {
     }
 
     #[test]
-    fn singleton_preview_has_one_face_per_axis_and_direction() {
-        let faces =
-            build_preview_faces([3; 3], vec![[1, 1, 1]], VoxelPreviewKind::Bridge, 1, 6).unwrap();
+    fn singleton_highlight_has_one_face_per_axis_and_direction() {
+        let faces = build_highlight_faces(
+            [3; 3],
+            vec![([1, 1, 1], VoxelHighlightKind::BridgePath)],
+            1,
+            6,
+        )
+        .unwrap();
 
         assert_eq!(faces.len(), 6);
         for axis in 0..3 {
@@ -1350,26 +1515,65 @@ mod tests {
                     face.origin == [1, 1, 1]
                         && face.axis() == axis
                         && face.positive() == positive
-                        && face.kind() == VoxelPreviewKind::Bridge as u32
+                        && face.kind() == VoxelHighlightKind::BridgePath as u32
                 }));
             }
         }
     }
 
     #[test]
-    fn solid_preview_block_work_scales_with_surface_area() {
+    fn mixed_highlight_kinds_share_no_internal_faces_and_anchor_wins_duplicates() {
+        let faces = build_highlight_faces(
+            [4; 3],
+            vec![
+                ([1, 1, 1], VoxelHighlightKind::BridgePath),
+                ([2, 1, 1], VoxelHighlightKind::BridgePath),
+                ([1, 1, 1], VoxelHighlightKind::BridgeAnchor),
+            ],
+            2,
+            12,
+        )
+        .unwrap();
+
+        assert_eq!(faces.len(), 10);
+        assert!(
+            faces
+                .iter()
+                .filter(|face| face.origin == [1, 1, 1])
+                .all(|face| face.kind() == VoxelHighlightKind::BridgeAnchor as u32)
+        );
+        assert!(
+            faces
+                .iter()
+                .filter(|face| face.origin == [2, 1, 1])
+                .all(|face| face.kind() == VoxelHighlightKind::BridgePath as u32)
+        );
+        assert!(
+            !faces
+                .iter()
+                .any(|face| { face.origin == [1, 1, 1] && face.axis() == 0 && face.positive() })
+        );
+        assert!(
+            !faces
+                .iter()
+                .any(|face| { face.origin == [2, 1, 1] && face.axis() == 0 && !face.positive() })
+        );
+    }
+
+    #[test]
+    fn solid_highlight_block_work_scales_with_surface_area() {
         let dimensions = [12, 10, 8];
-        let coordinates = (0..dimensions[2])
+        let highlights = (0..dimensions[2])
             .flat_map(|z| {
                 (0..dimensions[1]).flat_map(move |y| (0..dimensions[0]).map(move |x| [x, y, z]))
             })
+            .map(|coordinate| (coordinate, VoxelHighlightKind::Paint))
             .collect::<Vec<_>>();
-        let faces = build_preview_faces(
+        let faces = build_highlight_faces(
             dimensions,
-            coordinates,
-            VoxelPreviewKind::Paint,
-            MAX_VOXEL_PREVIEW_VOXELS,
-            MAX_VOXEL_PREVIEW_FACES,
+            highlights,
+            MAX_VOXEL_HIGHLIGHT_VOXELS,
+            MAX_VOXEL_HIGHLIGHT_FACES,
         )
         .unwrap();
         let expected_surface_faces = 2
@@ -1382,24 +1586,28 @@ mod tests {
     }
 
     #[test]
-    fn preview_limits_count_unique_voxels_and_exposed_faces() {
+    fn highlight_limits_count_unique_voxels_and_exposed_faces() {
         assert!(matches!(
-            build_preview_faces(
+            build_highlight_faces(
                 [4; 3],
-                vec![[1, 1, 1], [1, 1, 1], [2, 1, 1]],
-                VoxelPreviewKind::Paint,
+                typed_highlights(
+                    vec![[1, 1, 1], [1, 1, 1], [2, 1, 1]],
+                    VoxelHighlightKind::Paint,
+                ),
                 1,
                 6,
             ),
-            Err(PreviewBuildError::Failed(
-                VoxelPreviewFailure::TooManyVoxels
+            Err(HighlightBuildError::Failed(
+                VoxelHighlightFailure::TooManyVoxels
             ))
         ));
         assert_eq!(
-            build_preview_faces(
+            build_highlight_faces(
                 [4; 3],
-                vec![[1, 1, 1], [1, 1, 1], [8, 8, 8]],
-                VoxelPreviewKind::Paint,
+                typed_highlights(
+                    vec![[1, 1, 1], [1, 1, 1], [8, 8, 8]],
+                    VoxelHighlightKind::Paint,
+                ),
                 1,
                 6,
             )
@@ -1408,25 +1616,25 @@ mod tests {
             6
         );
         assert!(matches!(
-            build_preview_faces([4; 3], vec![[1, 1, 1]], VoxelPreviewKind::Paint, 1, 5,),
-            Err(PreviewBuildError::Failed(VoxelPreviewFailure::TooManyFaces))
+            build_highlight_faces([4; 3], vec![([1, 1, 1], VoxelHighlightKind::Paint)], 1, 5,),
+            Err(HighlightBuildError::Failed(
+                VoxelHighlightFailure::TooManyFaces
+            ))
         ));
     }
 
     #[test]
-    fn preview_face_build_stops_when_its_generation_is_cancelled() {
+    fn highlight_face_build_stops_when_its_generation_is_cancelled() {
         let checks = std::sync::atomic::AtomicUsize::new(0);
-        let coordinates = (0..4_096).map(|x| [x, 0, 0]).collect();
-        let result = build_preview_faces_cancellable(
-            [4_096, 1, 1],
-            coordinates,
-            VoxelPreviewKind::Paint,
-            4_096,
-            24_576,
-            || checks.fetch_add(1, Ordering::AcqRel) == 0,
-        );
+        let highlights = (0..4_096)
+            .map(|x| ([x, 0, 0], VoxelHighlightKind::Paint))
+            .collect();
+        let result =
+            build_highlight_faces_cancellable([4_096, 1, 1], highlights, 4_096, 24_576, || {
+                checks.fetch_add(1, Ordering::AcqRel) == 0
+            });
 
-        assert!(matches!(result, Err(PreviewBuildError::Cancelled)));
+        assert!(matches!(result, Err(HighlightBuildError::Cancelled)));
         assert!(checks.load(Ordering::Acquire) >= 2);
     }
 
@@ -1438,30 +1646,30 @@ mod tests {
         let voxels = x * y * z;
         let boundary_faces = 2 * (x * y + x * z + y * z);
 
-        assert!(voxels <= MAX_VOXEL_PREVIEW_VOXELS);
-        assert!(boundary_faces <= MAX_VOXEL_PREVIEW_FACES);
+        assert!(voxels <= MAX_VOXEL_HIGHLIGHT_VOXELS);
+        assert!(boundary_faces <= MAX_VOXEL_HIGHLIGHT_FACES);
         assert!(boundary_faces * 6 < voxels * 36 / 100);
     }
 
     #[test]
-    fn stale_preview_is_ignored_and_invalidation_clears_a_pending_preview() {
+    fn stale_highlight_is_ignored_and_invalidation_clears_a_pending_highlight() {
         let bridge = SceneBridge::default();
         bridge.reset(7, 11, [8; 3], SceneState::default().affine);
-        assert!(!bridge.set_voxel_preview(6, 11, vec![[1, 1, 1]], VoxelPreviewKind::Paint));
-        assert!(!bridge.set_voxel_preview(7, 10, vec![[1, 1, 1]], VoxelPreviewKind::Paint));
-        assert!(bridge.set_voxel_preview(7, 11, vec![[1, 1, 1]], VoxelPreviewKind::Bridge));
-        let stale_generation = bridge.preview_generation.load(Ordering::Acquire);
+        let highlight = vec![([1, 1, 1], VoxelHighlightKind::Paint)];
+        assert!(!bridge.set_voxel_highlight(6, 11, highlight.clone()));
+        assert!(!bridge.set_voxel_highlight(7, 10, highlight.clone()));
+        assert!(bridge.set_voxel_highlight(7, 11, highlight));
+        let stale_generation = bridge.highlight_generation.load(Ordering::Acquire);
         bridge.invalidate(7, 12, vec![ChunkCoord::new(0, 0, 0)]);
-        bridge.finish_preview_build(
+        bridge.finish_highlight_build(
             7,
             11,
             stale_generation,
-            build_preview_faces(
+            build_highlight_faces(
                 [8; 3],
-                vec![[1, 1, 1]],
-                VoxelPreviewKind::Bridge,
-                MAX_VOXEL_PREVIEW_VOXELS,
-                MAX_VOXEL_PREVIEW_FACES,
+                vec![([1, 1, 1], VoxelHighlightKind::BridgePath)],
+                MAX_VOXEL_HIGHLIGHT_VOXELS,
+                MAX_VOXEL_HIGHLIGHT_FACES,
             ),
         );
 
@@ -1478,7 +1686,7 @@ mod tests {
     }
 
     #[test]
-    fn chunk_update_stays_ahead_of_reduced_preview() {
+    fn background_chunk_update_stays_ahead_of_later_highlight() {
         let bridge = SceneBridge::default();
         bridge.reset(3, 6, [8; 3], SceneState::default().affine);
         bridge.insert_chunk(
@@ -1486,12 +1694,14 @@ mod tests {
                 document_epoch: 3,
                 revision: 6,
                 chunk_generation: 2,
+                edit_generation: 0,
                 chunk: ChunkCoord::new(0, 0, 0),
             },
             Vec::new(),
+            MeshUpdatePriority::Background,
         );
-        assert!(bridge.set_voxel_preview(3, 6, vec![[2, 2, 2]], VoxelPreviewKind::Paint,));
-        wait_for_preview_kind(&bridge, VoxelPreviewKind::Paint);
+        assert!(bridge.set_voxel_highlight(3, 6, vec![([2, 2, 2], VoxelHighlightKind::Paint)],));
+        wait_for_highlight_kind(&bridge, VoxelHighlightKind::Paint);
 
         let state = bridge.state.lock().unwrap();
         let chunk_index = state
@@ -1499,49 +1709,127 @@ mod tests {
             .iter()
             .position(|update| matches!(update, SceneUpdate::Chunk { .. }))
             .unwrap();
-        let preview_index = state
+        let highlight_index = state
             .updates
             .iter()
-            .position(|update| matches!(update, SceneUpdate::Preview { .. }))
+            .position(|update| matches!(update, SceneUpdate::Highlight { .. }))
             .unwrap();
-        assert!(chunk_index < preview_index);
+        assert!(chunk_index < highlight_index);
     }
 
     #[test]
-    fn only_current_preview_failures_are_reported_once() {
+    fn live_chunks_follow_barriers_precede_background_and_prune_older_same_chunk() {
+        let bridge = SceneBridge::default();
+        let affine = SceneState::default().affine;
+        let replaced = ChunkCoord::new(1, 0, 0);
+        let other_live = ChunkCoord::new(2, 0, 0);
+        let background = ChunkCoord::new(3, 0, 0);
+        let tag = |revision, generation, chunk| MeshJobTag {
+            document_epoch: 4,
+            revision,
+            chunk_generation: generation,
+            edit_generation: 0,
+            chunk,
+        };
+        bridge.reset(4, 8, [128, 32, 32], affine);
+        bridge.insert_chunk(
+            tag(8, 1, replaced),
+            Vec::new(),
+            MeshUpdatePriority::Background,
+        );
+        bridge.invalidate(4, 9, vec![replaced]);
+        bridge.insert_chunk(
+            tag(9, 1, background),
+            Vec::new(),
+            MeshUpdatePriority::Background,
+        );
+        bridge.insert_chunk(
+            tag(9, 2, replaced),
+            Vec::new(),
+            MeshUpdatePriority::Background,
+        );
+        bridge.insert_chunk(
+            tag(9, 3, replaced),
+            Vec::new(),
+            MeshUpdatePriority::Background,
+        );
+        bridge.insert_chunk(tag(9, 3, replaced), Vec::new(), MeshUpdatePriority::Live);
+        bridge.insert_chunk(tag(9, 1, other_live), Vec::new(), MeshUpdatePriority::Live);
+
+        let state = bridge.state.lock().unwrap();
+        assert_eq!(state.updates.len(), 6);
+        assert!(matches!(state.updates[0], SceneUpdate::Reset { .. }));
+        assert!(matches!(
+            state.updates[1],
+            SceneUpdate::Chunk { tag, .. }
+                if tag.revision == 8 && tag.chunk == replaced
+        ));
+        assert!(matches!(state.updates[2], SceneUpdate::Invalidate { .. }));
+        assert!(matches!(
+            state.updates[3],
+            SceneUpdate::Chunk {
+                tag,
+                priority: MeshUpdatePriority::Live,
+                ..
+            } if tag.chunk == replaced && tag.chunk_generation == 3
+        ));
+        assert!(matches!(
+            state.updates[4],
+            SceneUpdate::Chunk {
+                tag,
+                priority: MeshUpdatePriority::Live,
+                ..
+            } if tag.chunk == other_live
+        ));
+        assert!(matches!(
+            state.updates[5],
+            SceneUpdate::Chunk {
+                tag,
+                priority: MeshUpdatePriority::Background,
+                ..
+            } if tag.chunk == background
+        ));
+    }
+
+    #[test]
+    fn only_current_highlight_failures_are_reported_once() {
         let bridge = SceneBridge::default();
         bridge.reset(3, 6, [8; 3], SceneState::default().affine);
-        let generation = bridge.preview_generation.load(Ordering::Acquire);
-        bridge.finish_preview_build(
+        let generation = bridge.highlight_generation.load(Ordering::Acquire);
+        bridge.finish_highlight_build(
             3,
             6,
             generation,
-            Err(PreviewBuildError::Failed(VoxelPreviewFailure::TooManyFaces)),
+            Err(HighlightBuildError::Failed(
+                VoxelHighlightFailure::TooManyFaces,
+            )),
         );
 
         assert_eq!(
-            bridge.take_preview_failure(),
-            Some(VoxelPreviewFailure::TooManyFaces)
+            bridge.take_highlight_failure(),
+            Some(VoxelHighlightFailure::TooManyFaces)
         );
-        assert_eq!(bridge.take_preview_failure(), None);
+        assert_eq!(bridge.take_highlight_failure(), None);
 
         let stale_generation = generation;
-        bridge.clear_voxel_preview();
-        bridge.finish_preview_build(
+        bridge.clear_voxel_highlight();
+        bridge.finish_highlight_build(
             3,
             6,
             stale_generation,
-            Err(PreviewBuildError::Failed(VoxelPreviewFailure::Allocation)),
+            Err(HighlightBuildError::Failed(
+                VoxelHighlightFailure::Allocation,
+            )),
         );
-        assert_eq!(bridge.take_preview_failure(), None);
+        assert_eq!(bridge.take_highlight_failure(), None);
     }
 
     #[test]
-    fn clearing_preview_replaces_pending_preview_after_document_transition() {
+    fn clearing_highlight_replaces_pending_highlight_after_document_transition() {
         let bridge = SceneBridge::default();
         bridge.reset(2, 3, [8; 3], SceneState::default().affine);
-        assert!(bridge.set_voxel_preview(2, 3, vec![[4, 4, 4]], VoxelPreviewKind::Paint));
-        bridge.clear_voxel_preview();
+        assert!(bridge.set_voxel_highlight(2, 3, vec![([4, 4, 4], VoxelHighlightKind::Paint)],));
+        bridge.clear_voxel_highlight();
 
         let state = bridge.state.lock().unwrap();
         assert_eq!(state.updates.len(), 2);
@@ -1551,26 +1839,36 @@ mod tests {
         ));
         assert!(matches!(
             state.updates.back(),
-            Some(SceneUpdate::ClearPreview)
+            Some(SceneUpdate::ClearHighlight)
         ));
     }
 
-    fn wait_for_preview_kind(bridge: &SceneBridge, kind: VoxelPreviewKind) {
+    fn typed_highlights(
+        coordinates: Vec<[u32; 3]>,
+        kind: VoxelHighlightKind,
+    ) -> Vec<([u32; 3], VoxelHighlightKind)> {
+        coordinates
+            .into_iter()
+            .map(|coordinate| (coordinate, kind))
+            .collect()
+    }
+
+    fn wait_for_highlight_kind(bridge: &SceneBridge, kind: VoxelHighlightKind) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let has_preview = bridge.state.lock().unwrap().updates.iter().any(|update| {
+            let has_highlight = bridge.state.lock().unwrap().updates.iter().any(|update| {
                 matches!(
                     update,
-                    SceneUpdate::Preview { faces, .. }
+                    SceneUpdate::Highlight { faces, .. }
                         if faces.first().is_some_and(|face| face.kind() == kind as u32)
                 )
             });
-            if has_preview {
+            if has_highlight {
                 return;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "timed out waiting for the latest background preview"
+                "timed out waiting for the latest background highlight"
             );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -1588,7 +1886,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (view, _, _) = scene_camera(&state);
+        let (view, _, _, _, _) = scene_camera(&state);
         let eye = view.inverse().transform_point3(Vec3::ZERO);
         assert!(eye.length() > 200.0);
     }
@@ -1696,7 +1994,7 @@ mod tests {
         world_position: Vec3,
         viewport: egui::Vec2,
     ) -> egui::Vec2 {
-        let (view, projection, _) = scene_camera(state);
+        let (view, projection, _, _, _) = scene_camera(state);
         let ndc = (projection * view).project_point3(world_position);
         egui::vec2(
             (ndc.x + 1.0) * 0.5 * viewport.x,
@@ -1745,43 +2043,44 @@ mod tests {
                     document_epoch: 4,
                     revision: 8,
                     chunk_generation: 3,
+                    edit_generation: 0,
                     chunk,
                 },
                 quads: vec![
                     CompactQuad::new([0, 0, 0], 1, 1, crate::mesh::FaceAxis::X, true)
                         .expect("unit face is representable"),
                 ],
+                priority: MeshUpdatePriority::Background,
             },
         );
         assert!(renderer.chunks.contains_key(&chunk));
 
         renderer.apply_update(
             &device,
-            SceneUpdate::Preview {
+            SceneUpdate::Highlight {
                 epoch: 4,
                 revision: 8,
-                faces: build_preview_faces(
+                faces: build_highlight_faces(
                     [32; 3],
-                    vec![[2, 3, 4], [3, 3, 4]],
-                    VoxelPreviewKind::Erase,
-                    MAX_VOXEL_PREVIEW_VOXELS,
-                    MAX_VOXEL_PREVIEW_FACES,
+                    typed_highlights(vec![[2, 3, 4], [3, 3, 4]], VoxelHighlightKind::Erase),
+                    MAX_VOXEL_HIGHLIGHT_VOXELS,
+                    MAX_VOXEL_HIGHLIGHT_FACES,
                 )
                 .unwrap(),
             },
         );
         assert_eq!(
-            renderer.preview.as_ref().map(|preview| preview.faces),
+            renderer.highlight.as_ref().map(|highlight| highlight.faces),
             Some(10)
         );
         assert!(
             renderer.chunks.contains_key(&chunk),
-            "transient preview replacement must not alter resident chunk meshes"
+            "transient highlight must not alter resident chunk meshes"
         );
 
         renderer.apply_update(&device, SceneUpdate::Invalidate { revision: 9 });
         assert_eq!(renderer.revision, 9);
-        assert!(renderer.preview.is_none());
+        assert!(renderer.highlight.is_none());
         assert!(
             renderer.chunks.contains_key(&chunk),
             "the previous mesh must remain resident until its replacement is ready"
@@ -1794,14 +2093,37 @@ mod tests {
                     document_epoch: 4,
                     revision: 9,
                     chunk_generation: 4,
+                    edit_generation: 0,
                     chunk,
                 },
                 quads: Vec::new(),
+                priority: MeshUpdatePriority::Live,
             },
         );
         assert!(
             !renderer.chunks.contains_key(&chunk),
             "an empty replacement removes the old resident mesh atomically"
+        );
+        renderer.apply_update(
+            &device,
+            SceneUpdate::Chunk {
+                tag: MeshJobTag {
+                    document_epoch: 4,
+                    revision: 9,
+                    chunk_generation: 3,
+                    edit_generation: 0,
+                    chunk,
+                },
+                quads: vec![
+                    CompactQuad::new([0, 0, 0], 1, 1, crate::mesh::FaceAxis::X, true)
+                        .expect("unit face is representable"),
+                ],
+                priority: MeshUpdatePriority::Background,
+            },
+        );
+        assert!(
+            !renderer.chunks.contains_key(&chunk),
+            "an older background upload must not resurrect a live empty replacement"
         );
     }
 }

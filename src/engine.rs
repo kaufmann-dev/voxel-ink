@@ -6,23 +6,23 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, never, select_biased};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select_biased};
 
 use crate::{
     AppError, Result,
     brush::{
-        BrushDepth, BrushSpec, Ray, brush_indices, brush_indices_cancellable, ray_plane_voxel,
+        BrushDepth, BrushSpec, Ray, brush_indices_cancellable, ray_plane_voxel,
         surface_edit_target, walk_supercover,
     },
     cancel::CancellationToken,
     io::{SaveMode, load_path, save_document},
     mesh::{
-        ChunkCoord, ChunkInput, CompactQuad, MeshJobTag, MeshMemoryBudget, TaggedChunkMesh,
-        bounded_mesh_queue, chunk_grid, invalidated_chunks_for_index_spans,
-        invalidated_chunks_for_indices, mesh_chunk, mesh_queue_capacity,
+        ChunkCoord, ChunkInput, CompactQuad, MeshBudgetError, MeshJobTag, MeshMemoryBudget,
+        MeshUpdatePriority, TaggedChunkMesh, bounded_mesh_queue, chunk_grid,
+        invalidated_chunks_for_index_spans, invalidated_chunks_for_indices, mesh_chunk,
     },
     volume::{
         ChangedVoxels, DocumentSummary, Matrix4, SliceAxis, SliceImage, Tool, VolumeDocument,
@@ -35,8 +35,10 @@ const EVENT_CAPACITY: usize = 256;
 const MESH_EVENT_BACKLOG_LIMIT: usize = 8;
 const PATCH_TILE: u32 = 32;
 const MAX_PREVIEW_VOXELS: usize = 2_000_000;
+const LIVE_FEEDBACK_GRACE: Duration = Duration::from_millis(10);
 
 pub type JobId = u64;
+pub type EditId = u64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BusyKind {
@@ -55,6 +57,19 @@ pub enum StrokeSpace {
 pub enum PointerSample {
     Slice { axis: SliceAxis, voxel: [u32; 3] },
     Ray { ray: Ray },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StrokeDisposition {
+    Complete { final_sample: Option<PointerSample> },
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EditOutcome {
+    Completed,
+    Cancelled,
+    Rejected,
 }
 
 /// A latest-only request for the exact voxels an edit would change.
@@ -90,26 +105,25 @@ pub enum EngineCommand {
     Close,
     SetCursor([u32; 3]),
     BeginStroke {
+        edit_id: EditId,
         tool: Tool,
         spec: BrushSpec,
         space: StrokeSpace,
-    },
-    SliceSample {
-        axis: SliceAxis,
-        voxel: [u32; 3],
-    },
-    RaySample {
-        ray: Ray,
+        initial_sample: PointerSample,
+        cancel: CancellationToken,
     },
     CommitBridge {
+        edit_id: EditId,
         anchor: [u32; 3],
         plane_normal: [f64; 3],
         sample: PointerSample,
         spec: BrushSpec,
         space: StrokeSpace,
     },
-    CompleteStroke,
-    CancelStroke,
+    EndStroke {
+        edit_id: EditId,
+        disposition: StrokeDisposition,
+    },
     Undo,
     Redo,
     FillEnclosedCavities {
@@ -173,6 +187,11 @@ pub enum EngineEvent {
         preview_generation: u64,
         patch: SlicePatch,
     },
+    EditFinished {
+        epoch: u64,
+        edit_id: EditId,
+        outcome: EditOutcome,
+    },
     BrushPreview {
         epoch: u64,
         revision: u64,
@@ -211,6 +230,7 @@ pub enum EngineEvent {
     MeshChunk {
         tag: MeshJobTag,
         quads: Vec<CompactQuad>,
+        priority: MeshUpdatePriority,
     },
     PreviewTooComplex {
         epoch: u64,
@@ -221,8 +241,8 @@ pub enum EngineEvent {
 pub struct EngineHandle {
     commands: Sender<EngineCommand>,
     events: Receiver<EngineEvent>,
-    latest_samples: Sender<PointerSample>,
-    sample_drain: Receiver<PointerSample>,
+    latest_samples: Sender<StrokeSample>,
+    sample_drain: Receiver<StrokeSample>,
     latest_previews: Sender<CancellableBrushPreview>,
     preview_drain: Receiver<CancellableBrushPreview>,
     active_preview: Mutex<Option<CancellationToken>>,
@@ -234,6 +254,12 @@ pub struct EngineHandle {
 struct CancellableBrushPreview {
     request: BrushPreviewRequest,
     cancel: CancellationToken,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StrokeSample {
+    edit_id: EditId,
+    sample: PointerSample,
 }
 
 impl EngineHandle {
@@ -293,7 +319,8 @@ impl EngineHandle {
             })
     }
 
-    pub fn send_latest_sample(&self, sample: PointerSample) -> Result<()> {
+    pub fn send_latest_sample(&self, edit_id: EditId, sample: PointerSample) -> Result<()> {
+        let sample = StrokeSample { edit_id, sample };
         match self.latest_samples.try_send(sample) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(sample)) => {
@@ -462,13 +489,17 @@ impl Drop for EngineHandle {
 
 #[derive(Debug)]
 struct StrokeContext {
+    edit_id: EditId,
     tool: Tool,
     spec: BrushSpec,
     space: StrokeSpace,
+    cancel: CancellationToken,
+    last_sample: Option<PointerSample>,
     last_applied: Option<[u32; 3]>,
+    affected_chunks: HashSet<ChunkCoord>,
 }
 
-type MeshResult = (MeshJobTag, Result<TaggedChunkMesh>);
+type MeshResult = (MeshJobTag, MeshUpdatePriority, Result<TaggedChunkMesh>);
 
 #[derive(Debug, Default)]
 struct DirtyChunkQueue {
@@ -535,6 +566,19 @@ impl DirtyChunkQueue {
         Some(chunk)
     }
 
+    fn remove(&mut self, chunk: ChunkCoord) -> bool {
+        if !self.members.remove(&chunk) {
+            return false;
+        }
+        let position = self
+            .order
+            .iter()
+            .position(|candidate| *candidate == chunk)
+            .expect("dirty chunk membership and order diverged");
+        self.order.remove(position);
+        true
+    }
+
     fn contains_coordinate(&self, chunk: ChunkCoord) -> bool {
         chunk
             .as_array()
@@ -546,7 +590,7 @@ impl DirtyChunkQueue {
 
 struct EngineState {
     command_rx: Receiver<EngineCommand>,
-    sample_rx: Receiver<PointerSample>,
+    sample_rx: Receiver<StrokeSample>,
     preview_rx: Receiver<CancellableBrushPreview>,
     event_tx: Sender<EngineEvent>,
     repaint: egui::Context,
@@ -560,23 +604,34 @@ struct EngineState {
     mesh_worker_limit: usize,
     mesh_in_flight: usize,
     mesh_in_flight_chunks: HashSet<ChunkCoord>,
+    mesh_in_flight_priorities: HashMap<ChunkCoord, MeshUpdatePriority>,
     mesh_dirty: DirtyChunkQueue,
+    mesh_live_chunks: HashSet<ChunkCoord>,
+    mesh_recovery_chunks: HashSet<ChunkCoord>,
+    mesh_recovery_edit: Option<EditId>,
+    deferred_recovery_chunks: HashSet<ChunkCoord>,
+    progressive_live_jobs: HashSet<MeshJobTag>,
+    last_live_feedback_generation: u64,
+    last_live_feedback_at: Option<Instant>,
     mesh_scan_grid: [u32; 3],
     mesh_scan_next: u64,
     mesh_scan_total: u64,
     mesh_pass_generation: u64,
     mesh_generations: HashMap<ChunkCoord, u64>,
+    mesh_edit_generations: HashMap<ChunkCoord, u64>,
     mesh_budget: MeshMemoryBudget,
     mesh_cancel: CancellationToken,
+    mesh_background_cancel: CancellationToken,
     preview_too_complex: bool,
-    pending_mesh_chunk: Option<(MeshJobTag, Vec<CompactQuad>)>,
+    pending_live_mesh_chunks: VecDeque<(MeshJobTag, Vec<CompactQuad>)>,
+    pending_background_mesh_chunks: VecDeque<(MeshJobTag, Vec<CompactQuad>)>,
 }
 
 impl EngineState {
     #[allow(clippy::too_many_arguments)]
     fn new(
         command_rx: Receiver<EngineCommand>,
-        sample_rx: Receiver<PointerSample>,
+        sample_rx: Receiver<StrokeSample>,
         preview_rx: Receiver<CancellableBrushPreview>,
         event_tx: Sender<EngineEvent>,
         mesh_tx: Sender<MeshResult>,
@@ -598,19 +653,30 @@ impl EngineState {
             preview_generation: 0,
             mesh_tx,
             mesh_rx,
-            mesh_worker_limit: mesh_queue_capacity(worker_count),
+            mesh_worker_limit: worker_count.get(),
             mesh_in_flight: 0,
             mesh_in_flight_chunks: HashSet::new(),
+            mesh_in_flight_priorities: HashMap::new(),
             mesh_dirty: DirtyChunkQueue::default(),
+            mesh_live_chunks: HashSet::new(),
+            mesh_recovery_chunks: HashSet::new(),
+            mesh_recovery_edit: None,
+            deferred_recovery_chunks: HashSet::new(),
+            progressive_live_jobs: HashSet::new(),
+            last_live_feedback_generation: 0,
+            last_live_feedback_at: None,
             mesh_scan_grid: [0; 3],
             mesh_scan_next: 0,
             mesh_scan_total: 0,
             mesh_pass_generation: 0,
             mesh_generations: HashMap::new(),
+            mesh_edit_generations: HashMap::new(),
             mesh_budget: MeshMemoryBudget::default(),
             mesh_cancel: CancellationToken::default(),
+            mesh_background_cancel: CancellationToken::default(),
             preview_too_complex: false,
-            pending_mesh_chunk: None,
+            pending_live_mesh_chunks: VecDeque::new(),
+            pending_background_mesh_chunks: VecDeque::new(),
         }
     }
 
@@ -618,13 +684,13 @@ impl EngineState {
         loop {
             self.flush_pending_mesh_chunk();
             self.dispatch_mesh_jobs();
-            let blocked_mesh_rx = never();
-            let selectable_mesh_rx = if self.pending_mesh_chunk.is_none() {
-                &self.mesh_rx
-            } else {
-                &blocked_mesh_rx
-            };
-            let idle_wait = if self.pending_mesh_chunk.is_some() {
+            if self.live_feedback_pending()
+                && self.command_rx.is_empty()
+                && let Ok(result) = self.mesh_rx.try_recv()
+            {
+                self.handle_mesh_result(result);
+            }
+            let idle_wait = if self.has_pending_mesh_chunks() {
                 Duration::from_millis(1)
             } else {
                 Duration::from_millis(25)
@@ -646,7 +712,7 @@ impl EngineState {
                         self.compute_brush_preview(pending);
                     }
                 }
-                recv(selectable_mesh_rx) -> result => {
+                recv(self.mesh_rx) -> result => {
                     if let Ok(result) = result {
                         self.handle_mesh_result(result);
                     }
@@ -655,6 +721,7 @@ impl EngineState {
             }
         }
         self.mesh_cancel.cancel();
+        self.mesh_background_cancel.cancel();
     }
 
     fn handle_command(&mut self, command: EngineCommand) {
@@ -666,29 +733,34 @@ impl EngineState {
             } => self.load(job_id, path, cancel),
             EngineCommand::Close => self.close(),
             EngineCommand::SetCursor(cursor) => self.set_cursor(cursor),
-            EngineCommand::BeginStroke { tool, spec, space } => {
-                self.begin_stroke(tool, spec, space)
-            }
-            EngineCommand::SliceSample { axis, voxel } => {
-                self.apply_pointer_sample(PointerSample::Slice { axis, voxel });
-            }
-            EngineCommand::RaySample { ray } => {
-                self.apply_pointer_sample(PointerSample::Ray { ray });
-            }
+            EngineCommand::BeginStroke {
+                edit_id,
+                tool,
+                spec,
+                space,
+                initial_sample,
+                cancel,
+            } => self.begin_stroke(edit_id, tool, spec, space, initial_sample, cancel),
             EngineCommand::CommitBridge {
+                edit_id,
                 anchor,
                 plane_normal,
                 sample,
                 spec,
                 space,
-            } => self.commit_bridge(anchor, plane_normal, sample, spec, space),
-            EngineCommand::CompleteStroke => {
-                while let Ok(sample) = self.sample_rx.try_recv() {
-                    self.apply_pointer_sample(sample);
+            } => self.commit_bridge(edit_id, anchor, plane_normal, sample, spec, space),
+            EngineCommand::EndStroke {
+                edit_id,
+                disposition,
+            } => match disposition {
+                StrokeDisposition::Complete { final_sample } => {
+                    if let Some(sample) = final_sample {
+                        self.apply_pointer_sample(StrokeSample { edit_id, sample });
+                    }
+                    self.complete_stroke(edit_id);
                 }
-                self.complete_stroke();
-            }
-            EngineCommand::CancelStroke => self.cancel_stroke(),
+                StrokeDisposition::Cancel => self.cancel_stroke(edit_id),
+            },
             EngineCommand::Undo => self.undo(),
             EngineCommand::Redo => self.redo(),
             EngineCommand::FillEnclosedCavities { job_id, cancel } => {
@@ -710,7 +782,18 @@ impl EngineState {
                     token.cancel();
                 }
             }
-            EngineCommand::RebuildPreview => self.reset_mesh_preview(),
+            EngineCommand::RebuildPreview => {
+                if self.stroke.is_some() || self.mesh_recovery_edit.is_some() {
+                    self.emit_error(
+                        None,
+                        AppError::InvalidDimensions(
+                            "the 3D preview cannot rebuild during an active edit".into(),
+                        ),
+                    );
+                } else {
+                    self.reset_mesh_preview();
+                }
+            }
             EngineCommand::Shutdown => {}
         }
     }
@@ -744,6 +827,7 @@ impl EngineState {
                     }
                 };
                 self.mesh_cancel.cancel();
+                self.mesh_background_cancel.cancel();
                 self.epoch = self.epoch.saturating_add(1);
                 self.document = Some(document);
                 self.stroke = None;
@@ -805,8 +889,9 @@ impl EngineState {
             kind: BusyKind::FillingCavities,
             active: true,
         });
-        self.cancel_stroke();
+        self.cancel_active_stroke();
         self.mesh_cancel.cancel();
+        self.mesh_background_cancel.cancel();
         let result = self
             .document
             .as_mut()
@@ -879,8 +964,9 @@ impl EngineState {
     }
 
     fn close(&mut self) {
-        self.cancel_stroke();
+        self.cancel_active_stroke();
         self.mesh_cancel.cancel();
+        self.mesh_background_cancel.cancel();
         self.document = None;
         self.epoch = self.epoch.saturating_add(1);
         self.mesh_dirty.configure([0; 3]);
@@ -888,8 +974,17 @@ impl EngineState {
         self.mesh_scan_next = 0;
         self.mesh_scan_total = 0;
         self.mesh_generations.clear();
+        self.mesh_edit_generations.clear();
+        self.mesh_live_chunks.clear();
+        self.mesh_recovery_chunks.clear();
+        self.mesh_recovery_edit = None;
+        self.deferred_recovery_chunks.clear();
+        self.progressive_live_jobs.clear();
+        self.last_live_feedback_generation = 0;
+        self.last_live_feedback_at = None;
         self.mesh_budget.clear();
-        self.pending_mesh_chunk = None;
+        self.pending_live_mesh_chunks.clear();
+        self.pending_background_mesh_chunks.clear();
         self.emit(EngineEvent::DocumentClosed { epoch: self.epoch });
     }
 
@@ -919,8 +1014,25 @@ impl EngineState {
         self.prioritize_mesh_near_cursor();
     }
 
-    fn begin_stroke(&mut self, tool: Tool, spec: BrushSpec, space: StrokeSpace) {
-        self.cancel_stroke();
+    fn begin_stroke(
+        &mut self,
+        edit_id: EditId,
+        tool: Tool,
+        spec: BrushSpec,
+        space: StrokeSpace,
+        initial_sample: PointerSample,
+        cancel: CancellationToken,
+    ) {
+        if self.stroke.is_some() || self.mesh_recovery_edit.is_some() {
+            self.emit_error(
+                None,
+                AppError::InvalidDimensions(
+                    "another edit stroke is active or still restoring its 3D surface".into(),
+                ),
+            );
+            self.emit_edit_finished(edit_id, EditOutcome::Rejected);
+            return;
+        }
         if tool == Tool::Bridge {
             self.emit_error(
                 None,
@@ -928,31 +1040,49 @@ impl EngineState {
                     "bridge edits must be committed after both endpoints are chosen".into(),
                 ),
             );
+            self.emit_edit_finished(edit_id, EditOutcome::Rejected);
             return;
         }
         let Some(document) = self.document.as_mut() else {
             self.emit_error(None, AppError::NoDocument);
+            self.emit_edit_finished(edit_id, EditOutcome::Rejected);
             return;
         };
-        if let Some(value) = edit_value(tool) {
-            if let Err(error) = document.begin_stroke(value) {
-                self.emit_error(None, error);
-                return;
-            }
-            self.mesh_cancel.cancel();
+        if let Some(value) = edit_value(tool)
+            && let Err(error) = document.begin_stroke(value)
+        {
+            self.emit_error(None, error);
+            self.emit_edit_finished(edit_id, EditOutcome::Rejected);
+            return;
         }
         self.stroke = Some(StrokeContext {
+            edit_id,
             tool,
             spec,
             space,
+            cancel,
+            last_sample: None,
             last_applied: None,
+            affected_chunks: HashSet::new(),
+        });
+        self.apply_pointer_sample(StrokeSample {
+            edit_id,
+            sample: initial_sample,
         });
     }
 
-    fn apply_pointer_sample(&mut self, sample: PointerSample) {
-        let Some(stroke) = self.stroke.as_ref() else {
+    fn apply_pointer_sample(&mut self, pending: StrokeSample) {
+        let Some(stroke) = self.stroke.as_mut() else {
             return;
         };
+        if stroke.edit_id != pending.edit_id {
+            return;
+        }
+        let sample = pending.sample;
+        if stroke.last_sample == Some(sample) {
+            return;
+        }
+        stroke.last_sample = Some(sample);
         let target = self
             .document
             .as_ref()
@@ -964,7 +1094,15 @@ impl EngineState {
     }
 
     fn apply_target(&mut self, target: [u32; 3]) {
-        let Some(stroke) = self.stroke.as_mut() else {
+        let Some((tool, spec, space, start, cancel)) = self.stroke.as_ref().map(|stroke| {
+            (
+                stroke.tool,
+                stroke.spec,
+                stroke.space,
+                stroke.last_applied.unwrap_or(target),
+                stroke.cancel.clone(),
+            )
+        }) else {
             return;
         };
         let Some(document) = self.document.as_mut() else {
@@ -974,9 +1112,12 @@ impl EngineState {
             return;
         }
         let previous_cursor = document.cursor();
-        if stroke.tool == Tool::Inspect {
+        if tool == Tool::Inspect {
             document.set_cursor(target);
-            stroke.last_applied = Some(target);
+            self.stroke
+                .as_mut()
+                .expect("the inspect stroke remains active")
+                .last_applied = Some(target);
             let summary = document.summary();
             let revision = document.revision();
             let slices = match visible_slices(document) {
@@ -1000,38 +1141,72 @@ impl EngineState {
         let replacement_axes = axes_with_changed_coordinate(previous_cursor, target);
         let replaced_axes = replacement_axes.iter().copied().collect::<HashSet<_>>();
         let mut patch_tiles = HashSet::new();
-        let space = stroke.space;
-        let spec = stroke.spec;
-        let start = stroke.last_applied.unwrap_or(target);
+        let stroke_change_start = document.active_stroke_indices().map_or(0, <[u32]>::len);
         let apply_result = walk_supercover(start, target, |center| {
-            let footprint = footprint_indices(document, center, spec, space)?;
-            document.apply_stroke_indices(footprint.iter().copied())?;
-            add_slice_patch_tiles(
-                document,
-                footprint.iter().copied(),
-                &replaced_axes,
-                &mut patch_tiles,
-            )
+            cancel.check()?;
+            let footprint = footprint_indices(document, center, spec, space, &cancel)?;
+            for batch in footprint.chunks(4_096) {
+                cancel.check()?;
+                document.apply_stroke_indices(batch.iter().copied())?;
+                add_slice_patch_tiles(
+                    document,
+                    batch.iter().copied(),
+                    &replaced_axes,
+                    &mut patch_tiles,
+                )?;
+            }
+            Ok(())
         });
         if let Err(error) = apply_result {
-            document.cancel_stroke();
-            self.stroke = None;
-            self.emit_error(None, error);
-            self.resume_mesh_after_cancel();
+            let _ = document;
+            self.rollback_active_stroke(Some(previous_cursor));
+            if !matches!(error, AppError::Cancelled) {
+                self.emit_error(None, error);
+            }
             return;
         }
         document.set_cursor(target);
-        stroke.last_applied = Some(target);
+        self.stroke
+            .as_mut()
+            .expect("the editable stroke remains active")
+            .last_applied = Some(target);
         self.preview_generation = self.preview_generation.saturating_add(1);
         let revision = document.revision();
+        let dimensions = document.geometry().dimensions;
+        let newly_affected = invalidated_chunks_for_indices(
+            dimensions,
+            document
+                .active_stroke_indices()
+                .expect("an editable stroke owns its exact changes")[stroke_change_start..]
+                .iter()
+                .copied(),
+        );
+        if newly_affected
+            .iter()
+            .copied()
+            .any(|chunk| self.mesh_budget.reserve_current_if_absent(chunk).is_err())
+        {
+            let _ = document;
+            self.rollback_active_stroke(Some(previous_cursor));
+            self.emit_error(
+                None,
+                AppError::Allocation {
+                    bytes: std::mem::size_of::<(ChunkCoord, usize)>(),
+                },
+            );
+            return;
+        }
+        self.stroke
+            .as_mut()
+            .expect("the editable stroke remains active")
+            .affected_chunks
+            .extend(newly_affected.iter().copied());
         let patches = match slice_patches_from_tiles(document, patch_tiles) {
             Ok(patches) => patches,
             Err(error) => {
-                document.cancel_stroke();
-                document.set_cursor(previous_cursor);
-                self.stroke = None;
+                let _ = document;
+                self.rollback_active_stroke(Some(previous_cursor));
                 self.emit_error(None, error);
-                self.resume_mesh_after_cancel();
                 return;
             }
         };
@@ -1047,6 +1222,10 @@ impl EngineState {
                 patch,
             });
         }
+        if !newly_affected.is_empty() {
+            self.preempt_mesh_for_live_feedback();
+        }
+        self.promote_live_mesh_chunks(newly_affected);
         let replacements = replacement_axes
             .iter()
             .map(|&axis| {
@@ -1059,27 +1238,8 @@ impl EngineState {
         let replacements = match replacements {
             Ok(replacements) => replacements,
             Err(error) => {
-                let restoration = self.document.as_mut().and_then(|document| {
-                    document.cancel_stroke();
-                    document.set_cursor(previous_cursor);
-                    visible_slices(document)
-                        .ok()
-                        .map(|slices| (document.summary(), document.revision(), slices))
-                });
-                self.stroke = None;
-                if let Some((summary, revision, slices)) = restoration {
-                    self.emit(EngineEvent::Summary {
-                        epoch: self.epoch,
-                        summary,
-                    });
-                    self.emit(EngineEvent::SlicesReplaced {
-                        epoch: self.epoch,
-                        revision,
-                        slices,
-                    });
-                }
+                self.rollback_active_stroke(Some(previous_cursor));
                 self.emit_error(None, error);
-                self.resume_mesh_after_cancel();
                 return;
             }
         };
@@ -1107,12 +1267,7 @@ impl EngineState {
             return;
         };
         let revision = document.revision();
-        match calculate_brush_preview(
-            document,
-            self.stroke.as_ref(),
-            pending.request,
-            &pending.cancel,
-        ) {
+        match calculate_brush_preview(document, pending.request, &pending.cancel) {
             Ok(preview) => {
                 if pending.cancel.check().is_ok() {
                     self.emit(EngineEvent::BrushPreview {
@@ -1137,13 +1292,23 @@ impl EngineState {
 
     fn commit_bridge(
         &mut self,
+        edit_id: EditId,
         anchor: [u32; 3],
         plane_normal: [f64; 3],
         sample: PointerSample,
         spec: BrushSpec,
         space: StrokeSpace,
     ) {
-        self.cancel_stroke();
+        if self.stroke.is_some() || self.mesh_recovery_edit.is_some() {
+            self.emit_error(
+                None,
+                AppError::InvalidDimensions(
+                    "another edit stroke is active or still restoring its 3D surface".into(),
+                ),
+            );
+            self.emit_edit_finished(edit_id, EditOutcome::Rejected);
+            return;
+        }
         let (end, candidates) =
             match self
                 .document
@@ -1162,10 +1327,12 @@ impl EngineState {
                 Ok(output) => output,
                 Err(error) => {
                     self.emit_error(None, error);
+                    self.emit_edit_finished(edit_id, EditOutcome::Rejected);
                     return;
                 }
             };
         let Some(document) = self.document.as_mut() else {
+            self.emit_edit_finished(edit_id, EditOutcome::Rejected);
             return;
         };
         let previous_cursor = document.cursor();
@@ -1183,9 +1350,11 @@ impl EngineState {
         }) {
             document.cancel_stroke();
             self.emit_error(None, error);
+            self.emit_edit_finished(edit_id, EditOutcome::Rejected);
             return;
         }
         self.mesh_cancel.cancel();
+        self.mesh_background_cancel.cancel();
         document.set_cursor(end);
         let replacements = replacement_axes
             .iter()
@@ -1201,6 +1370,7 @@ impl EngineState {
                 document.set_cursor(previous_cursor);
                 self.emit_error(None, error);
                 self.resume_mesh_after_cancel();
+                self.emit_edit_finished(edit_id, EditOutcome::Cancelled);
                 return;
             }
         };
@@ -1219,6 +1389,7 @@ impl EngineState {
                 });
             }
             self.resume_mesh_after_cancel();
+            self.emit_edit_finished(edit_id, EditOutcome::Completed);
             return;
         };
         self.preview_generation = self.preview_generation.saturating_add(1);
@@ -1247,26 +1418,39 @@ impl EngineState {
             });
         }
         self.restart_mesh_after_change(invalidated, revision);
+        self.emit_edit_finished(edit_id, EditOutcome::Completed);
     }
 
-    fn complete_stroke(&mut self) {
+    fn complete_stroke(&mut self, edit_id: EditId) {
+        if self
+            .stroke
+            .as_ref()
+            .is_none_or(|stroke| stroke.edit_id != edit_id)
+        {
+            return;
+        }
         let Some(stroke) = self.stroke.take() else {
             return;
         };
         if stroke.tool == Tool::Inspect {
+            self.emit_edit_finished(edit_id, EditOutcome::Completed);
             return;
         }
         let Some(document) = self.document.as_mut() else {
+            self.emit_edit_finished(edit_id, EditOutcome::Rejected);
             return;
         };
         if document.finish_stroke().is_none() {
-            self.resume_mesh_after_cancel();
+            for chunk in stroke.affected_chunks {
+                self.mesh_budget.release_reservation(chunk);
+            }
+            self.emit_edit_finished(edit_id, EditOutcome::Completed);
             return;
         }
-        let invalidated = invalidated_chunks_for_changes(
-            document.geometry().dimensions,
-            document.latest_undo_changes(),
-        );
+        let invalidated = stroke.affected_chunks.into_iter().collect();
+        for &chunk in &invalidated {
+            self.mesh_budget.release_reservation(chunk);
+        }
         let summary = document.summary();
         let revision = document.revision();
         self.emit(EngineEvent::Summary {
@@ -1274,42 +1458,130 @@ impl EngineState {
             summary,
         });
         self.restart_mesh_after_change(invalidated, revision);
+        self.emit_edit_finished(edit_id, EditOutcome::Completed);
     }
 
-    fn cancel_stroke(&mut self) {
-        let editable = self
+    fn cancel_stroke(&mut self, edit_id: EditId) {
+        if self
             .stroke
-            .take()
-            .is_some_and(|stroke| stroke.tool != Tool::Inspect);
-        if editable {
-            if let Some(document) = self.document.as_mut() {
-                document.cancel_stroke();
-                let revision = document.revision();
-                let summary = document.summary();
-                let slices = match visible_slices(document) {
-                    Ok(slices) => slices,
-                    Err(error) => {
-                        self.emit_error(None, error);
-                        self.resume_mesh_after_cancel();
-                        return;
-                    }
-                };
-                self.emit(EngineEvent::Summary {
-                    epoch: self.epoch,
-                    summary,
-                });
-                self.emit(EngineEvent::SlicesReplaced {
-                    epoch: self.epoch,
-                    revision,
-                    slices,
-                });
-            }
-            self.resume_mesh_after_cancel();
+            .as_ref()
+            .is_none_or(|stroke| stroke.edit_id != edit_id)
+        {
+            return;
         }
+        self.rollback_active_stroke(None);
+    }
+
+    fn cancel_active_stroke(&mut self) {
+        self.rollback_active_stroke(None);
+    }
+
+    fn rollback_active_stroke(&mut self, restore_cursor: Option<[u32; 3]>) {
+        let Some(stroke) = self.stroke.take() else {
+            return;
+        };
+        let edit_id = stroke.edit_id;
+        if stroke.tool == Tool::Inspect {
+            self.emit_edit_finished(edit_id, EditOutcome::Cancelled);
+            return;
+        }
+        let mut affected = stroke.affected_chunks;
+        let restoration = self.document.as_mut().map(|document| {
+            let dimensions = document.geometry().dimensions;
+            if let Some(indices) = document.active_stroke_indices() {
+                affected.extend(invalidated_chunks_for_indices(
+                    dimensions,
+                    indices.iter().copied(),
+                ));
+            }
+            document.cancel_stroke();
+            if let Some(cursor) = restore_cursor {
+                document.set_cursor(cursor);
+            }
+            let summary = document.summary();
+            let revision = document.revision();
+            let slices = visible_slices(document);
+            (summary, revision, slices)
+        });
+        let affected = affected.into_iter().collect::<Vec<_>>();
+        let mut preserved_live = if affected.is_empty() {
+            HashSet::new()
+        } else {
+            self.cancel_mesh_for_barrier()
+        };
+        let affected_set = affected.iter().copied().collect::<HashSet<_>>();
+        preserved_live.retain(|chunk| !affected_set.contains(chunk));
+        self.promote_live_mesh_chunks(preserved_live);
+        self.promote_live_mesh_chunks(affected.iter().copied());
+        let Some((summary, revision, slices)) = restoration else {
+            self.emit_edit_finished(edit_id, EditOutcome::Cancelled);
+            return;
+        };
+        self.mesh_recovery_edit = Some(edit_id);
+        let mut absent_before_stroke = Vec::new();
+        let mut never_promoted = Vec::new();
+        for &chunk in &affected {
+            match self.mesh_budget.reserved_bytes(chunk) {
+                Some(0) => absent_before_stroke.push(chunk),
+                Some(_) => {
+                    self.mesh_recovery_chunks.insert(chunk);
+                }
+                None => never_promoted.push(chunk),
+            }
+        }
+        for chunk in never_promoted {
+            // Cancellation can interrupt a sample after it mutates occupancy but
+            // before that sample reserves or promotes any mesh work. The resident
+            // geometry is therefore already the restored geometry. Demote the
+            // bookkeeping-only promotion and let ordinary background work revisit
+            // a chunk that had not reached the renderer yet.
+            self.mesh_dirty.remove(chunk);
+            self.mesh_live_chunks.remove(&chunk);
+            if !self.preview_too_complex {
+                let queued = self.mesh_dirty.enqueue_back(chunk);
+                debug_assert!(queued);
+            }
+        }
+        for chunk in absent_before_stroke {
+            self.mesh_dirty.remove(chunk);
+            self.mesh_live_chunks.remove(&chunk);
+            self.mesh_budget.remove(chunk);
+            let generation = self
+                .mesh_generations
+                .get(&chunk)
+                .copied()
+                .unwrap_or(self.mesh_pass_generation);
+            let tag = MeshJobTag {
+                document_epoch: self.epoch,
+                revision,
+                chunk_generation: generation,
+                edit_generation: self.preview_generation,
+                chunk,
+            };
+            self.queue_mesh_chunk(tag, Vec::new(), MeshUpdatePriority::Live);
+            self.mesh_budget.release_reservation(chunk);
+            if !self.preview_too_complex {
+                let queued = self.mesh_dirty.enqueue_back(chunk);
+                debug_assert!(queued);
+            }
+        }
+        self.emit(EngineEvent::Summary {
+            epoch: self.epoch,
+            summary,
+        });
+        match slices {
+            Ok(slices) => self.emit(EngineEvent::SlicesReplaced {
+                epoch: self.epoch,
+                revision,
+                slices,
+            }),
+            Err(error) => self.emit_error(None, error),
+        }
+        self.maybe_finish_mesh_recovery();
     }
 
     fn undo(&mut self) {
-        self.cancel_stroke();
+        self.cancel_active_stroke();
         let Some(document) = self.document.as_mut() else {
             return;
         };
@@ -1342,7 +1614,7 @@ impl EngineState {
     }
 
     fn redo(&mut self) {
-        self.cancel_stroke();
+        self.cancel_active_stroke();
         let Some(document) = self.document.as_mut() else {
             return;
         };
@@ -1376,13 +1648,29 @@ impl EngineState {
 
     fn reset_mesh_preview(&mut self) {
         self.mesh_cancel.cancel();
+        self.mesh_background_cancel.cancel();
         self.mesh_dirty.clear();
+        self.mesh_live_chunks.clear();
+        self.mesh_recovery_chunks.clear();
+        self.mesh_recovery_edit = None;
+        self.deferred_recovery_chunks.clear();
+        self.progressive_live_jobs.clear();
+        self.last_live_feedback_generation = 0;
+        self.last_live_feedback_at = None;
         self.mesh_budget.clear();
-        self.pending_mesh_chunk = None;
+        self.pending_live_mesh_chunks.clear();
+        self.pending_background_mesh_chunks.clear();
         self.preview_too_complex = false;
         self.mesh_cancel = CancellationToken::default();
-        self.mesh_pass_generation = self.mesh_pass_generation.saturating_add(1);
+        self.mesh_background_cancel = CancellationToken::default();
+        self.mesh_pass_generation = self
+            .mesh_generations
+            .values()
+            .copied()
+            .fold(self.mesh_pass_generation, u64::max)
+            .saturating_add(1);
         self.mesh_generations.clear();
+        self.mesh_edit_generations.clear();
         let Some(document) = &self.document else {
             self.mesh_scan_grid = [0; 3];
             self.mesh_scan_next = 0;
@@ -1407,33 +1695,20 @@ impl EngineState {
 
     fn restart_mesh_after_change(&mut self, invalidated: Vec<ChunkCoord>, revision: u64) {
         self.mesh_cancel.cancel();
+        self.mesh_background_cancel.cancel();
         self.mesh_cancel = CancellationToken::default();
+        self.mesh_background_cancel = CancellationToken::default();
+        self.progressive_live_jobs.clear();
         if self.document.is_none() {
             return;
         }
-        if let Some((tag, _)) = self.pending_mesh_chunk.take() {
-            let queued = self.mesh_dirty.enqueue_back(tag.chunk);
-            debug_assert!(queued);
-        }
-        for chunk in self
-            .mesh_in_flight_chunks
-            .iter()
-            .copied()
-            .chain(invalidated.iter().copied())
-        {
-            let queued = self.mesh_dirty.enqueue_back(chunk);
-            debug_assert!(queued);
-        }
-        for &chunk in &invalidated {
-            let generation = self
-                .mesh_generations
-                .get(&chunk)
-                .copied()
-                .unwrap_or(self.mesh_pass_generation)
-                .saturating_add(1);
-            self.mesh_generations.insert(chunk, generation);
-        }
+        let mut preserved_live = self.requeue_pending_mesh_chunks();
+        preserved_live.extend(self.requeue_in_flight_mesh_chunks());
+        let invalidated_set = invalidated.iter().copied().collect::<HashSet<_>>();
+        preserved_live.retain(|chunk| !invalidated_set.contains(chunk));
         self.prioritize_mesh_near_cursor();
+        self.promote_live_mesh_chunks(preserved_live);
+        self.promote_live_mesh_chunks(invalidated.iter().copied());
         self.emit(EngineEvent::MeshInvalidated {
             epoch: self.epoch,
             revision,
@@ -1441,13 +1716,100 @@ impl EngineState {
         });
     }
 
-    fn resume_mesh_after_cancel(&mut self) {
-        self.mesh_cancel = CancellationToken::default();
-        for chunk in self.mesh_in_flight_chunks.clone() {
+    fn promote_live_mesh_chunks(&mut self, chunks: impl IntoIterator<Item = ChunkCoord>) {
+        for chunk in chunks {
+            if !self.mesh_dirty.contains_coordinate(chunk) {
+                continue;
+            }
+            let generation = self
+                .mesh_generations
+                .get(&chunk)
+                .copied()
+                .unwrap_or(self.mesh_pass_generation)
+                .saturating_add(1);
+            self.mesh_generations.insert(chunk, generation);
+            self.mesh_edit_generations
+                .insert(chunk, self.preview_generation);
+            self.mesh_live_chunks.insert(chunk);
+            self.mesh_dirty.promote(chunk);
+        }
+    }
+
+    fn preempt_mesh_for_live_feedback(&mut self) {
+        let background_chunks = self
+            .mesh_in_flight_priorities
+            .iter()
+            .filter_map(|(&chunk, &priority)| {
+                (priority == MeshUpdatePriority::Background).then_some(chunk)
+            })
+            .collect::<Vec<_>>();
+        if background_chunks.is_empty() {
+            return;
+        }
+        self.mesh_background_cancel.cancel();
+        self.mesh_background_cancel = CancellationToken::default();
+        for chunk in background_chunks {
             let queued = self.mesh_dirty.enqueue_back(chunk);
             debug_assert!(queued);
         }
+    }
+
+    fn cancel_mesh_for_barrier(&mut self) -> HashSet<ChunkCoord> {
+        self.mesh_cancel.cancel();
+        self.mesh_background_cancel.cancel();
+        self.mesh_cancel = CancellationToken::default();
+        self.mesh_background_cancel = CancellationToken::default();
+        self.progressive_live_jobs.clear();
+        let mut preserved_live = self.requeue_pending_mesh_chunks();
+        preserved_live.extend(self.requeue_in_flight_mesh_chunks());
+        preserved_live
+    }
+
+    fn resume_mesh_after_cancel(&mut self) {
+        self.mesh_cancel = CancellationToken::default();
+        self.mesh_background_cancel = CancellationToken::default();
+        self.progressive_live_jobs.clear();
+        let preserved_live = self.requeue_in_flight_mesh_chunks();
         self.prioritize_mesh_near_cursor();
+        self.promote_live_mesh_chunks(preserved_live);
+    }
+
+    fn requeue_pending_mesh_chunks(&mut self) -> HashSet<ChunkCoord> {
+        let mut preserved_live = HashSet::new();
+        for (tag, _) in self.pending_live_mesh_chunks.drain(..) {
+            preserved_live.insert(tag.chunk);
+            let queued = self.mesh_dirty.enqueue_back(tag.chunk);
+            debug_assert!(queued);
+        }
+        for (tag, _) in self.pending_background_mesh_chunks.drain(..) {
+            let queued = self.mesh_dirty.enqueue_back(tag.chunk);
+            debug_assert!(queued);
+        }
+        preserved_live
+    }
+
+    fn requeue_in_flight_mesh_chunks(&mut self) -> HashSet<ChunkCoord> {
+        let mut preserved_live = HashSet::new();
+        for &chunk in &self.mesh_in_flight_chunks {
+            if self.mesh_in_flight_priorities.get(&chunk) == Some(&MeshUpdatePriority::Live) {
+                preserved_live.insert(chunk);
+            }
+            let queued = self.mesh_dirty.enqueue_back(chunk);
+            debug_assert!(queued);
+        }
+        preserved_live
+    }
+
+    fn live_feedback_pending(&self) -> bool {
+        self.stroke.is_some()
+            || !self.mesh_live_chunks.is_empty()
+            || !self.mesh_recovery_chunks.is_empty()
+            || !self.progressive_live_jobs.is_empty()
+            || !self.pending_live_mesh_chunks.is_empty()
+            || self
+                .mesh_in_flight_priorities
+                .values()
+                .any(|priority| *priority == MeshUpdatePriority::Live)
     }
 
     fn prioritize_mesh_near_cursor(&mut self) {
@@ -1489,25 +1851,61 @@ impl EngineState {
     }
 
     fn dispatch_mesh_jobs(&mut self) {
-        if self.pending_mesh_chunk.is_some()
-            || self
-                .stroke
-                .as_ref()
-                .is_some_and(|stroke| stroke.tool != Tool::Inspect)
-            || self.preview_too_complex
+        if (self.preview_too_complex && self.mesh_recovery_chunks.is_empty())
+            || (self.has_pending_mesh_chunks()
+                && self.mesh_live_chunks.is_empty()
+                && self.mesh_recovery_chunks.is_empty())
         {
             return;
         }
         while self.mesh_in_flight < self.mesh_worker_limit {
-            if !self.command_rx.is_empty()
-                || !self.sample_rx.is_empty()
-                || !self.preview_rx.is_empty()
+            if self.stroke.is_some()
+                && self
+                    .mesh_in_flight_priorities
+                    .values()
+                    .any(|priority| *priority == MeshUpdatePriority::Live)
             {
                 break;
             }
-            let Some(chunk) = self.next_mesh_chunk() else {
+            if self.has_pending_mesh_chunks()
+                && self.mesh_live_chunks.is_empty()
+                && self.mesh_recovery_chunks.is_empty()
+            {
+                break;
+            }
+            if !self.command_rx.is_empty() {
+                break;
+            }
+            if (!self.sample_rx.is_empty() || !self.preview_rx.is_empty())
+                && self.mesh_live_chunks.is_empty()
+            {
+                break;
+            }
+            let next = if self.preview_too_complex {
+                self.next_recovery_mesh_chunk()
+            } else {
+                self.next_mesh_chunk()
+            };
+            let Some((chunk, priority)) = next else {
                 break;
             };
+            let edit_generation = self.mesh_edit_generations.get(&chunk).copied().unwrap_or(0);
+            if priority == MeshUpdatePriority::Live
+                && self.stroke.is_some()
+                && edit_generation <= self.last_live_feedback_generation
+                && self
+                    .last_live_feedback_at
+                    .is_some_and(|at| at.elapsed() < LIVE_FEEDBACK_GRACE)
+            {
+                self.mesh_live_chunks.insert(chunk);
+                self.mesh_dirty.promote(chunk);
+                break;
+            }
+            if priority == MeshUpdatePriority::Background && self.stroke.is_some() {
+                let queued = self.mesh_dirty.enqueue_back(chunk);
+                debug_assert!(queued);
+                break;
+            }
             let Some(document) = &self.document else {
                 break;
             };
@@ -1520,33 +1918,55 @@ impl EngineState {
                 document_epoch: self.epoch,
                 revision: document.revision(),
                 chunk_generation: generation,
+                edit_generation,
                 chunk,
+            };
+            let cancel = match priority {
+                MeshUpdatePriority::Background => self.mesh_background_cancel.clone(),
+                MeshUpdatePriority::Live => self.mesh_cancel.clone(),
             };
             let input = match ChunkInput::copy_from_volume(
                 document.geometry().dimensions,
                 document.view().occupancy,
                 chunk,
-                &self.mesh_cancel,
+                &cancel,
             ) {
                 Ok(input) => input,
-                Err(AppError::Cancelled) => break,
+                Err(AppError::Cancelled) => {
+                    if self.mesh_recovery_chunks.contains(&chunk) {
+                        self.mesh_cancel = CancellationToken::default();
+                        self.mesh_live_chunks.insert(chunk);
+                        self.mesh_dirty.promote(chunk);
+                    }
+                    break;
+                }
                 Err(error) => {
+                    if self.mesh_recovery_chunks.contains(&chunk) {
+                        self.fail_mesh_recovery(format!(
+                            "chunk {:?} could not be prepared for remeshing: {error}",
+                            chunk.as_array()
+                        ));
+                        break;
+                    }
                     self.emit_error(None, error);
                     continue;
                 }
             };
             let sender = self.mesh_tx.clone();
-            let cancel = self.mesh_cancel.clone();
             self.mesh_in_flight += 1;
             self.mesh_in_flight_chunks.insert(chunk);
+            self.mesh_in_flight_priorities.insert(chunk, priority);
+            if priority == MeshUpdatePriority::Live {
+                self.progressive_live_jobs.insert(tag);
+            }
             rayon::spawn(move || {
                 let result = mesh_chunk(&input, tag, &cancel);
-                let _ = sender.send((tag, result));
+                let _ = sender.send((tag, priority, result));
             });
         }
     }
 
-    fn next_mesh_chunk(&mut self) -> Option<ChunkCoord> {
+    fn next_mesh_chunk(&mut self) -> Option<(ChunkCoord, MeshUpdatePriority)> {
         let pending = self.mesh_dirty.len();
         for _ in 0..pending {
             let chunk = self.mesh_dirty.pop_front()?;
@@ -1554,7 +1974,12 @@ impl EngineState {
                 let queued = self.mesh_dirty.enqueue_back(chunk);
                 debug_assert!(queued);
             } else {
-                return Some(chunk);
+                let priority = if self.mesh_live_chunks.remove(&chunk) {
+                    MeshUpdatePriority::Live
+                } else {
+                    MeshUpdatePriority::Background
+                };
+                return Some((chunk, priority));
             }
         }
         while self.mesh_scan_next < self.mesh_scan_total {
@@ -1565,15 +1990,32 @@ impl EngineState {
                 debug_assert!(queued);
                 continue;
             }
-            return Some(chunk);
+            return Some((chunk, MeshUpdatePriority::Background));
         }
         None
     }
 
-    fn handle_mesh_result(&mut self, (tag, result): MeshResult) {
+    fn next_recovery_mesh_chunk(&mut self) -> Option<(ChunkCoord, MeshUpdatePriority)> {
+        let chunk = self.mesh_recovery_chunks.iter().copied().find(|chunk| {
+            !self.mesh_in_flight_chunks.contains(chunk) && self.mesh_dirty.members.contains(chunk)
+        })?;
+        if !self.mesh_dirty.remove(chunk) {
+            return None;
+        }
+        self.mesh_live_chunks.remove(&chunk);
+        Some((chunk, MeshUpdatePriority::Live))
+    }
+
+    fn handle_mesh_result(&mut self, (tag, priority, result): MeshResult) {
         self.mesh_in_flight = self.mesh_in_flight.saturating_sub(1);
         self.mesh_in_flight_chunks.remove(&tag.chunk);
-        if self.preview_too_complex {
+        self.mesh_in_flight_priorities.remove(&tag.chunk);
+        let progressive_live = self.progressive_live_jobs.remove(&tag);
+        let recovery_result = self.mesh_recovery_chunks.contains(&tag.chunk);
+        if self.mesh_recovery_edit.is_some() && !recovery_result {
+            return;
+        }
+        if self.preview_too_complex && !recovery_result {
             return;
         }
         let Some(document) = &self.document else {
@@ -1584,33 +2026,70 @@ impl EngineState {
             .get(&tag.chunk)
             .copied()
             .unwrap_or(self.mesh_pass_generation);
-        if tag.is_stale(self.epoch, document.revision(), generation) {
+        let identity_is_stale =
+            tag.document_epoch != self.epoch || tag.revision != document.revision();
+        let progressive_generation = priority == MeshUpdatePriority::Live
+            && progressive_live
+            && tag.chunk_generation < generation;
+        if identity_is_stale || (tag.chunk_generation != generation && !progressive_generation) {
             return;
         }
         let tagged = match result {
             Ok(tagged) => tagged,
             Err(AppError::Cancelled) => {
-                // An editable stroke cancels the current mesh pass but leaves
-                // the document revision unchanged until the stroke commits.
-                // A cancelled result can therefore arrive and be removed from
-                // `mesh_in_flight_chunks` before completion has a chance to
-                // requeue it. Keep that non-stale chunk dirty immediately so
-                // the replacement pass cannot lose work already passed by the
-                // lazy scan cursor.
+                // A cancelled shared pass can leave the document identity and
+                // this chunk generation unchanged. Keep that still-current
+                // chunk dirty so work already passed by the lazy scan cursor is
+                // not lost when the replacement pass resumes.
                 let queued = self.mesh_dirty.enqueue_back(tag.chunk);
                 debug_assert!(queued);
+                if recovery_result {
+                    if self.mesh_cancel.is_cancelled() {
+                        self.mesh_cancel = CancellationToken::default();
+                    }
+                    self.mesh_live_chunks.insert(tag.chunk);
+                    self.mesh_dirty.promote(tag.chunk);
+                }
                 return;
             }
             Err(error) => {
-                self.emit_error(None, error);
+                if recovery_result {
+                    self.fail_mesh_recovery(format!(
+                        "chunk {:?} could not be remeshed: {error}",
+                        tag.chunk.as_array()
+                    ));
+                } else {
+                    self.emit_error(None, error);
+                }
                 return;
             }
         };
+        if recovery_result {
+            match self.mesh_budget.try_replace_mesh(tag.chunk, &tagged.mesh) {
+                Ok(()) => {
+                    self.accept_recovery_mesh(tagged);
+                    self.requeue_deferred_recovery_chunks();
+                }
+                Err(MeshBudgetError::Limit { .. }) => {
+                    self.deferred_recovery_chunks.insert(tag.chunk);
+                    self.fail_recovery_if_no_progress_is_possible();
+                }
+                Err(MeshBudgetError::Allocation) => {
+                    self.fail_mesh_recovery(format!(
+                        "mesh accounting for chunk {:?} ran out of memory",
+                        tag.chunk.as_array()
+                    ));
+                }
+            }
+            self.maybe_finish_mesh_recovery();
+            return;
+        }
         if self
             .mesh_budget
             .try_replace_mesh_or_cancel(tag.chunk, &tagged.mesh, &self.mesh_cancel)
             .is_err()
         {
+            self.mesh_background_cancel.cancel();
             self.preview_too_complex = true;
             self.mesh_dirty.clear();
             self.mesh_scan_next = self.mesh_scan_total;
@@ -1620,33 +2099,194 @@ impl EngineState {
             });
             return;
         }
-        self.queue_mesh_chunk(tagged.tag, tagged.mesh.quads);
+        self.queue_mesh_chunk(tagged.tag, tagged.mesh.quads, priority);
+        if priority == MeshUpdatePriority::Live && self.stroke.is_some() {
+            self.last_live_feedback_generation =
+                self.last_live_feedback_generation.max(tag.edit_generation);
+            self.last_live_feedback_at = Some(Instant::now());
+        }
     }
 
-    fn queue_mesh_chunk(&mut self, tag: MeshJobTag, quads: Vec<CompactQuad>) {
-        debug_assert!(self.pending_mesh_chunk.is_none());
-        if self.event_tx.len() >= MESH_EVENT_BACKLOG_LIMIT {
-            self.pending_mesh_chunk = Some((tag, quads));
+    fn accept_recovery_mesh(&mut self, tagged: TaggedChunkMesh) {
+        let tag = tagged.tag;
+        self.mesh_budget.release_reservation(tag.chunk);
+        self.mesh_recovery_chunks.remove(&tag.chunk);
+        self.queue_mesh_chunk(tag, tagged.mesh.quads, MeshUpdatePriority::Live);
+    }
+
+    fn requeue_deferred_recovery_chunks(&mut self) {
+        for chunk in self.deferred_recovery_chunks.drain() {
+            self.mesh_live_chunks.insert(chunk);
+            let queued = self.mesh_dirty.enqueue_back(chunk);
+            debug_assert!(queued);
+        }
+    }
+
+    fn fail_recovery_if_no_progress_is_possible(&mut self) {
+        let work_can_still_finish = self.mesh_recovery_chunks.iter().any(|chunk| {
+            self.mesh_in_flight_chunks.contains(chunk) || self.mesh_dirty.members.contains(chunk)
+        });
+        if !self.deferred_recovery_chunks.is_empty() && !work_can_still_finish {
+            self.fail_mesh_recovery(
+                "the restored chunk meshes exceed the available 3D preview memory".into(),
+            );
+        }
+    }
+
+    fn fail_mesh_recovery(&mut self, message: String) {
+        let failed_chunks = self.mesh_recovery_chunks.clone();
+        self.mesh_cancel.cancel();
+        self.mesh_background_cancel.cancel();
+        self.preview_too_complex = true;
+        self.mesh_dirty.clear();
+        self.mesh_live_chunks.clear();
+        self.mesh_scan_next = self.mesh_scan_total;
+        self.progressive_live_jobs.clear();
+        self.pending_live_mesh_chunks
+            .retain(|(tag, _)| !failed_chunks.contains(&tag.chunk));
+        for chunk in self.mesh_recovery_chunks.drain() {
+            self.mesh_budget.release_reservation(chunk);
+        }
+        self.deferred_recovery_chunks.clear();
+        self.emit(EngineEvent::Error {
+            job_id: None,
+            message: format!("3D surface rollback failed: {message}"),
+            source_changed: false,
+        });
+        if let Some(document) = &self.document {
+            self.emit(EngineEvent::PreviewTooComplex {
+                epoch: self.epoch,
+                revision: document.revision(),
+            });
+        }
+        self.maybe_finish_mesh_recovery();
+    }
+
+    fn maybe_finish_mesh_recovery(&mut self) {
+        if self.mesh_recovery_chunks.is_empty()
+            && self.deferred_recovery_chunks.is_empty()
+            && self.pending_live_mesh_chunks.is_empty()
+            && let Some(edit_id) = self.mesh_recovery_edit.take()
+        {
+            self.emit_edit_finished(edit_id, EditOutcome::Cancelled);
+        }
+    }
+
+    fn queue_mesh_chunk(
+        &mut self,
+        tag: MeshJobTag,
+        quads: Vec<CompactQuad>,
+        priority: MeshUpdatePriority,
+    ) {
+        if self.has_pending_mesh_chunks() || self.event_tx.len() >= MESH_EVENT_BACKLOG_LIMIT {
+            self.enqueue_pending_mesh_chunk(tag, quads, priority);
             return;
         }
-        match self
-            .event_tx
-            .try_send(EngineEvent::MeshChunk { tag, quads })
-        {
+        match self.event_tx.try_send(EngineEvent::MeshChunk {
+            tag,
+            quads,
+            priority,
+        }) {
             Ok(()) => self.repaint.request_repaint(),
-            Err(TrySendError::Full(EngineEvent::MeshChunk { tag, quads })) => {
-                self.pending_mesh_chunk = Some((tag, quads));
+            Err(TrySendError::Full(EngineEvent::MeshChunk {
+                tag,
+                quads,
+                priority,
+            })) => {
+                self.enqueue_pending_mesh_chunk(tag, quads, priority);
             }
             Err(TrySendError::Disconnected(_)) => {}
             Err(TrySendError::Full(_)) => unreachable!("only mesh chunks are queued here"),
         }
     }
 
+    fn enqueue_pending_mesh_chunk(
+        &mut self,
+        tag: MeshJobTag,
+        quads: Vec<CompactQuad>,
+        priority: MeshUpdatePriority,
+    ) {
+        match priority {
+            MeshUpdatePriority::Live => {
+                let newer_is_queued = self.pending_live_mesh_chunks.iter().any(|(queued, _)| {
+                    queued.document_epoch == tag.document_epoch
+                        && queued.revision == tag.revision
+                        && queued.chunk == tag.chunk
+                        && queued.chunk_generation >= tag.chunk_generation
+                });
+                if newer_is_queued {
+                    return;
+                }
+                self.pending_live_mesh_chunks.retain(|(queued, _)| {
+                    queued.document_epoch != tag.document_epoch
+                        || queued.revision != tag.revision
+                        || queued.chunk != tag.chunk
+                        || queued.chunk_generation > tag.chunk_generation
+                });
+                self.pending_background_mesh_chunks.retain(|(queued, _)| {
+                    queued.document_epoch != tag.document_epoch
+                        || queued.revision != tag.revision
+                        || queued.chunk != tag.chunk
+                        || queued.chunk_generation > tag.chunk_generation
+                });
+                self.pending_live_mesh_chunks.push_back((tag, quads));
+            }
+            MeshUpdatePriority::Background => {
+                if self.pending_live_mesh_chunks.iter().any(|(queued, _)| {
+                    queued.document_epoch == tag.document_epoch
+                        && queued.revision == tag.revision
+                        && queued.chunk == tag.chunk
+                        && queued.chunk_generation >= tag.chunk_generation
+                }) {
+                    return;
+                }
+                self.pending_background_mesh_chunks.push_back((tag, quads))
+            }
+        }
+    }
+
+    fn has_pending_mesh_chunks(&self) -> bool {
+        !self.pending_live_mesh_chunks.is_empty() || !self.pending_background_mesh_chunks.is_empty()
+    }
+
     fn flush_pending_mesh_chunk(&mut self) {
-        let Some((tag, quads)) = self.pending_mesh_chunk.take() else {
+        if self.event_tx.len() >= MESH_EVENT_BACKLOG_LIMIT {
+            return;
+        }
+        let (priority, pending) = if let Some(pending) = self.pending_live_mesh_chunks.pop_front() {
+            (MeshUpdatePriority::Live, pending)
+        } else if let Some(pending) = self.pending_background_mesh_chunks.pop_front() {
+            (MeshUpdatePriority::Background, pending)
+        } else {
             return;
         };
-        self.queue_mesh_chunk(tag, quads);
+        let (tag, quads) = pending;
+        match self.event_tx.try_send(EngineEvent::MeshChunk {
+            tag,
+            quads,
+            priority,
+        }) {
+            Ok(()) => {
+                self.repaint.request_repaint();
+                if priority == MeshUpdatePriority::Live {
+                    self.maybe_finish_mesh_recovery();
+                }
+            }
+            Err(TrySendError::Full(EngineEvent::MeshChunk {
+                tag,
+                quads,
+                priority,
+            })) => match priority {
+                MeshUpdatePriority::Live => {
+                    self.pending_live_mesh_chunks.push_front((tag, quads));
+                }
+                MeshUpdatePriority::Background => {
+                    self.pending_background_mesh_chunks.push_front((tag, quads));
+                }
+            },
+            Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Full(_)) => unreachable!("only mesh chunks are queued here"),
+        }
     }
 
     fn emit_error(&self, job_id: Option<JobId>, error: AppError) {
@@ -1662,6 +2302,14 @@ impl EngineState {
         if self.event_tx.send(event).is_ok() {
             self.repaint.request_repaint();
         }
+    }
+
+    fn emit_edit_finished(&self, edit_id: EditId, outcome: EditOutcome) {
+        self.emit(EngineEvent::EditFinished {
+            epoch: self.epoch,
+            edit_id,
+            outcome,
+        });
     }
 }
 
@@ -1748,7 +2396,6 @@ const fn preview_request_generation(request: BrushPreviewRequest) -> u64 {
 
 fn calculate_brush_preview(
     document: &VolumeDocument,
-    stroke: Option<&StrokeContext>,
     request: BrushPreviewRequest,
     cancel: &CancellationToken,
 ) -> Result<BrushPreviewComputation> {
@@ -1763,17 +2410,17 @@ fn calculate_brush_preview(
             ..
         } => {
             let target = edit_target(document, tool, space, sample);
+            if tool == Tool::Bridge {
+                cancel.check()?;
+                return Ok(BrushPreviewComputation {
+                    generation,
+                    tool,
+                    target,
+                    voxels: target.into_iter().collect(),
+                });
+            }
             let candidates = match target {
                 None => Vec::new(),
-                Some(end)
-                    if matches!(tool, Tool::Paint | Tool::Erase)
-                        && stroke.is_some_and(|stroke| {
-                            stroke.tool == tool && stroke.spec == spec && stroke.space == space
-                        }) =>
-                {
-                    let start = stroke.and_then(|stroke| stroke.last_applied).unwrap_or(end);
-                    preview_path_footprint_indices(document, start, end, spec, space, cancel)?
-                }
                 Some(center) => preview_footprint_indices(document, center, spec, space, cancel)?,
             };
             (tool, target, candidates)
@@ -1817,12 +2464,13 @@ fn footprint_indices(
     center: [u32; 3],
     spec: BrushSpec,
     space: StrokeSpace,
+    cancel: &CancellationToken,
 ) -> Result<Vec<u32>> {
     let (normal_axis, spec) = match space {
         StrokeSpace::Slice(axis) => (axis.normal_axis(), spec),
         StrokeSpace::Volume3D => (0, spec.with_depth(BrushDepth::Volume)),
     };
-    brush_indices(document.geometry(), center, normal_axis, spec)
+    brush_indices_cancellable(document.geometry(), center, normal_axis, spec, cancel, None)
 }
 
 fn preview_footprint_indices(
@@ -1928,7 +2576,9 @@ fn bridge_footprint_indices(
     }
     let mut unique = HashSet::new();
     walk_supercover(start, end, |center| {
-        for index in footprint_indices(document, center, spec, space)? {
+        for index in
+            footprint_indices(document, center, spec, space, &CancellationToken::default())?
+        {
             if unique.contains(&index) {
                 continue;
             }
@@ -2152,6 +2802,7 @@ mod tests {
     use super::*;
 
     use crate::brush::{BrushShape, BrushSize};
+    use crate::mesh::ChunkMesh;
     use crate::volume::{SpatialUnits, VolumeGeometry};
 
     fn one_voxel_brush() -> BrushSpec {
@@ -2165,7 +2816,7 @@ mod tests {
     fn detached_engine_handle() -> EngineHandle {
         let (commands, _command_rx) = bounded::<EngineCommand>(1);
         let (_event_tx, events) = bounded::<EngineEvent>(1);
-        let (latest_samples, sample_drain) = bounded::<PointerSample>(1);
+        let (latest_samples, sample_drain) = bounded::<StrokeSample>(1);
         let (latest_previews, preview_drain) = bounded::<CancellableBrushPreview>(1);
         EngineHandle {
             commands,
@@ -2250,22 +2901,66 @@ mod tests {
         state
     }
 
+    fn current_chunk_mesh(state: &EngineState, chunk: ChunkCoord) -> TaggedChunkMesh {
+        let document = state.document.as_ref().unwrap();
+        let tag = MeshJobTag {
+            document_epoch: state.epoch,
+            revision: document.revision(),
+            chunk_generation: state
+                .mesh_generations
+                .get(&chunk)
+                .copied()
+                .unwrap_or(state.mesh_pass_generation),
+            edit_generation: state
+                .mesh_edit_generations
+                .get(&chunk)
+                .copied()
+                .unwrap_or(0),
+            chunk,
+        };
+        let input = ChunkInput::copy_from_volume(
+            document.geometry().dimensions,
+            document.view().occupancy,
+            chunk,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        mesh_chunk(&input, tag, &CancellationToken::default()).unwrap()
+    }
+
     #[test]
     fn latest_sample_channel_discards_intermediate_motion() {
         let context = egui::Context::default();
         let engine = EngineHandle::spawn(context);
         engine
-            .send_latest_sample(PointerSample::Slice {
-                axis: SliceAxis::Axial,
-                voxel: [1, 1, 1],
-            })
+            .send_latest_sample(
+                4,
+                PointerSample::Slice {
+                    axis: SliceAxis::Axial,
+                    voxel: [1, 1, 1],
+                },
+            )
             .unwrap();
         engine
-            .send_latest_sample(PointerSample::Slice {
-                axis: SliceAxis::Axial,
-                voxel: [9, 9, 9],
-            })
+            .send_latest_sample(
+                4,
+                PointerSample::Slice {
+                    axis: SliceAxis::Axial,
+                    voxel: [9, 9, 9],
+                },
+            )
             .unwrap();
+        assert_eq!(
+            engine.sample_drain.try_recv().unwrap(),
+            StrokeSample {
+                edit_id: 4,
+                sample: PointerSample::Slice {
+                    axis: SliceAxis::Axial,
+                    voxel: [9, 9, 9],
+                },
+            }
+        );
+        assert!(engine.sample_drain.try_recv().is_err());
     }
 
     #[test]
@@ -2331,32 +3026,30 @@ mod tests {
     }
 
     #[test]
-    fn active_stroke_preview_matches_the_interpolated_supercover_edit() {
-        let mut state = state_with_empty_document([6, 1, 1]);
-        let spec = one_voxel_brush();
-        let space = StrokeSpace::Slice(SliceAxis::Axial);
-        state.begin_stroke(Tool::Paint, spec, space);
-        state.apply_target([1, 0, 0]);
-
+    fn bridge_anchor_preview_contains_only_the_selected_voxel() {
+        let state = state_with_empty_document([6, 3, 1]);
         let preview = calculate_brush_preview(
             state.document.as_ref().unwrap(),
-            state.stroke.as_ref(),
             BrushPreviewRequest::Brush {
                 generation: 7,
-                tool: Tool::Paint,
-                spec,
-                space,
+                tool: Tool::Bridge,
+                spec: BrushSpec {
+                    shape: BrushShape::Square,
+                    depth: BrushDepth::Volume,
+                    size: BrushSize::voxels(5).unwrap(),
+                },
+                space: StrokeSpace::Slice(SliceAxis::Axial),
                 sample: PointerSample::Slice {
                     axis: SliceAxis::Axial,
-                    voxel: [4, 0, 0],
+                    voxel: [3, 1, 0],
                 },
             },
             &CancellationToken::default(),
         )
         .unwrap();
 
-        assert_eq!(preview.target, Some([4, 0, 0]));
-        assert_eq!(preview.voxels, vec![[2, 0, 0], [3, 0, 0], [4, 0, 0]]);
+        assert_eq!(preview.target, Some([3, 1, 0]));
+        assert_eq!(preview.voxels, vec![[3, 1, 0]]);
     }
 
     #[test]
@@ -2407,37 +3100,293 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_mesh_results_consumed_during_a_stroke_remain_queued() {
+    fn active_stroke_keeps_mesh_workers_live_and_promotes_exact_halo_chunks() {
         let mut state = state_with_empty_document([64, 1, 1]);
         let chunks = [ChunkCoord::new(0, 0, 0), ChunkCoord::new(1, 0, 0)];
-        state.mesh_in_flight = chunks.len();
-        state.mesh_in_flight_chunks.extend(chunks);
         state.begin_stroke(
+            1,
             Tool::Paint,
-            BrushSpec::default(),
+            one_voxel_brush(),
             StrokeSpace::Slice(SliceAxis::Axial),
+            PointerSample::Slice {
+                axis: SliceAxis::Axial,
+                voxel: [31, 0, 0],
+            },
+            CancellationToken::default(),
         );
-        assert!(state.mesh_cancel.is_cancelled());
 
-        for chunk in chunks {
-            let tag = MeshJobTag {
-                document_epoch: state.epoch,
-                revision: 1,
-                chunk_generation: state.mesh_pass_generation,
-                chunk,
-            };
-            state.handle_mesh_result((tag, Err(AppError::Cancelled)));
-        }
-        assert!(state.mesh_in_flight_chunks.is_empty());
-
-        // The cancelled results arrived before stroke completion, so the
-        // completion path can no longer recover them from the in-flight set.
-        state.complete_stroke();
+        assert!(!state.mesh_cancel.is_cancelled());
         assert_eq!(state.mesh_dirty.len(), chunks.len());
         assert!(
             chunks
                 .into_iter()
                 .all(|chunk| state.mesh_dirty.members.contains(&chunk))
+        );
+        assert_eq!(state.mesh_live_chunks, chunks.into_iter().collect());
+        assert!(chunks.into_iter().all(|chunk| {
+            state.mesh_generations.get(&chunk) == Some(&(state.mesh_pass_generation + 1))
+        }));
+    }
+
+    #[test]
+    fn identical_ray_sample_does_not_advance_a_surface_again() {
+        let mut state = state_with_empty_document([3, 1, 1]);
+        let document = state.document.as_mut().unwrap();
+        document.begin_stroke(1).unwrap();
+        document.apply_stroke_indices([0]).unwrap();
+        document.finish_stroke().unwrap();
+        let sample = PointerSample::Ray {
+            ray: Ray {
+                origin: [4.0, 0.0, 0.0],
+                direction: [-1.0, 0.0, 0.0],
+            },
+        };
+
+        state.begin_stroke(
+            77,
+            Tool::Paint,
+            one_voxel_brush(),
+            StrokeSpace::Volume3D,
+            sample,
+            CancellationToken::default(),
+        );
+        assert_eq!(state.document.as_ref().unwrap().summary().occupied_count, 2);
+        let generation = state.preview_generation;
+
+        state.apply_pointer_sample(StrokeSample {
+            edit_id: 77,
+            sample,
+        });
+
+        assert_eq!(state.document.as_ref().unwrap().summary().occupied_count, 2);
+        assert_eq!(state.preview_generation, generation);
+    }
+
+    #[test]
+    fn terminal_commands_do_not_consume_the_next_strokes_sample() {
+        let mut state = state_with_empty_document([4, 1, 1]);
+        state.begin_stroke(
+            1,
+            Tool::Paint,
+            one_voxel_brush(),
+            StrokeSpace::Slice(SliceAxis::Axial),
+            PointerSample::Slice {
+                axis: SliceAxis::Axial,
+                voxel: [0, 0, 0],
+            },
+            CancellationToken::default(),
+        );
+        let (sample_tx, sample_rx) = bounded(1);
+        state.sample_rx = sample_rx;
+        sample_tx
+            .send(StrokeSample {
+                edit_id: 2,
+                sample: PointerSample::Slice {
+                    axis: SliceAxis::Axial,
+                    voxel: [2, 0, 0],
+                },
+            })
+            .unwrap();
+
+        state.handle_command(EngineCommand::EndStroke {
+            edit_id: 1,
+            disposition: StrokeDisposition::Complete {
+                final_sample: Some(PointerSample::Slice {
+                    axis: SliceAxis::Axial,
+                    voxel: [1, 0, 0],
+                }),
+            },
+        });
+        assert_eq!(state.sample_rx.len(), 1);
+        assert_eq!(state.document.as_ref().unwrap().summary().occupied_count, 2);
+
+        state.begin_stroke(
+            2,
+            Tool::Paint,
+            one_voxel_brush(),
+            StrokeSpace::Slice(SliceAxis::Axial),
+            PointerSample::Slice {
+                axis: SliceAxis::Axial,
+                voxel: [3, 0, 0],
+            },
+            CancellationToken::default(),
+        );
+        state.apply_pointer_sample(state.sample_rx.try_recv().unwrap());
+        state.handle_command(EngineCommand::EndStroke {
+            edit_id: 1,
+            disposition: StrokeDisposition::Cancel,
+        });
+
+        assert_eq!(state.stroke.as_ref().map(|stroke| stroke.edit_id), Some(2));
+        assert_eq!(state.document.as_ref().unwrap().summary().occupied_count, 4);
+    }
+
+    #[test]
+    fn live_feedback_preempts_background_without_cancelling_live_jobs() {
+        let mut state = state_with_empty_document([64, 1, 1]);
+        let background = ChunkCoord::new(0, 0, 0);
+        let live = ChunkCoord::new(1, 0, 0);
+        state.mesh_in_flight = state.mesh_worker_limit;
+        state.mesh_in_flight_chunks.extend([background, live]);
+        state
+            .mesh_in_flight_priorities
+            .insert(background, MeshUpdatePriority::Background);
+        state
+            .mesh_in_flight_priorities
+            .insert(live, MeshUpdatePriority::Live);
+        let cancelled_background_batch = state.mesh_background_cancel.clone();
+        let retained_live_batch = state.mesh_cancel.clone();
+
+        state.preempt_mesh_for_live_feedback();
+
+        assert!(cancelled_background_batch.is_cancelled());
+        assert!(!retained_live_batch.is_cancelled());
+        assert!(state.mesh_dirty.members.contains(&background));
+        assert!(!state.mesh_dirty.members.contains(&live));
+    }
+
+    #[test]
+    fn reset_generation_is_newer_than_every_in_flight_chunk_generation() {
+        let mut state = state_with_empty_document([32, 1, 1]);
+        let chunk = ChunkCoord::new(0, 0, 0);
+        state.mesh_pass_generation = 5;
+        state.mesh_generations.insert(chunk, 8);
+
+        state.reset_mesh_preview();
+
+        assert_eq!(state.mesh_pass_generation, 9);
+        let old = MeshJobTag {
+            document_epoch: state.epoch,
+            revision: state.document.as_ref().unwrap().revision(),
+            chunk_generation: 8,
+            edit_generation: 0,
+            chunk,
+        };
+        assert!(old.is_stale(state.epoch, old.revision, state.mesh_pass_generation));
+    }
+
+    #[test]
+    fn committed_live_chunks_stay_ahead_of_cursor_background_work() {
+        let mut state = state_with_empty_document([96, 1, 1]);
+        let invalidated = ChunkCoord::new(2, 0, 0);
+
+        state.restart_mesh_after_change(vec![invalidated], 2);
+
+        assert_eq!(
+            state.next_mesh_chunk(),
+            Some((invalidated, MeshUpdatePriority::Live))
+        );
+    }
+
+    #[test]
+    fn revision_barrier_preserves_older_live_work_ahead_of_background() {
+        let mut state = state_with_empty_document([128, 1, 1]);
+        let background = ChunkCoord::new(0, 0, 0);
+        let current = ChunkCoord::new(1, 0, 0);
+        let pending_live = ChunkCoord::new(2, 0, 0);
+        let in_flight_live = ChunkCoord::new(3, 0, 0);
+        assert!(state.mesh_dirty.enqueue_back(background));
+        let tag = MeshJobTag {
+            document_epoch: state.epoch,
+            revision: state.document.as_ref().unwrap().revision(),
+            chunk_generation: state.mesh_pass_generation,
+            edit_generation: 1,
+            chunk: pending_live,
+        };
+        state.pending_live_mesh_chunks.push_back((tag, Vec::new()));
+        state.mesh_in_flight_chunks.insert(in_flight_live);
+        state
+            .mesh_in_flight_priorities
+            .insert(in_flight_live, MeshUpdatePriority::Live);
+
+        state.restart_mesh_after_change(vec![current], 2);
+        // Model the cancelled worker returning before replacement dispatch.
+        state.mesh_in_flight_chunks.remove(&in_flight_live);
+        state.mesh_in_flight_priorities.remove(&in_flight_live);
+
+        assert_eq!(
+            state.next_mesh_chunk(),
+            Some((current, MeshUpdatePriority::Live))
+        );
+        let older_live = [state.next_mesh_chunk(), state.next_mesh_chunk()];
+        assert!(older_live.iter().all(|entry| {
+            entry.is_some_and(|(_, priority)| priority == MeshUpdatePriority::Live)
+        }));
+        assert_eq!(
+            older_live
+                .into_iter()
+                .flatten()
+                .map(|(chunk, _)| chunk)
+                .collect::<HashSet<_>>(),
+            HashSet::from([pending_live, in_flight_live])
+        );
+        assert_eq!(
+            state.next_mesh_chunk(),
+            Some((background, MeshUpdatePriority::Background))
+        );
+    }
+
+    #[test]
+    fn rebuild_is_rejected_without_resetting_an_active_stroke() {
+        let mut state = state_with_empty_document([1, 1, 1]);
+        let (event_tx, event_rx) = bounded(16);
+        state.event_tx = event_tx;
+        state.begin_stroke(
+            92,
+            Tool::Paint,
+            one_voxel_brush(),
+            StrokeSpace::Slice(SliceAxis::Axial),
+            PointerSample::Slice {
+                axis: SliceAxis::Axial,
+                voxel: [0, 0, 0],
+            },
+            CancellationToken::default(),
+        );
+        while event_rx.try_recv().is_ok() {}
+
+        state.handle_command(EngineCommand::RebuildPreview);
+
+        assert_eq!(state.stroke.as_ref().map(|stroke| stroke.edit_id), Some(92));
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Error { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::MeshReset { .. }))
+        );
+    }
+
+    #[test]
+    fn pending_live_uploads_keep_only_the_latest_chunk_generation() {
+        let mut state = state_with_empty_document([64, 1, 1]);
+        let chunk = ChunkCoord::new(0, 0, 0);
+        for generation in 1..=100 {
+            state.enqueue_pending_mesh_chunk(
+                MeshJobTag {
+                    document_epoch: state.epoch,
+                    revision: state.document.as_ref().unwrap().revision(),
+                    chunk_generation: generation,
+                    edit_generation: generation,
+                    chunk,
+                },
+                vec![CompactQuad::new([0, 0, 0], 1, 1, crate::mesh::FaceAxis::X, true).unwrap()],
+                MeshUpdatePriority::Live,
+            );
+        }
+
+        assert_eq!(state.pending_live_mesh_chunks.len(), 1);
+        assert_eq!(
+            state
+                .pending_live_mesh_chunks
+                .front()
+                .unwrap()
+                .0
+                .chunk_generation,
+            100
         );
     }
 
@@ -2458,6 +3407,437 @@ mod tests {
         assert!(!state.preview_too_complex);
         assert_eq!(state.mesh_scan_next, 0);
         assert!(state.mesh_scan_total > 0);
+    }
+
+    #[test]
+    fn cancel_recovers_resident_chunks_after_partial_live_budget_failure() {
+        let dimensions = [64, 3, 3];
+        let chunks = [ChunkCoord::new(0, 0, 0), ChunkCoord::new(1, 0, 0)];
+        let mut state = state_with_empty_document(dimensions);
+        let document = state.document.as_mut().unwrap();
+        document.begin_stroke(1).unwrap();
+        document
+            .apply_stroke_indices(0..dimensions.into_iter().product())
+            .unwrap();
+        document.finish_stroke().unwrap();
+        let baseline = chunks.map(|chunk| current_chunk_mesh(&state, chunk));
+        let baseline_bytes: [usize; 2] =
+            std::array::from_fn(|index| baseline[index].mesh.gpu_bytes());
+        let baseline_quads: [Vec<CompactQuad>; 2] =
+            std::array::from_fn(|index| baseline[index].mesh.quads.clone());
+
+        {
+            let document = state.document.as_mut().unwrap();
+            document.begin_stroke(0).unwrap();
+            let line = (16..=48).map(|x| x + dimensions[0] * 4);
+            document.apply_stroke_indices(line).unwrap();
+        }
+        let edited = chunks.map(|chunk| current_chunk_mesh(&state, chunk));
+        state.document.as_mut().unwrap().cancel_stroke();
+        let edited_bytes = edited.map(|tagged| tagged.mesh.gpu_bytes());
+        assert!(
+            edited_bytes
+                .iter()
+                .zip(baseline_bytes)
+                .all(|(&edited, baseline)| edited > baseline)
+        );
+
+        let cap = edited_bytes[0].max(baseline_bytes[0]) + baseline_bytes[1];
+        state.mesh_budget = MeshMemoryBudget::new(cap);
+        for (chunk, bytes) in chunks.into_iter().zip(baseline_bytes) {
+            state.mesh_budget.try_replace(chunk, bytes).unwrap();
+        }
+        let (event_tx, event_rx) = bounded(128);
+        state.event_tx = event_tx;
+        state.begin_stroke(
+            90,
+            Tool::Erase,
+            one_voxel_brush(),
+            StrokeSpace::Slice(SliceAxis::Axial),
+            PointerSample::Slice {
+                axis: SliceAxis::Axial,
+                voxel: [16, 1, 1],
+            },
+            CancellationToken::default(),
+        );
+        state.apply_pointer_sample(StrokeSample {
+            edit_id: 90,
+            sample: PointerSample::Slice {
+                axis: SliceAxis::Axial,
+                voxel: [48, 1, 1],
+            },
+        });
+
+        for chunk in chunks {
+            let tagged = current_chunk_mesh(&state, chunk);
+            state.handle_mesh_result((tagged.tag, MeshUpdatePriority::Live, Ok(tagged)));
+        }
+        assert!(state.preview_too_complex);
+        assert_eq!(
+            state.mesh_budget.reserved_bytes(chunks[0]),
+            Some(baseline_bytes[0])
+        );
+        assert_eq!(
+            state.mesh_budget.reserved_bytes(chunks[1]),
+            Some(baseline_bytes[1])
+        );
+
+        state.cancel_stroke(90);
+        assert_eq!(state.mesh_recovery_chunks, chunks.into_iter().collect());
+        state.handle_command(EngineCommand::RebuildPreview);
+        assert_eq!(state.mesh_recovery_chunks, chunks.into_iter().collect());
+        assert_eq!(state.mesh_recovery_edit, Some(90));
+        while event_rx.try_recv().is_ok() {}
+        let recovery_generations = chunks.map(|chunk| state.mesh_generations[&chunk]);
+        for chunk in chunks {
+            let tagged = current_chunk_mesh(&state, chunk);
+            state.handle_mesh_result((tagged.tag, MeshUpdatePriority::Live, Ok(tagged)));
+        }
+        while state.has_pending_mesh_chunks() {
+            state.flush_pending_mesh_chunk();
+        }
+
+        assert!(state.preview_too_complex);
+        assert!(state.mesh_recovery_chunks.is_empty());
+        assert!(state.mesh_recovery_edit.is_none());
+        assert_eq!(
+            state.mesh_budget.used_bytes(),
+            baseline_bytes.into_iter().sum()
+        );
+        for chunk in chunks {
+            assert_eq!(state.mesh_budget.reserved_bytes(chunk), None);
+        }
+        let mut restored = HashMap::new();
+        let mut acknowledged = false;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                EngineEvent::MeshChunk {
+                    tag,
+                    quads,
+                    priority: MeshUpdatePriority::Live,
+                } => {
+                    restored.insert(tag.chunk, (tag.chunk_generation, quads));
+                }
+                EngineEvent::EditFinished {
+                    edit_id: 90,
+                    outcome: EditOutcome::Cancelled,
+                    ..
+                } => acknowledged = true,
+                EngineEvent::MeshReset { .. } => panic!("rollback must not reset the mesh"),
+                _ => {}
+            }
+        }
+        assert!(acknowledged);
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let (generation, quads) = restored.remove(&chunk).unwrap();
+            assert_eq!(generation, recovery_generations[index]);
+            assert_eq!(quads, baseline_quads[index]);
+        }
+    }
+
+    #[test]
+    fn cancel_removes_a_live_chunk_that_was_not_resident_before_the_stroke() {
+        let mut state = state_with_empty_document([1, 1, 1]);
+        let chunk = ChunkCoord::new(0, 0, 0);
+        let (event_tx, event_rx) = bounded(32);
+        state.event_tx = event_tx;
+        state.begin_stroke(
+            91,
+            Tool::Paint,
+            one_voxel_brush(),
+            StrokeSpace::Slice(SliceAxis::Axial),
+            PointerSample::Slice {
+                axis: SliceAxis::Axial,
+                voxel: [0, 0, 0],
+            },
+            CancellationToken::default(),
+        );
+        let live = current_chunk_mesh(&state, chunk);
+        state.handle_mesh_result((live.tag, MeshUpdatePriority::Live, Ok(live)));
+        assert!(state.mesh_budget.used_bytes() > 0);
+        assert_eq!(state.mesh_budget.reserved_bytes(chunk), Some(0));
+        while event_rx.try_recv().is_ok() {}
+
+        state.cancel_stroke(91);
+
+        assert_eq!(state.mesh_budget.used_bytes(), 0);
+        assert_eq!(state.mesh_budget.reserved_bytes(chunk), None);
+        assert!(state.mesh_dirty.members.contains(&chunk));
+        assert!(!state.mesh_live_chunks.contains(&chunk));
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                EngineEvent::MeshChunk {
+                    tag,
+                    quads,
+                    priority: MeshUpdatePriority::Live,
+                } if tag.chunk == chunk && quads.is_empty()
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                EngineEvent::EditFinished {
+                    edit_id: 91,
+                    outcome: EditOutcome::Cancelled,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn partial_cancel_before_mesh_promotion_needs_no_recovery_mesh() {
+        let mut state = state_with_empty_document([1, 1, 1]);
+        let chunk = ChunkCoord::new(0, 0, 0);
+        let (event_tx, event_rx) = bounded(32);
+        state.event_tx = event_tx;
+        state.mesh_budget = MeshMemoryBudget::new(0);
+        state.preview_too_complex = true;
+        state.document.as_mut().unwrap().begin_stroke(1).unwrap();
+        state
+            .document
+            .as_mut()
+            .unwrap()
+            .apply_stroke_indices([0])
+            .unwrap();
+        state.stroke = Some(StrokeContext {
+            edit_id: 93,
+            tool: Tool::Paint,
+            spec: one_voxel_brush(),
+            space: StrokeSpace::Slice(SliceAxis::Axial),
+            cancel: CancellationToken::default(),
+            last_sample: None,
+            last_applied: None,
+            affected_chunks: HashSet::new(),
+        });
+
+        state.rollback_active_stroke(None);
+
+        assert_eq!(state.document.as_ref().unwrap().summary().occupied_count, 0);
+        assert!(state.mesh_recovery_chunks.is_empty());
+        assert!(state.deferred_recovery_chunks.is_empty());
+        assert!(state.mesh_recovery_edit.is_none());
+        assert!(!state.mesh_live_chunks.contains(&chunk));
+        assert_eq!(state.mesh_budget.used_bytes(), 0);
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(!events.iter().any(|event| {
+            matches!(event, EngineEvent::MeshChunk { tag, .. } if tag.chunk == chunk)
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                EngineEvent::EditFinished {
+                    edit_id: 93,
+                    outcome: EditOutcome::Cancelled,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn recovery_retries_growth_after_a_shrinking_chunk_frees_budget() {
+        let mut state = state_with_empty_document([64, 1, 1]);
+        let grow = ChunkCoord::new(0, 0, 0);
+        let shrink = ChunkCoord::new(1, 0, 0);
+        let quad = CompactQuad::new([0, 0, 0], 1, 1, crate::mesh::FaceAxis::X, true).unwrap();
+        let bytes = size_of::<CompactQuad>();
+        state.mesh_budget = MeshMemoryBudget::new(3 * bytes);
+        state.mesh_budget.try_replace(grow, bytes).unwrap();
+        state.mesh_budget.try_replace(shrink, 2 * bytes).unwrap();
+        state.mesh_budget.reserve_current_if_absent(grow).unwrap();
+        state.mesh_budget.reserve_current_if_absent(shrink).unwrap();
+        state.mesh_recovery_chunks.extend([grow, shrink]);
+        state.mesh_recovery_edit = Some(94);
+        state.mesh_in_flight = 2;
+        state.mesh_in_flight_chunks.extend([grow, shrink]);
+        let revision = state.document.as_ref().unwrap().revision();
+        let epoch = state.epoch;
+        let generation = state.mesh_pass_generation;
+        let tag = |chunk| MeshJobTag {
+            document_epoch: epoch,
+            revision,
+            chunk_generation: generation,
+            edit_generation: 1,
+            chunk,
+        };
+        let cancelled_live_batch = state.mesh_cancel.clone();
+        let (event_tx, event_rx) = bounded(32);
+        state.event_tx = event_tx;
+
+        state.handle_mesh_result((
+            tag(grow),
+            MeshUpdatePriority::Live,
+            Ok(TaggedChunkMesh {
+                tag: tag(grow),
+                mesh: ChunkMesh {
+                    quads: vec![quad; 2],
+                    exposed_voxel_faces: 2,
+                },
+            }),
+        ));
+        assert!(state.deferred_recovery_chunks.contains(&grow));
+        assert!(!cancelled_live_batch.is_cancelled());
+
+        state.handle_mesh_result((
+            tag(shrink),
+            MeshUpdatePriority::Live,
+            Ok(TaggedChunkMesh {
+                tag: tag(shrink),
+                mesh: ChunkMesh {
+                    quads: vec![quad],
+                    exposed_voxel_faces: 1,
+                },
+            }),
+        ));
+        assert!(!state.deferred_recovery_chunks.contains(&grow));
+        assert!(state.mesh_dirty.members.contains(&grow));
+        state.mesh_in_flight = 1;
+        state.mesh_in_flight_chunks.insert(grow);
+        state.handle_mesh_result((
+            tag(grow),
+            MeshUpdatePriority::Live,
+            Ok(TaggedChunkMesh {
+                tag: tag(grow),
+                mesh: ChunkMesh {
+                    quads: vec![quad; 2],
+                    exposed_voxel_faces: 2,
+                },
+            }),
+        ));
+
+        assert!(state.mesh_recovery_chunks.is_empty());
+        assert!(state.mesh_recovery_edit.is_none());
+        assert_eq!(state.mesh_budget.used_bytes(), 3 * bytes);
+        assert_eq!(state.mesh_budget.reserved_bytes(grow), None);
+        assert_eq!(state.mesh_budget.reserved_bytes(shrink), None);
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        let acknowledgement = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    EngineEvent::EditFinished {
+                        edit_id: 94,
+                        outcome: EditOutcome::Cancelled,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let restored = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| matches!(event, EngineEvent::MeshChunk { .. }))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(restored.len(), 2);
+        assert!(restored.into_iter().all(|index| index < acknowledgement));
+    }
+
+    #[test]
+    fn recovery_ack_waits_until_a_pending_restoration_is_delivered() {
+        let mut state = state_with_empty_document([1, 1, 1]);
+        let (event_tx, event_rx) = bounded(64);
+        state.event_tx = event_tx;
+        state.begin_stroke(
+            95,
+            Tool::Paint,
+            one_voxel_brush(),
+            StrokeSpace::Slice(SliceAxis::Axial),
+            PointerSample::Slice {
+                axis: SliceAxis::Axial,
+                voxel: [0, 0, 0],
+            },
+            CancellationToken::default(),
+        );
+        while event_rx.try_recv().is_ok() {}
+        for index in 0..MESH_EVENT_BACKLOG_LIMIT {
+            state
+                .event_tx
+                .try_send(EngineEvent::Error {
+                    job_id: None,
+                    message: format!("backlog {index}"),
+                    source_changed: false,
+                })
+                .unwrap();
+        }
+
+        state.cancel_stroke(95);
+
+        assert_eq!(state.pending_live_mesh_chunks.len(), 1);
+        let before_flush = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(
+            !before_flush
+                .iter()
+                .any(|event| matches!(event, EngineEvent::EditFinished { edit_id: 95, .. }))
+        );
+        state.flush_pending_mesh_chunk();
+        let delivered = event_rx.try_iter().collect::<Vec<_>>();
+        let mesh = delivered
+            .iter()
+            .position(|event| matches!(event, EngineEvent::MeshChunk { .. }))
+            .unwrap();
+        let acknowledgement = delivered
+            .iter()
+            .position(|event| matches!(event, EngineEvent::EditFinished { edit_id: 95, .. }))
+            .unwrap();
+        assert!(mesh < acknowledgement);
+    }
+
+    #[test]
+    fn deterministic_recovery_error_terminates_with_a_visible_failure() {
+        let mut state = state_with_empty_document([1, 1, 1]);
+        let chunk = ChunkCoord::new(0, 0, 0);
+        state.mesh_budget.try_replace(chunk, 1).unwrap();
+        state.mesh_budget.reserve_current_if_absent(chunk).unwrap();
+        state.mesh_recovery_chunks.insert(chunk);
+        state.mesh_recovery_edit = Some(96);
+        state.mesh_in_flight = 1;
+        state.mesh_in_flight_chunks.insert(chunk);
+        let tag = MeshJobTag {
+            document_epoch: state.epoch,
+            revision: state.document.as_ref().unwrap().revision(),
+            chunk_generation: state.mesh_pass_generation,
+            edit_generation: 1,
+            chunk,
+        };
+        let (event_tx, event_rx) = bounded(16);
+        state.event_tx = event_tx;
+
+        state.handle_mesh_result((
+            tag,
+            MeshUpdatePriority::Live,
+            Err(AppError::Allocation { bytes: 1 }),
+        ));
+
+        assert!(state.preview_too_complex);
+        assert!(state.mesh_recovery_chunks.is_empty());
+        assert!(state.mesh_recovery_edit.is_none());
+        assert_eq!(state.mesh_budget.reserved_bytes(chunk), None);
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Error { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::PreviewTooComplex { .. }))
+        );
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                EngineEvent::EditFinished {
+                    edit_id: 96,
+                    outcome: EditOutcome::Cancelled,
+                    ..
+                }
+            )
+        }));
     }
 
     #[test]

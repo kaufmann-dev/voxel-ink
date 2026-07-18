@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::{Path, PathBuf},
 };
 
@@ -9,10 +9,14 @@ use egui::{Color32, TextureHandle, TextureOptions, Vec2};
 use crate::{
     EngineCommand, EngineEvent, EngineHandle,
     brush::{BrushDepth, BrushShape, BrushSize, BrushSpec},
+    cancel::CancellationToken,
     codecs::{FormatFamily, SourceVariant},
-    engine::{BrushPreviewRequest, BusyKind, JobId, PointerSample, SlicePatch, StrokeSpace},
+    engine::{
+        BrushPreviewRequest, BusyKind, EditId, JobId, PointerSample, SlicePatch, StrokeDisposition,
+        StrokeSpace,
+    },
     io::SaveMode,
-    renderer::{SceneBridge, VolumePaintCallback, VoxelPreviewKind},
+    renderer::{SceneBridge, VolumePaintCallback, VoxelHighlightKind},
     volume::{DocumentSummary, SliceAxis, SliceImage, SpatialUnits, Tool},
 };
 
@@ -96,27 +100,7 @@ struct FrameStrokeActions {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PreviewAction {
-    Stroke { complete: bool },
     BridgeAnchor { plane_normal: [f64; 3] },
-    BridgeCommit,
-}
-
-impl PreviewAction {
-    const fn finishing_stroke(self) -> bool {
-        matches!(self, Self::Stroke { complete: true })
-    }
-
-    fn mark_stroke_complete(&mut self) {
-        if let Self::Stroke { complete } = self {
-            *complete = true;
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct ActionPreview {
-    request: BrushPreviewRequest,
-    action: PreviewAction,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -138,6 +122,36 @@ struct BridgeAnchor {
     voxel: [u32; 3],
     space: StrokeSpace,
     plane_normal: [f64; 3],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum UiStrokePhase {
+    Open,
+    Pending(StrokeDisposition),
+    AwaitingAcknowledgement,
+}
+
+#[derive(Clone, Debug)]
+struct UiStroke {
+    edit_id: EditId,
+    space: StrokeSpace,
+    last_submitted: PointerSample,
+    cancel: CancellationToken,
+    phase: UiStrokePhase,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BridgeCommitPhase {
+    Pending,
+    AwaitingAcknowledgement,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PendingBridgeCommit {
+    edit_id: EditId,
+    anchor: BridgeAnchor,
+    release: DeferredBridgeRelease,
+    phase: BridgeCommitPhase,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -240,16 +254,10 @@ pub struct VoxelInkApp {
     slice_preview_generation: u64,
     brush_preview_generation: u64,
     last_preview_request: Option<BrushPreviewRequest>,
-    brush_preview_tool: Option<Tool>,
+    brush_preview_kind: Option<VoxelHighlightKind>,
     brush_preview_target: Option<[u32; 3]>,
     brush_preview_voxels: Vec<[u32; 3]>,
-    stroke_overlay_tool: Option<Tool>,
-    stroke_overlay_voxels: Vec<[u32; 3]>,
-    stroke_overlay_members: HashSet<[u32; 3]>,
-    stroke_overlay_revision: Option<u64>,
-    stroke_overlay_waiting_for_mesh: bool,
     pending_preview: Option<PendingPreview>,
-    queued_action_preview: Option<ActionPreview>,
     deferred_bridge_release: Option<DeferredBridgeRelease>,
     bridge_anchor: Option<BridgeAnchor>,
     logo: TextureHandle,
@@ -275,8 +283,9 @@ pub struct VoxelInkApp {
     allow_exit: bool,
     forced_colors: bool,
     reduced_motion: bool,
-    stroke_active: bool,
-    stroke_completion_pending: bool,
+    stroke: Option<UiStroke>,
+    bridge_commit: Option<PendingBridgeCommit>,
+    next_edit_id: EditId,
     pane_keyboard_focus: bool,
     maximized_pane: Option<WorkspacePane>,
     workspace_column_ratio: f32,
@@ -334,16 +343,10 @@ impl VoxelInkApp {
             slice_preview_generation: 0,
             brush_preview_generation: 0,
             last_preview_request: None,
-            brush_preview_tool: None,
+            brush_preview_kind: None,
             brush_preview_target: None,
             brush_preview_voxels: Vec::new(),
-            stroke_overlay_tool: None,
-            stroke_overlay_voxels: Vec::new(),
-            stroke_overlay_members: HashSet::new(),
-            stroke_overlay_revision: None,
-            stroke_overlay_waiting_for_mesh: false,
             pending_preview: None,
-            queued_action_preview: None,
             deferred_bridge_release: None,
             bridge_anchor: None,
             logo,
@@ -372,24 +375,27 @@ impl VoxelInkApp {
             allow_exit: false,
             forced_colors,
             reduced_motion,
-            stroke_active: false,
-            stroke_completion_pending: false,
+            stroke: None,
+            bridge_commit: None,
+            next_edit_id: 1,
             pane_keyboard_focus: false,
             maximized_pane: None,
             workspace_column_ratio: 0.5,
             workspace_row_ratio: 0.5,
         };
-        if let Some(path) = initial_path
-            && let Err(error) = app.engine.start_load(path)
-        {
-            app.error_message = Some(error.to_string());
+        if let Some(path) = initial_path {
+            match app.engine.start_load(path) {
+                Ok(job_id) => {
+                    app.busy.insert(job_id, BusyKind::Loading);
+                }
+                Err(error) => app.error_message = Some(error.to_string()),
+            }
         }
         app
     }
 
     fn process_engine_events(&mut self, ctx: &egui::Context) {
         let mut exhausted_budget = true;
-        let mut overlay_refresh_revision = None;
         for _ in 0..MAX_ENGINE_EVENTS_PER_FRAME {
             let Some(event) = self.engine.try_event() else {
                 exhausted_budget = false;
@@ -428,6 +434,21 @@ impl VoxelInkApp {
                     }
                     self.error_message = Some(message);
                 }
+                EngineEvent::EditFinished { epoch, edit_id, .. } if epoch == self.epoch => {
+                    if self
+                        .stroke
+                        .as_ref()
+                        .is_some_and(|stroke| stroke.edit_id == edit_id)
+                    {
+                        self.stroke = None;
+                    }
+                    if self
+                        .bridge_commit
+                        .is_some_and(|commit| commit.edit_id == edit_id)
+                    {
+                        self.bridge_commit = None;
+                    }
+                }
                 EngineEvent::DocumentReplaced {
                     epoch,
                     summary,
@@ -443,21 +464,15 @@ impl VoxelInkApp {
                     self.slice_preview_generation = 0;
                     self.brush_preview_generation = 0;
                     self.last_preview_request = None;
-                    self.brush_preview_tool = None;
+                    self.brush_preview_kind = None;
                     self.brush_preview_target = None;
                     self.brush_preview_voxels.clear();
-                    self.stroke_overlay_tool = None;
-                    self.stroke_overlay_voxels.clear();
-                    self.stroke_overlay_members.clear();
-                    self.stroke_overlay_revision = None;
-                    self.stroke_overlay_waiting_for_mesh = false;
                     self.pending_preview = None;
-                    self.queued_action_preview = None;
                     self.deferred_bridge_release = None;
                     self.bridge_anchor = None;
                     self.summary = Some(summary);
-                    self.stroke_active = false;
-                    self.stroke_completion_pending = false;
+                    self.stroke = None;
+                    self.bridge_commit = None;
                     self.maximized_pane = None;
                     for view in self.slice_views.values_mut() {
                         view.reset();
@@ -475,20 +490,14 @@ impl VoxelInkApp {
                     self.slice_preview_generation = 0;
                     self.brush_preview_generation = 0;
                     self.last_preview_request = None;
-                    self.brush_preview_tool = None;
+                    self.brush_preview_kind = None;
                     self.brush_preview_target = None;
                     self.brush_preview_voxels.clear();
-                    self.stroke_overlay_tool = None;
-                    self.stroke_overlay_voxels.clear();
-                    self.stroke_overlay_members.clear();
-                    self.stroke_overlay_revision = None;
-                    self.stroke_overlay_waiting_for_mesh = false;
                     self.pending_preview = None;
-                    self.queued_action_preview = None;
                     self.deferred_bridge_release = None;
                     self.bridge_anchor = None;
-                    self.stroke_active = false;
-                    self.stroke_completion_pending = false;
+                    self.stroke = None;
+                    self.bridge_commit = None;
                     self.maximized_pane = None;
                     for view in self.slice_views.values_mut() {
                         view.reset();
@@ -510,15 +519,11 @@ impl VoxelInkApp {
                         self.engine.cancel_preview();
                         self.last_preview_request = None;
                         self.pending_preview = None;
-                        self.queued_action_preview = None;
                         self.deferred_bridge_release = None;
                         self.bridge_anchor = None;
                         self.brush_preview_target = None;
                         self.brush_preview_voxels.clear();
-                        self.brush_preview_tool = None;
-                        if !self.stroke_overlay_waiting_for_mesh {
-                            self.clear_stroke_overlay_data();
-                        }
+                        self.brush_preview_kind = None;
                         self.refresh_scene_brush_preview(epoch, self.summary_revision());
                     }
                 }
@@ -537,7 +542,7 @@ impl VoxelInkApp {
                     self.last_preview_request = None;
                     self.brush_preview_target = None;
                     self.brush_preview_voxels.clear();
-                    self.brush_preview_tool = None;
+                    self.brush_preview_kind = None;
                     self.refresh_scene_brush_preview(epoch, revision);
                     self.replace_slices(ctx, slices);
                 }
@@ -635,20 +640,13 @@ impl VoxelInkApp {
                     chunks,
                 } => {
                     self.scene.invalidate(epoch, revision, chunks);
-                    if epoch == self.epoch && self.stroke_overlay_waiting_for_mesh {
-                        self.stroke_overlay_revision = Some(revision);
-                        self.stroke_overlay_waiting_for_mesh = false;
-                        self.refresh_scene_brush_preview(epoch, revision);
-                    }
                 }
-                EngineEvent::MeshChunk { tag, quads } => {
-                    self.scene.insert_chunk(tag, quads);
-                    if tag.document_epoch == self.epoch
-                        && self.stroke_overlay_revision == Some(tag.revision)
-                        && self.retire_stroke_overlay_chunk(tag.chunk)
-                    {
-                        overlay_refresh_revision = Some(tag.revision);
-                    }
+                EngineEvent::MeshChunk {
+                    tag,
+                    quads,
+                    priority,
+                } => {
+                    self.scene.insert_chunk(tag, quads, priority);
                 }
                 EngineEvent::PreviewTooComplex { epoch, .. } if epoch == self.epoch => {
                     self.mesh_preview_failed = true;
@@ -656,16 +654,16 @@ impl VoxelInkApp {
                 _ => {}
             }
         }
-        if let Some(revision) = overlay_refresh_revision {
-            self.refresh_scene_brush_preview(self.epoch, revision);
-        }
         if exhausted_budget {
             ctx.request_repaint();
         }
-        if self.scene.take_remesh_request() && self.summary.is_some() {
+        if !self.has_edit_interaction()
+            && self.scene.take_remesh_request()
+            && self.summary.is_some()
+        {
             let _ = self.send_command(EngineCommand::RebuildPreview);
         }
-        if let Some(message) = self.scene.take_preview_failure() {
+        if let Some(message) = self.scene.take_highlight_failure() {
             self.error_message = Some(message.to_string());
         }
     }
@@ -688,8 +686,11 @@ impl VoxelInkApp {
         match purpose {
             Some(DialogPurpose::Open) => {
                 self.cancel_edit_interaction();
-                if let Err(error) = self.engine.start_load(path) {
-                    self.error_message = Some(error.to_string());
+                match self.engine.start_load(path) {
+                    Ok(job_id) => {
+                        self.busy.insert(job_id, BusyKind::Loading);
+                    }
+                    Err(error) => self.error_message = Some(error.to_string()),
                 }
             }
             Some(DialogPurpose::SaveAs) => {
@@ -728,7 +729,11 @@ impl VoxelInkApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if self.prompt.is_some() || self.error_message.is_some() || !self.busy.is_empty() {
+        if self.prompt.is_some()
+            || self.error_message.is_some()
+            || !self.busy.is_empty()
+            || self.dialog.is_some()
+        {
             return;
         }
         let has_edit_interaction = self.has_edit_interaction();
@@ -779,11 +784,9 @@ impl VoxelInkApp {
         }
         if (redo_shift || redo_y) && edit_commands_ready {
             self.clear_brush_preview();
-            self.clear_stroke_overlay();
             let _ = self.send_command(EngineCommand::Redo);
         } else if undo && edit_commands_ready {
             self.clear_brush_preview();
-            self.clear_stroke_overlay();
             let _ = self.send_command(EngineCommand::Undo);
         }
         let previous_tool = self.tool;
@@ -847,19 +850,13 @@ impl VoxelInkApp {
         });
         if edit && matches!(self.tool, Tool::Paint | Tool::Erase) {
             let space = StrokeSpace::Slice(self.active_slice);
-            self.request_action_preview(
-                BrushPreviewRequest::Brush {
-                    generation: 0,
-                    tool: self.tool,
-                    spec: self.brush_spec(),
-                    space,
-                    sample: PointerSample::Slice {
-                        axis: self.active_slice,
-                        voxel: cursor,
-                    },
-                },
-                PreviewAction::Stroke { complete: true },
-            );
+            let sample = PointerSample::Slice {
+                axis: self.active_slice,
+                voxel: cursor,
+            };
+            if self.begin_stroke(self.tool, self.brush_spec(), space, sample) {
+                let _ = self.complete_active_stroke(None);
+            }
         }
     }
 
@@ -929,7 +926,6 @@ impl VoxelInkApp {
                         .clicked()
                     {
                         self.clear_brush_preview();
-                        self.clear_stroke_overlay();
                         let _ = self.send_command(EngineCommand::Undo);
                     }
                     if ui
@@ -938,7 +934,6 @@ impl VoxelInkApp {
                         .clicked()
                     {
                         self.clear_brush_preview();
-                        self.clear_stroke_overlay();
                         let _ = self.send_command(EngineCommand::Redo);
                     }
                     if let Some(summary) = &self.summary {
@@ -1159,7 +1154,6 @@ impl VoxelInkApp {
                         {
                             self.preview_notice = None;
                             self.clear_brush_preview();
-                            self.clear_stroke_overlay();
                             if let Err(error) = self.engine.start_fill_enclosed_cavities() {
                                 self.error_message = Some(error.to_string());
                             }
@@ -1216,7 +1210,12 @@ impl VoxelInkApp {
                             YELLOW,
                             "3D preview paused at its memory limit; slice editing is unaffected",
                         );
-                        if ui.button("Retry 3D preview").clicked()
+                        if ui
+                            .add_enabled(
+                                !self.has_edit_interaction(),
+                                egui::Button::new("Retry 3D preview"),
+                            )
+                            .clicked()
                             && self.send_command(EngineCommand::RebuildPreview)
                         {
                             self.mesh_preview_failed = false;
@@ -1247,6 +1246,7 @@ impl VoxelInkApp {
     fn workspace(&mut self, root: &mut egui::Ui) {
         self.pane_keyboard_focus = false;
         let background = self.background_color();
+        let dialog_open = self.dialog.is_some();
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -1254,6 +1254,9 @@ impl VoxelInkApp {
                     .inner_margin(egui::Margin::same(6)),
             )
             .show(root, |ui| {
+                if dialog_open {
+                    ui.disable();
+                }
                 let rect = ui.max_rect();
                 let mut actions = FrameStrokeActions::default();
                 match self.maximized_pane {
@@ -1284,7 +1287,7 @@ impl VoxelInkApp {
                     }
                 }
                 if !actions.preview_hovered
-                    && !self.stroke_active
+                    && self.stroke.is_none()
                     && self.bridge_anchor.is_none()
                     && self.pending_preview.is_none()
                 {
@@ -1470,10 +1473,14 @@ impl VoxelInkApp {
             SliceAxis::Coronal => "Coronal",
             SliceAxis::Sagittal => "Sagittal",
         };
-        let coordinate = self
-            .summary
-            .as_ref()
-            .map_or(0, |summary| summary.cursor[axis.normal_axis()]);
+        let coordinate = self.slices.get(&axis).map_or_else(
+            || {
+                self.summary
+                    .as_ref()
+                    .map_or(0, |summary| summary.cursor[axis.normal_axis()])
+            },
+            |slice| slice.coordinate,
+        );
         let last_coordinate = self.summary.as_ref().map_or(0, |summary| {
             summary.dimensions[axis.normal_axis()].saturating_sub(1)
         });
@@ -1582,20 +1589,7 @@ impl VoxelInkApp {
             egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
             Color32::WHITE,
         );
-        if let Some(preview_tool) = self.stroke_overlay_tool {
-            paint_brush_preview(
-                &ui.painter().with_clip_rect(content),
-                image_rect,
-                axis,
-                coordinate,
-                width,
-                height,
-                &self.stroke_overlay_voxels,
-                preview_tool,
-                self.forced_colors,
-            );
-        }
-        if let Some(preview_tool) = self.brush_preview_tool {
+        if let Some(kind) = self.brush_preview_kind {
             paint_brush_preview(
                 &ui.painter().with_clip_rect(content),
                 image_rect,
@@ -1604,7 +1598,20 @@ impl VoxelInkApp {
                 width,
                 height,
                 &self.brush_preview_voxels,
-                preview_tool,
+                kind,
+                self.forced_colors,
+            );
+        }
+        if let Some(anchor) = self.bridge_anchor {
+            paint_brush_preview(
+                &ui.painter().with_clip_rect(content),
+                image_rect,
+                axis,
+                coordinate,
+                width,
+                height,
+                std::slice::from_ref(&anchor.voxel),
+                VoxelHighlightKind::BridgeAnchor,
                 self.forced_colors,
             );
         }
@@ -1655,8 +1662,8 @@ impl VoxelInkApp {
         }
         if response.hovered()
             && self.busy.is_empty()
-            && !self.stroke_active
-            && !self.stroke_completion_pending
+            && self.stroke.is_none()
+            && self.bridge_commit.is_none()
         {
             let control = ui.input(|input| input.modifiers.ctrl);
             if control {
@@ -1702,31 +1709,35 @@ impl VoxelInkApp {
                 height,
             );
         }
-        let pointer_voxel = response
-            .interact_pointer_pos()
-            .and_then(|position| {
-                rect_contains_half_open(interaction_rect, position).then_some(position)
-            })
-            .and_then(|position| {
-                self.summary.as_ref().and_then(|summary| {
-                    slice_pointer_to_voxel(
-                        axis,
-                        position,
-                        image_rect,
-                        width,
-                        height,
-                        summary.cursor,
-                    )
+        let displayed_cursor = self.summary.as_ref().map(|summary| {
+            let mut cursor = summary.cursor;
+            cursor[axis.normal_axis()] = coordinate;
+            cursor
+        });
+        let pointer_to_voxel = |position| {
+            rect_contains_half_open(interaction_rect, position)
+                .then_some(position)
+                .and_then(|position| {
+                    displayed_cursor.and_then(|cursor| {
+                        slice_pointer_to_voxel(axis, position, image_rect, width, height, cursor)
+                    })
                 })
-            });
-        if !self.busy.is_empty() {
+        };
+        let pointer_voxel = response.interact_pointer_pos().and_then(pointer_to_voxel);
+        let (primary_press_position, primary_release_position) =
+            ui.input(|input| primary_pointer_event_positions(&input.events));
+        let pressed_voxel = primary_press_position.and_then(pointer_to_voxel);
+        let released_voxel = primary_release_position.and_then(pointer_to_voxel);
+        let primary_pressed = pressed_voxel.is_some();
+        let primary_released = primary_release_position.is_some();
+        if self.edit_input_blocked() {
             return;
         }
         let space = StrokeSpace::Slice(axis);
         if self.tool != Tool::Inspect
             && response.hovered()
-            && !self.stroke_active
-            && !self.stroke_completion_pending
+            && self.stroke.is_none()
+            && self.bridge_commit.is_none()
             && let Some(voxel) = pointer_voxel
         {
             actions.preview_hovered = true;
@@ -1753,67 +1764,31 @@ impl VoxelInkApp {
             self.request_brush_preview(request);
         }
         if matches!(self.tool, Tool::Paint | Tool::Erase) {
-            if response.drag_started_by(egui::PointerButton::Primary)
-                && let Some(voxel) = pointer_voxel
-            {
+            if primary_pressed && let Some(voxel) = pressed_voxel {
                 self.active_slice = axis;
-                self.request_action_preview(
-                    BrushPreviewRequest::Brush {
-                        generation: 0,
-                        tool: self.tool,
-                        spec: self.brush_spec(),
-                        space,
-                        sample: PointerSample::Slice { axis, voxel },
-                    },
-                    PreviewAction::Stroke { complete: false },
+                let _ = self.begin_stroke(
+                    self.tool,
+                    self.brush_spec(),
+                    space,
+                    PointerSample::Slice { axis, voxel },
                 );
             } else if response.dragged_by(egui::PointerButton::Primary)
+                && let Some(edit_id) = self.open_stroke_id(space)
                 && let Some(voxel) = pointer_voxel
+                && let Err(error) =
+                    self.send_stroke_sample(edit_id, PointerSample::Slice { axis, voxel })
             {
-                self.request_action_preview(
-                    BrushPreviewRequest::Brush {
-                        generation: 0,
-                        tool: self.tool,
-                        spec: self.brush_spec(),
-                        space,
-                        sample: PointerSample::Slice { axis, voxel },
-                    },
-                    PreviewAction::Stroke { complete: false },
+                self.error_message = Some(error.to_string());
+                self.cancel_edit_interaction();
+            }
+            if primary_released && self.open_stroke_id(space).is_some() {
+                self.finish_stroke_pointer_release(
+                    released_voxel.map(|voxel| PointerSample::Slice { axis, voxel }),
                 );
             }
-            if response.drag_stopped_by(egui::PointerButton::Primary) {
-                if let Some(voxel) = pointer_voxel {
-                    self.request_action_preview(
-                        BrushPreviewRequest::Brush {
-                            generation: 0,
-                            tool: self.tool,
-                            spec: self.brush_spec(),
-                            space,
-                            sample: PointerSample::Slice { axis, voxel },
-                        },
-                        PreviewAction::Stroke { complete: true },
-                    );
-                } else {
-                    self.finish_stroke_pointer_release();
-                }
-            } else if response.clicked_by(egui::PointerButton::Primary)
-                && let Some(voxel) = pointer_voxel
-            {
-                self.request_action_preview(
-                    BrushPreviewRequest::Brush {
-                        generation: 0,
-                        tool: self.tool,
-                        spec: self.brush_spec(),
-                        space,
-                        sample: PointerSample::Slice { axis, voxel },
-                    },
-                    PreviewAction::Stroke { complete: true },
-                );
-            }
-        } else if self.tool == Tool::Bridge {
-            if response.drag_started_by(egui::PointerButton::Primary)
-                && let Some(voxel) = pointer_voxel
-            {
+        } else if self.tool == Tool::Bridge && self.stroke.is_none() && self.bridge_commit.is_none()
+        {
+            if primary_pressed && let Some(voxel) = pressed_voxel {
                 self.active_slice = axis;
                 self.request_action_preview(
                     BrushPreviewRequest::Brush {
@@ -1828,8 +1803,20 @@ impl VoxelInkApp {
                     },
                 );
             }
-            if response.drag_stopped_by(egui::PointerButton::Primary) {
-                if let Some(voxel) = pointer_voxel {
+            let bridge_interaction_matches = self
+                .bridge_anchor
+                .is_some_and(|anchor| anchor.space == space)
+                || self.pending_preview.is_some_and(|pending| {
+                    matches!(
+                        pending.request,
+                        BrushPreviewRequest::Brush {
+                            space: pending_space,
+                            ..
+                        } if pending_space == space
+                    )
+                });
+            if primary_released && bridge_interaction_matches {
+                if let Some(voxel) = released_voxel {
                     let release = DeferredBridgeRelease {
                         sample: PointerSample::Slice { axis, voxel },
                         spec: self.brush_spec(),
@@ -1984,23 +1971,29 @@ impl VoxelInkApp {
         if self.tool == Tool::Inspect || self.summary.is_none() {
             return;
         }
-        if !self.busy.is_empty() {
+        if self.edit_input_blocked() {
             return;
         }
-        let pointer_ray = response
-            .interact_pointer_pos()
-            .filter(|position| rect_contains_half_open(content, *position))
-            .map(|position| {
+        let pointer_to_ray = |position| {
+            rect_contains_half_open(content, position).then(|| {
                 let normalized = [
                     ((position.x - content.left()) / content.width()) * 2.0 - 1.0,
                     1.0 - ((position.y - content.top()) / content.height()) * 2.0,
                 ];
                 self.scene.ray_for_pointer(normalized)
-            });
+            })
+        };
+        let pointer_ray = response.interact_pointer_pos().and_then(pointer_to_ray);
+        let (primary_press_position, primary_release_position) =
+            ui.input(|input| primary_pointer_event_positions(&input.events));
+        let pressed_ray = primary_press_position.and_then(pointer_to_ray);
+        let released_ray = primary_release_position.and_then(pointer_to_ray);
+        let primary_pressed = pressed_ray.is_some();
+        let primary_released = primary_release_position.is_some();
         let space = StrokeSpace::Volume3D;
         if (response.hovered() || response.dragged_by(egui::PointerButton::Primary))
-            && !self.stroke_active
-            && !self.stroke_completion_pending
+            && self.stroke.is_none()
+            && self.bridge_commit.is_none()
             && let Some(ray) = pointer_ray
         {
             actions.preview_hovered = true;
@@ -2027,66 +2020,29 @@ impl VoxelInkApp {
             self.request_brush_preview(request);
         }
         if matches!(self.tool, Tool::Paint | Tool::Erase) {
-            if response.drag_started_by(egui::PointerButton::Primary)
-                && let Some(ray) = pointer_ray
-            {
-                self.request_action_preview(
-                    BrushPreviewRequest::Brush {
-                        generation: 0,
-                        tool: self.tool,
-                        spec: self.brush_spec(),
-                        space,
-                        sample: PointerSample::Ray { ray },
-                    },
-                    PreviewAction::Stroke { complete: false },
+            if primary_pressed && let Some(ray) = pressed_ray {
+                let _ = self.begin_stroke(
+                    self.tool,
+                    self.brush_spec(),
+                    space,
+                    PointerSample::Ray { ray },
                 );
             } else if response.dragged_by(egui::PointerButton::Primary)
+                && let Some(edit_id) = self.open_stroke_id(space)
                 && let Some(ray) = pointer_ray
+                && let Err(error) = self.send_stroke_sample(edit_id, PointerSample::Ray { ray })
             {
-                self.request_action_preview(
-                    BrushPreviewRequest::Brush {
-                        generation: 0,
-                        tool: self.tool,
-                        spec: self.brush_spec(),
-                        space,
-                        sample: PointerSample::Ray { ray },
-                    },
-                    PreviewAction::Stroke { complete: false },
+                self.error_message = Some(error.to_string());
+                self.cancel_edit_interaction();
+            }
+            if primary_released && self.open_stroke_id(space).is_some() {
+                self.finish_stroke_pointer_release(
+                    released_ray.map(|ray| PointerSample::Ray { ray }),
                 );
             }
-            if response.drag_stopped_by(egui::PointerButton::Primary) {
-                if let Some(ray) = pointer_ray {
-                    self.request_action_preview(
-                        BrushPreviewRequest::Brush {
-                            generation: 0,
-                            tool: self.tool,
-                            spec: self.brush_spec(),
-                            space,
-                            sample: PointerSample::Ray { ray },
-                        },
-                        PreviewAction::Stroke { complete: true },
-                    );
-                } else {
-                    self.finish_stroke_pointer_release();
-                }
-            } else if response.clicked_by(egui::PointerButton::Primary)
-                && let Some(ray) = pointer_ray
-            {
-                self.request_action_preview(
-                    BrushPreviewRequest::Brush {
-                        generation: 0,
-                        tool: self.tool,
-                        spec: self.brush_spec(),
-                        space,
-                        sample: PointerSample::Ray { ray },
-                    },
-                    PreviewAction::Stroke { complete: true },
-                );
-            }
-        } else if self.tool == Tool::Bridge {
-            if response.drag_started_by(egui::PointerButton::Primary)
-                && let Some(ray) = pointer_ray
-            {
+        } else if self.tool == Tool::Bridge && self.stroke.is_none() && self.bridge_commit.is_none()
+        {
+            if primary_pressed && let Some(ray) = pressed_ray {
                 self.request_action_preview(
                     BrushPreviewRequest::Brush {
                         generation: 0,
@@ -2100,8 +2056,20 @@ impl VoxelInkApp {
                     },
                 );
             }
-            if response.drag_stopped_by(egui::PointerButton::Primary) {
-                if let Some(ray) = pointer_ray {
+            let bridge_interaction_matches = self
+                .bridge_anchor
+                .is_some_and(|anchor| anchor.space == space)
+                || self.pending_preview.is_some_and(|pending| {
+                    matches!(
+                        pending.request,
+                        BrushPreviewRequest::Brush {
+                            space: pending_space,
+                            ..
+                        } if pending_space == space
+                    )
+                });
+            if primary_released && bridge_interaction_matches {
+                if let Some(ray) = released_ray {
                     let release = DeferredBridgeRelease {
                         sample: PointerSample::Ray { ray },
                         spec: self.brush_spec(),
@@ -2316,7 +2284,7 @@ impl VoxelInkApp {
     }
 
     fn request_brush_preview(&mut self, request: BrushPreviewRequest) {
-        if self.pending_preview.is_some() || self.queued_action_preview.is_some() {
+        if self.pending_preview.is_some() || self.edit_input_blocked() {
             return;
         }
         let template = preview_with_generation(request, 0);
@@ -2336,49 +2304,29 @@ impl VoxelInkApp {
     }
 
     fn request_action_preview(&mut self, request: BrushPreviewRequest, action: PreviewAction) {
-        let mut queued = ActionPreview { request, action };
-        if self.pending_preview.is_some() {
-            if self
-                .pending_preview
-                .is_some_and(|current| current.action.finishing_stroke())
-                || self
-                    .queued_action_preview
-                    .is_some_and(|current| current.action.finishing_stroke())
-            {
-                queued.action.mark_stroke_complete();
-            }
-            self.queued_action_preview = Some(queued);
+        if self.pending_preview.is_some() || self.edit_input_blocked() {
             return;
         }
-        self.dispatch_action_preview(queued);
-    }
-
-    fn dispatch_action_preview(&mut self, action_preview: ActionPreview) {
         self.brush_preview_generation = self.brush_preview_generation.saturating_add(1);
-        if self.brush_preview_tool.is_some()
+        if self.brush_preview_kind.is_some()
             || self.brush_preview_target.is_some()
             || !self.brush_preview_voxels.is_empty()
         {
             self.discard_current_brush_preview();
         }
-        let request =
-            preview_with_generation(action_preview.request, self.brush_preview_generation);
+        let request = preview_with_generation(request, self.brush_preview_generation);
         match self.engine.send_latest_preview(request) {
             Ok(()) => {
                 self.last_preview_request = Some(preview_with_generation(request, 0));
                 self.pending_preview = Some(PendingPreview {
                     generation: self.brush_preview_generation,
                     request,
-                    action: action_preview.action,
+                    action,
                 });
             }
             Err(error) => {
                 self.last_preview_request = None;
                 self.pending_preview = None;
-                self.queued_action_preview = None;
-                if self.stroke_active {
-                    let _ = self.complete_active_stroke();
-                }
                 self.error_message = Some(error.to_string());
             }
         }
@@ -2398,106 +2346,43 @@ impl VoxelInkApp {
             .take()
             .filter(|pending| pending.generation == generation)
         else {
-            self.brush_preview_tool = Some(tool);
+            self.brush_preview_kind = Some(match tool {
+                Tool::Paint => VoxelHighlightKind::Paint,
+                Tool::Erase => VoxelHighlightKind::Erase,
+                Tool::Bridge if self.bridge_anchor.is_some() => VoxelHighlightKind::BridgePath,
+                Tool::Bridge => VoxelHighlightKind::BridgeAnchor,
+                Tool::Inspect => return,
+            });
             self.brush_preview_target = target;
             self.brush_preview_voxels = voxels;
             self.refresh_scene_brush_preview(epoch, revision);
             return;
         };
         self.last_preview_request = None;
-        self.brush_preview_tool = None;
+        self.brush_preview_kind = None;
         self.brush_preview_target = None;
         self.brush_preview_voxels.clear();
-        let finishing_stroke = pending.action.finishing_stroke();
-        match (pending.action, pending.request) {
-            (
-                PreviewAction::Stroke { complete },
-                BrushPreviewRequest::Brush {
-                    tool,
-                    spec,
+        if let (
+            PreviewAction::BridgeAnchor { plane_normal },
+            BrushPreviewRequest::Brush { space, .. },
+        ) = (pending.action, pending.request)
+        {
+            if let Some(voxel) = target {
+                self.bridge_anchor = Some(BridgeAnchor {
+                    voxel,
                     space,
-                    sample,
-                    ..
-                },
-            ) => {
-                if target.is_some() {
-                    if !self.stroke_active && !self.begin_stroke(tool, spec, space) {
-                        self.queued_action_preview = None;
-                    } else if self.stroke_active {
-                        self.accumulate_stroke_overlay(tool, &voxels);
-                        if let Err(error) = self.engine.send_latest_sample(sample) {
-                            self.queued_action_preview = None;
-                            self.error_message = Some(error.to_string());
-                            let _ = self.complete_active_stroke();
-                        }
-                    }
-                }
-                if complete {
-                    let _ = self.complete_active_stroke();
-                }
-            }
-            (
-                PreviewAction::BridgeAnchor { plane_normal },
-                BrushPreviewRequest::Brush { space, .. },
-            ) => {
-                if let Some(voxel) = target {
-                    self.clear_stroke_overlay_data();
-                    self.bridge_anchor = Some(BridgeAnchor {
-                        voxel,
-                        space,
-                        plane_normal,
-                    });
-                    if let Some(release) = self.deferred_bridge_release.take()
-                        && release.space == space
-                    {
-                        self.request_bridge_commit(release);
-                    }
-                } else {
-                    self.deferred_bridge_release = None;
-                }
-            }
-            (
-                PreviewAction::BridgeCommit,
-                BrushPreviewRequest::Bridge {
-                    spec,
-                    space,
-                    anchor,
                     plane_normal,
-                    sample,
-                    ..
-                },
-            ) => {
-                if target.is_some() {
-                    self.accumulate_stroke_overlay(Tool::Bridge, &voxels);
-                    self.stroke_overlay_waiting_for_mesh = !self.stroke_overlay_voxels.is_empty();
-                    self.stroke_overlay_revision = None;
-                    if !self.send_command(EngineCommand::CommitBridge {
-                        anchor,
-                        plane_normal,
-                        sample,
-                        spec,
-                        space,
-                    }) {
-                        self.clear_stroke_overlay();
-                    }
+                });
+                if let Some(release) = self.deferred_bridge_release.take()
+                    && release.space == space
+                {
+                    self.request_bridge_commit(release);
                 }
-                self.bridge_anchor = None;
+            } else {
                 self.deferred_bridge_release = None;
-            }
-            _ => {
-                self.queued_action_preview = None;
             }
         }
         self.refresh_scene_brush_preview(epoch, revision);
-        if !finishing_stroke
-            && !self.stroke_completion_pending
-            && self.pending_preview.is_none()
-            && let Some(queued) = self.queued_action_preview.take()
-        {
-            self.dispatch_action_preview(queued);
-        } else if finishing_stroke {
-            self.queued_action_preview = None;
-        }
     }
 
     fn handle_brush_preview_failure(&mut self, generation: u64, message: String) {
@@ -2510,65 +2395,18 @@ impl VoxelInkApp {
         self.brush_preview_generation = self.brush_preview_generation.saturating_add(1);
         self.last_preview_request = None;
         self.pending_preview = None;
-        self.queued_action_preview = None;
         self.deferred_bridge_release = None;
         self.bridge_anchor = None;
         self.engine.cancel_preview();
         self.discard_current_brush_preview();
-        if self.stroke_active || self.stroke_completion_pending {
-            let _ = self.complete_active_stroke();
+        if self.stroke.is_some() {
+            let _ = self.complete_active_stroke(None);
         }
         self.error_message = Some(message);
     }
 
-    fn accumulate_stroke_overlay(&mut self, tool: Tool, voxels: &[[u32; 3]]) {
-        if voxels.is_empty() {
-            return;
-        }
-        if self.stroke_overlay_tool != Some(tool) {
-            self.stroke_overlay_tool = Some(tool);
-            self.stroke_overlay_voxels.clear();
-            self.stroke_overlay_members.clear();
-        }
-        self.stroke_overlay_revision = None;
-        self.stroke_overlay_waiting_for_mesh = false;
-        for voxel in voxels.iter().copied() {
-            if self.stroke_overlay_members.insert(voxel) {
-                self.stroke_overlay_voxels.push(voxel);
-            }
-        }
-    }
-
-    fn retire_stroke_overlay_chunk(&mut self, chunk: crate::mesh::ChunkCoord) -> bool {
-        let previous_len = self.stroke_overlay_voxels.len();
-        self.stroke_overlay_voxels
-            .retain(|voxel| crate::mesh::ChunkCoord::from_voxel(*voxel) != chunk);
-        if self.stroke_overlay_voxels.len() == previous_len {
-            return false;
-        }
-        self.stroke_overlay_members = self.stroke_overlay_voxels.iter().copied().collect();
-        if self.stroke_overlay_voxels.is_empty() {
-            self.stroke_overlay_tool = None;
-            self.stroke_overlay_revision = None;
-        }
-        true
-    }
-
-    fn clear_stroke_overlay_data(&mut self) {
-        self.stroke_overlay_tool = None;
-        self.stroke_overlay_voxels.clear();
-        self.stroke_overlay_members.clear();
-        self.stroke_overlay_revision = None;
-        self.stroke_overlay_waiting_for_mesh = false;
-    }
-
-    fn clear_stroke_overlay(&mut self) {
-        self.clear_stroke_overlay_data();
-        self.refresh_scene_brush_preview(self.epoch, self.summary_revision());
-    }
-
     fn discard_current_brush_preview(&mut self) {
-        self.brush_preview_tool = None;
+        self.brush_preview_kind = None;
         self.brush_preview_target = None;
         self.brush_preview_voxels.clear();
         let revision = self.summary.as_ref().map_or(0, |summary| summary.revision);
@@ -2577,60 +2415,59 @@ impl VoxelInkApp {
     }
 
     fn refresh_scene_brush_preview(&self, epoch: u64, revision: u64) {
-        let (tool, mut voxels) = if let Some(tool) = self.brush_preview_tool
-            && self.stroke_overlay_tool != Some(tool)
-        {
-            (tool, self.brush_preview_voxels.clone())
-        } else if let Some(tool) = self.stroke_overlay_tool {
-            (tool, self.stroke_overlay_voxels.clone())
-        } else if let Some(tool) = self.brush_preview_tool {
-            (tool, self.brush_preview_voxels.clone())
-        } else {
-            self.scene.clear_voxel_preview();
-            return;
-        };
-        if self.stroke_overlay_tool == self.brush_preview_tool {
-            voxels.extend(
+        let mut highlights = Vec::new();
+        if let Some(kind) = self.brush_preview_kind {
+            highlights.extend(
                 self.brush_preview_voxels
                     .iter()
                     .copied()
-                    .filter(|voxel| !self.stroke_overlay_members.contains(voxel)),
+                    .map(|voxel| (voxel, kind)),
             );
         }
-        if voxels.is_empty() {
-            self.scene.clear_voxel_preview();
+        if let Some(anchor) = self.bridge_anchor {
+            highlights.push((anchor.voxel, VoxelHighlightKind::BridgeAnchor));
+        }
+        if highlights.is_empty() {
+            self.scene.clear_voxel_highlight();
             return;
         }
-        let kind = match tool {
-            Tool::Erase => VoxelPreviewKind::Erase,
-            Tool::Bridge => VoxelPreviewKind::Bridge,
-            Tool::Inspect | Tool::Paint => VoxelPreviewKind::Paint,
-        };
-        let _ = self.scene.set_voxel_preview(epoch, revision, voxels, kind);
+        let _ = self.scene.set_voxel_highlight(epoch, revision, highlights);
     }
 
     fn request_bridge_commit(&mut self, release: DeferredBridgeRelease) {
+        if self.edit_input_blocked() {
+            self.cancel_edit_interaction();
+            return;
+        }
         let Some(anchor) = self.bridge_anchor else {
             self.deferred_bridge_release = Some(release);
             return;
         };
-        let request = BrushPreviewRequest::Bridge {
-            generation: 0,
-            spec: release.spec,
-            space: release.space,
-            anchor: anchor.voxel,
-            plane_normal: anchor.plane_normal,
-            sample: release.sample,
-        };
-        self.request_action_preview(request, PreviewAction::BridgeCommit);
+        if self.bridge_commit.is_some() || self.stroke.is_some() {
+            return;
+        }
+        let edit_id = self.allocate_edit_id();
+        self.brush_preview_generation = self.brush_preview_generation.saturating_add(1);
+        self.engine.cancel_preview();
+        self.last_preview_request = None;
+        self.pending_preview = None;
+        self.deferred_bridge_release = None;
+        self.bridge_anchor = None;
+        self.discard_current_brush_preview();
+        self.bridge_commit = Some(PendingBridgeCommit {
+            edit_id,
+            anchor,
+            release,
+            phase: BridgeCommitPhase::Pending,
+        });
+        self.retry_pending_bridge_commit();
     }
 
     fn clear_brush_preview(&mut self) {
         if self.last_preview_request.is_none()
-            && self.brush_preview_tool.is_none()
+            && self.brush_preview_kind.is_none()
             && self.brush_preview_voxels.is_empty()
             && self.pending_preview.is_none()
-            && self.queued_action_preview.is_none()
             && self.deferred_bridge_release.is_none()
         {
             return;
@@ -2639,7 +2476,6 @@ impl VoxelInkApp {
         self.engine.cancel_preview();
         self.last_preview_request = None;
         self.pending_preview = None;
-        self.queued_action_preview = None;
         self.deferred_bridge_release = None;
         self.discard_current_brush_preview();
     }
@@ -2649,70 +2485,130 @@ impl VoxelInkApp {
         self.engine.cancel_preview();
         self.last_preview_request = None;
         self.pending_preview = None;
-        self.queued_action_preview = None;
         self.deferred_bridge_release = None;
         self.bridge_anchor = None;
-        let had_active_stroke = self.stroke_active || self.stroke_completion_pending;
-        if had_active_stroke && self.send_command(EngineCommand::CancelStroke) {
-            self.stroke_active = false;
-            self.stroke_completion_pending = false;
+        if let Some(commit) = self.bridge_commit
+            && commit.phase == BridgeCommitPhase::Pending
+        {
+            self.bridge_commit = None;
         }
-        self.clear_stroke_overlay_data();
+        if let Some(stroke) = self.stroke.as_mut()
+            && stroke.phase != UiStrokePhase::AwaitingAcknowledgement
+        {
+            stroke.cancel.cancel();
+            stroke.phase = UiStrokePhase::Pending(StrokeDisposition::Cancel);
+            self.retry_pending_stroke_terminal();
+        }
         self.discard_current_brush_preview();
     }
 
-    fn finish_stroke_pointer_release(&mut self) {
-        if let Some(queued) = self.queued_action_preview.as_mut() {
-            queued.action.mark_stroke_complete();
-        } else if let Some(pending) = self.pending_preview.as_mut() {
-            pending.action.mark_stroke_complete();
-        } else {
-            let _ = self.complete_active_stroke();
-        }
+    fn finish_stroke_pointer_release(&mut self, final_sample: Option<PointerSample>) {
+        let _ = self.complete_active_stroke(final_sample);
     }
 
     fn has_edit_interaction(&self) -> bool {
         self.pending_preview.is_some()
-            || self.queued_action_preview.is_some()
             || self.deferred_bridge_release.is_some()
             || self.bridge_anchor.is_some()
-            || self.stroke_active
-            || self.stroke_completion_pending
+            || self.stroke.is_some()
+            || self.bridge_commit.is_some()
+    }
+
+    fn edit_input_blocked(&self) -> bool {
+        !self.busy.is_empty()
+            || self.dialog.is_some()
+            || self.prompt.is_some()
+            || self.error_message.is_some()
+            || self.allow_exit
+            || !self.egui_ctx.input(|input| input.focused)
+    }
+
+    fn open_stroke_id(&self, space: StrokeSpace) -> Option<EditId> {
+        self.stroke.as_ref().and_then(|stroke| {
+            (stroke.space == space && stroke.phase == UiStrokePhase::Open).then_some(stroke.edit_id)
+        })
     }
 
     fn summary_revision(&self) -> u64 {
         self.summary.as_ref().map_or(0, |summary| summary.revision)
     }
 
-    fn begin_stroke(&mut self, tool: Tool, spec: BrushSpec, space: StrokeSpace) -> bool {
-        if self.stroke_active || self.stroke_completion_pending || !self.busy.is_empty() {
+    fn begin_stroke(
+        &mut self,
+        tool: Tool,
+        spec: BrushSpec,
+        space: StrokeSpace,
+        initial_sample: PointerSample,
+    ) -> bool {
+        if self.stroke.is_some() || self.bridge_commit.is_some() || self.edit_input_blocked() {
             return false;
         }
-        self.clear_stroke_overlay_data();
-        if self.send_command(EngineCommand::BeginStroke { tool, spec, space }) {
-            self.stroke_active = tool != Tool::Inspect;
+        self.clear_brush_preview();
+        let edit_id = self.allocate_edit_id();
+        let cancel = CancellationToken::default();
+        if self.send_command(EngineCommand::BeginStroke {
+            edit_id,
+            tool,
+            spec,
+            space,
+            initial_sample,
+            cancel: cancel.clone(),
+        }) {
+            self.stroke = Some(UiStroke {
+                edit_id,
+                space,
+                last_submitted: initial_sample,
+                cancel,
+                phase: UiStrokePhase::Open,
+            });
             true
         } else {
             false
         }
     }
 
-    fn complete_active_stroke(&mut self) -> bool {
-        if !self.stroke_active && !self.stroke_completion_pending {
+    fn complete_active_stroke(&mut self, final_sample: Option<PointerSample>) -> bool {
+        let Some(stroke) = self.stroke.as_mut() else {
             return true;
+        };
+        match stroke.phase {
+            UiStrokePhase::Open => {
+                stroke.phase = UiStrokePhase::Pending(StrokeDisposition::Complete {
+                    final_sample: final_sample.or(Some(stroke.last_submitted)),
+                });
+            }
+            UiStrokePhase::Pending(StrokeDisposition::Complete { .. }) => {}
+            UiStrokePhase::Pending(StrokeDisposition::Cancel) => return false,
+            UiStrokePhase::AwaitingAcknowledgement => return true,
         }
-        if self.stroke_active && !self.stroke_overlay_voxels.is_empty() {
-            self.stroke_overlay_revision = None;
-            self.stroke_overlay_waiting_for_mesh = true;
-        }
-        match self.engine.send(EngineCommand::CompleteStroke) {
+        self.retry_pending_stroke_terminal()
+    }
+
+    fn retry_pending_stroke_terminal(&mut self) -> bool {
+        let Some((edit_id, disposition)) = self.stroke.as_ref().and_then(|stroke| {
+            if let UiStrokePhase::Pending(disposition) = stroke.phase {
+                Some((stroke.edit_id, disposition))
+            } else {
+                None
+            }
+        }) else {
+            return true;
+        };
+        match self.engine.send(EngineCommand::EndStroke {
+            edit_id,
+            disposition,
+        }) {
             Ok(()) => {
-                self.stroke_active = false;
-                self.stroke_completion_pending = false;
+                if let Some(stroke) = self
+                    .stroke
+                    .as_mut()
+                    .filter(|stroke| stroke.edit_id == edit_id)
+                {
+                    stroke.phase = UiStrokePhase::AwaitingAcknowledgement;
+                }
                 true
             }
             Err(error) => {
-                self.stroke_completion_pending = true;
                 self.error_message = Some(error.to_string());
                 self.egui_ctx.request_repaint();
                 false
@@ -2720,10 +2616,58 @@ impl VoxelInkApp {
         }
     }
 
-    fn retry_pending_stroke_completion(&mut self) {
-        if self.stroke_completion_pending {
-            let _ = self.complete_active_stroke();
+    fn send_stroke_sample(&mut self, edit_id: EditId, sample: PointerSample) -> crate::Result<()> {
+        self.engine.send_latest_sample(edit_id, sample)?;
+        if let Some(stroke) = self
+            .stroke
+            .as_mut()
+            .filter(|stroke| stroke.edit_id == edit_id)
+        {
+            stroke.last_submitted = sample;
         }
+        Ok(())
+    }
+
+    fn retry_pending_bridge_commit(&mut self) {
+        let Some(commit) = self
+            .bridge_commit
+            .filter(|commit| commit.phase == BridgeCommitPhase::Pending)
+        else {
+            return;
+        };
+        match self.engine.send(EngineCommand::CommitBridge {
+            edit_id: commit.edit_id,
+            anchor: commit.anchor.voxel,
+            plane_normal: commit.anchor.plane_normal,
+            sample: commit.release.sample,
+            spec: commit.release.spec,
+            space: commit.release.space,
+        }) {
+            Ok(()) => {
+                if let Some(queued) = self
+                    .bridge_commit
+                    .as_mut()
+                    .filter(|queued| queued.edit_id == commit.edit_id)
+                {
+                    queued.phase = BridgeCommitPhase::AwaitingAcknowledgement;
+                }
+            }
+            Err(error) => {
+                self.error_message = Some(error.to_string());
+                self.egui_ctx.request_repaint();
+            }
+        }
+    }
+
+    fn retry_pending_edit_commands(&mut self) {
+        let _ = self.retry_pending_stroke_terminal();
+        self.retry_pending_bridge_commit();
+    }
+
+    fn allocate_edit_id(&mut self) -> EditId {
+        let edit_id = self.next_edit_id;
+        self.next_edit_id = self.next_edit_id.wrapping_add(1).max(1);
+        edit_id
     }
 
     const fn background_color(&self) -> Color32 {
@@ -2775,7 +2719,7 @@ impl VoxelInkApp {
     }
 
     fn open_file_dialog(&mut self) {
-        if self.dialog.is_some() {
+        if self.dialog.is_some() || self.has_edit_interaction() || !self.busy.is_empty() {
             return;
         }
         let (sender, receiver) = bounded(1);
@@ -2946,15 +2890,22 @@ impl eframe::App for VoxelInkApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.process_engine_events(&ctx);
-        self.retry_pending_stroke_completion();
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
+        let had_edit_interaction = self.has_edit_interaction();
+        let escape_requested = had_edit_interaction
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let focus_lost = had_edit_interaction && ctx.input(|input| !input.focused);
+        if escape_requested || focus_lost || (close_requested && had_edit_interaction) {
+            self.cancel_edit_interaction();
+        }
         self.process_dialog();
-        if ctx.input(|input| input.viewport().close_requested()) {
+        self.retry_pending_edit_commands();
+        if close_requested {
             if self.allow_exit {
                 return;
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            if self.has_edit_interaction() {
-                self.cancel_edit_interaction();
+            if had_edit_interaction {
                 self.preview_notice = Some("Current edit cancelled; close again to exit".into());
             } else if self.prompt.is_none() {
                 self.guard_or_execute(GuardAction::Exit);
@@ -2963,6 +2914,9 @@ impl eframe::App for VoxelInkApp {
         if self.allow_exit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
+        }
+        if self.dialog.is_some() {
+            ui.disable();
         }
         self.toolbar(ui);
         self.status_bar(ui);
@@ -3073,6 +3027,30 @@ fn env_flag(name: &str) -> bool {
 
 fn consume_shortcut(ctx: &egui::Context, modifiers: egui::Modifiers, key: egui::Key) -> bool {
     ctx.input_mut(|input| input.consume_shortcut(&egui::KeyboardShortcut::new(modifiers, key)))
+}
+
+fn primary_pointer_event_positions(
+    events: &[egui::Event],
+) -> (Option<egui::Pos2>, Option<egui::Pos2>) {
+    let mut pressed = None;
+    let mut released = None;
+    for event in events {
+        let egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: is_pressed,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if *is_pressed {
+            pressed.get_or_insert(*pos);
+        } else {
+            released = Some(*pos);
+        }
+    }
+    (pressed, released)
 }
 
 fn preview_with_generation(request: BrushPreviewRequest, generation: u64) -> BrushPreviewRequest {
@@ -3266,22 +3244,17 @@ fn paint_brush_preview(
     width: u32,
     height: u32,
     voxels: &[[u32; 3]],
-    tool: Tool,
+    kind: VoxelHighlightKind,
     forced_colors: bool,
 ) {
-    let (fill, outline) = if forced_colors {
-        (Color32::from_white_alpha(120), Color32::WHITE)
-    } else if tool == Tool::Erase {
-        (
-            Color32::from_rgba_unmultiplied(255, 91, 69, 130),
-            Color32::from_rgb(255, 154, 89),
-        )
+    let color = if forced_colors {
+        [u8::MAX; 3]
     } else {
-        (
-            Color32::from_rgba_unmultiplied(36, 200, 219, 125),
-            Color32::from_rgb(121, 238, 248),
-        )
+        kind.color()
     };
+    let fill = Color32::from_rgba_unmultiplied(color[0], color[1], color[2], kind.fill_alpha());
+    let outline =
+        Color32::from_rgba_unmultiplied(color[0], color[1], color[2], kind.outline_alpha());
     let normal_axis = axis.normal_axis();
     for &voxel in voxels {
         if voxel[normal_axis] != coordinate {
@@ -3385,6 +3358,30 @@ mod tests {
                 [3, 7, 2],
             ),
             None
+        );
+    }
+
+    #[test]
+    fn primary_press_and_release_keep_their_own_same_frame_positions() {
+        let events = [
+            egui::Event::PointerButton {
+                pos: egui::pos2(12.0, 18.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerMoved(egui::pos2(42.0, 36.0)),
+            egui::Event::PointerButton {
+                pos: egui::pos2(42.0, 36.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+
+        assert_eq!(
+            primary_pointer_event_positions(&events),
+            (Some(egui::pos2(12.0, 18.0)), Some(egui::pos2(42.0, 36.0)))
         );
     }
 

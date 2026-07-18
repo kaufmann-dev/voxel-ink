@@ -179,6 +179,66 @@ fn loaded_document_has_synchronized_named_panes_and_keyboard_editing() {
 }
 
 #[test]
+fn a_same_frame_slice_click_applies_and_completes_one_edit() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("quick-click.binvox");
+    write_binvox(&path, [5, 5, 1], &[0; 25]);
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "5 × 5 × 1");
+    harness.key_press(egui::Key::B);
+    harness.step();
+
+    harness
+        .get_by_role_and_label(Role::Image, "Axial slice editor")
+        .click();
+    harness.step();
+
+    wait_for_label(&mut harness, "13 occupied");
+    wait_for_label(&mut harness, "modified");
+}
+
+#[test]
+fn a_same_frame_slice_drag_keeps_distinct_press_and_release_samples() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("quick-drag.binvox");
+    write_binvox(&path, [20, 7, 1], &[0; 140]);
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "20 × 7 × 1");
+    harness.key_press(egui::Key::B);
+    harness.step();
+
+    let rect = harness
+        .get_by_role_and_label(Role::Image, "Axial slice editor")
+        .rect();
+    let press = egui::pos2(rect.left() + rect.width() * 0.2, rect.center().y);
+    let release = egui::pos2(rect.left() + rect.width() * 0.8, rect.center().y);
+    for (pos, pressed) in [(press, true), (release, false)] {
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    harness.step();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if current_occupied_count(&harness).is_some_and(|count| count > 13) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "same-frame drag collapsed to one brush footprint: {:?}",
+            current_occupied_count(&harness)
+        );
+        thread::sleep(Duration::from_millis(2));
+        harness.step();
+    }
+    wait_for_label(&mut harness, "modified");
+}
+
+#[test]
 fn every_view_can_use_the_full_workspace_and_escape_restores_the_grid() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("maximize.binvox");
@@ -365,6 +425,90 @@ fn dirty_close_prompt_is_non_destructive_until_discard_is_chosen() {
     harness.step();
     wait_for_label(&mut harness, "Open a NIfTI, BINVOX, or VOX volume to begin");
     assert!(harness.query_by_label("Axial slice editor").is_none());
+}
+
+#[test]
+fn raw_pane_clicks_cannot_edit_behind_a_modal_prompt() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("modal-blocks-edit.binvox");
+    write_binvox(&path, [20, 7, 1], &[0; 140]);
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "20 × 7 × 1");
+
+    harness.key_press(egui::Key::B);
+    harness.step();
+    harness.key_press(egui::Key::Space);
+    harness.step();
+    wait_for_label(&mut harness, "13 occupied");
+
+    harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::W);
+    harness.step();
+    assert!(harness.query_by_label("Save changes?").is_some());
+    let rect = harness
+        .get_by_role_and_label(Role::Image, "Axial slice editor")
+        .rect();
+    let position = egui::pos2(rect.left() + rect.width() * 0.8, rect.center().y);
+    for pressed in [true, false] {
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    harness.step();
+    for _ in 0..8 {
+        thread::sleep(Duration::from_millis(2));
+        harness.step();
+    }
+
+    assert_eq!(current_occupied_count(&harness), Some(13));
+}
+
+#[test]
+fn a_same_frame_focus_loss_prevents_a_new_raw_stroke() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("focus-loss.binvox");
+    write_binvox(&path, [20, 7, 1], &[0; 140]);
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "20 × 7 × 1");
+    harness.key_press(egui::Key::B);
+    harness.step();
+
+    let rect = harness
+        .get_by_role_and_label(Role::Image, "Axial slice editor")
+        .rect();
+    let position = rect.center();
+    harness.input_mut().events.push(egui::Event::PointerButton {
+        pos: position,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::WindowFocused(false));
+    harness.input_mut().focused = false;
+    harness.step();
+    harness.input_mut().events.push(egui::Event::PointerButton {
+        pos: position,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::WindowFocused(true));
+    harness.input_mut().focused = true;
+    harness.step();
+    for _ in 0..8 {
+        thread::sleep(Duration::from_millis(2));
+        harness.step();
+    }
+
+    assert_eq!(current_occupied_count(&harness), Some(0));
 }
 
 #[test]
@@ -560,6 +704,18 @@ fn focused_label(harness: &Harness<'_, VoxelInkApp>) -> Option<String> {
         .children_recursive()
         .find(|node| node.is_focused())
         .and_then(|node| node.accesskit_node().label())
+}
+
+fn current_occupied_count(harness: &Harness<'_, VoxelInkApp>) -> Option<u64> {
+    harness.root().children_recursive().find_map(|node| {
+        let accessible = node.accesskit_node();
+        let text = accessible.value().or_else(|| accessible.label())?;
+        let words = text.split_whitespace().collect::<Vec<_>>();
+        words
+            .windows(2)
+            .find(|pair| pair[1] == "occupied")
+            .and_then(|pair| pair[0].replace(',', "").parse().ok())
+    })
 }
 
 fn contrast_ratio(foreground: egui::Color32, background: egui::Color32) -> f32 {
