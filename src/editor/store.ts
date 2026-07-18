@@ -18,24 +18,36 @@ export interface SourceHandle {
   readonly hash?: string;
 }
 
-export interface MeshChangeSet {
+export interface VoxelChangeBatch {
   readonly sequence: number;
+  readonly revision: number;
   readonly indices: Uint32Array;
-  readonly full: boolean;
+  readonly value: BinaryVoxel;
 }
 
-export const MAX_PENDING_MESH_BATCHES = 256;
-export const MAX_PENDING_MESH_INDICES = 65_536;
+export interface VoxelChangeEvent {
+  readonly document: VolumeDocument<CodecSaveState>;
+  readonly revision: number;
+  readonly indices: Uint32Array;
+  readonly value: BinaryVoxel;
+}
 
-export function combineMeshChangeIndices(changes: readonly MeshChangeSet[]): Uint32Array {
-  const indexCount = changes.reduce((count, change) => count + change.indices.length, 0);
-  const indices = new Uint32Array(indexCount);
-  let targetOffset = 0;
-  for (const change of changes) {
-    indices.set(change.indices, targetOffset);
-    targetOffset += change.indices.length;
-  }
-  return indices;
+type VoxelChangeListener = (event: VoxelChangeEvent) => void;
+const voxelChangeListeners = new Set<VoxelChangeListener>();
+
+export function subscribeVoxelChanges(listener: VoxelChangeListener): () => void {
+  voxelChangeListeners.add(listener);
+  return () => voxelChangeListeners.delete(listener);
+}
+
+function emitVoxelChanges(
+  document: VolumeDocument<CodecSaveState>,
+  indices: Uint32Array,
+  value: BinaryVoxel,
+): void {
+  if (indices.length === 0) return;
+  const event = { document, revision: document.revision, indices, value };
+  for (const listener of voxelChangeListeners) listener(event);
 }
 
 export interface PreparedEditorDocument {
@@ -52,7 +64,7 @@ interface EditorState {
   revision: number;
   savedRevision: number;
   meshChangeSequence: number;
-  pendingMeshChanges: readonly MeshChangeSet[];
+  pendingMeshChanges: readonly VoxelChangeBatch[];
   mode: EditorMode;
   brushDiameter: number;
   activeAxis: SliceAxis;
@@ -91,24 +103,14 @@ function asUnits(decoded: DecodedVolume): string {
 
 function publishChanges(
   state: Pick<EditorState, "meshChangeSequence" | "pendingMeshChanges">,
+  revision: number,
   indices: Uint32Array,
-  full = false,
+  value: BinaryVoxel,
 ): Pick<EditorState, "meshChangeSequence" | "pendingMeshChanges"> {
   const sequence = state.meshChangeSequence + 1;
-  const next = { sequence, indices, full };
-  const pendingIndexCount = state.pendingMeshChanges.reduce(
-    (count, change) => count + change.indices.length,
-    0,
-  );
-  const requiresSnapshot = full
-    || state.pendingMeshChanges.some((change) => change.full)
-    || state.pendingMeshChanges.length >= MAX_PENDING_MESH_BATCHES
-    || pendingIndexCount + indices.length > MAX_PENDING_MESH_INDICES;
   return {
     meshChangeSequence: sequence,
-    pendingMeshChanges: requiresSnapshot
-      ? [{ sequence, indices: new Uint32Array(), full: true }]
-      : [...state.pendingMeshChanges, next],
+    pendingMeshChanges: [...state.pendingMeshChanges, { sequence, revision, indices, value }],
   };
 }
 
@@ -160,36 +162,36 @@ export const useEditorStore = create<EditorState>()((set, get) => ({
     if (activeStroke) activeStroke.cancel();
     activeStroke = null;
     const { document, history } = prepared;
-    set((state) => ({
+    set({
       document,
       history,
       source,
       revision: document.revision,
       savedRevision: document.savedRevision,
-      ...publishChanges(state, new Uint32Array(), true),
+      pendingMeshChanges: [],
       activeAxis: 2,
       strokeActive: false,
       normalizationPending: prepared.normalizationPending,
       errorMessage: null,
       noticeMessage: prepared.normalizationNotice,
-    }));
+    });
   },
 
   clearDocument: () => {
     if (activeStroke) activeStroke.cancel();
     activeStroke = null;
-    set((state) => ({
+    set({
       document: null,
       history: null,
       source: null,
       revision: 0,
       savedRevision: 0,
-      ...publishChanges(state, new Uint32Array(), true),
+      pendingMeshChanges: [],
       strokeActive: false,
       normalizationPending: false,
       noticeMessage: null,
       errorMessage: null,
-    }));
+    });
   },
 
   setMode: (mode) => {
@@ -224,18 +226,42 @@ export const useEditorStore = create<EditorState>()((set, get) => ({
   },
   extendStroke: (indices) => {
     if (!activeStroke) return new Uint32Array();
+    const value = activeStroke.value;
     const changed = activeStroke.apply(indices);
     if (changed.length > 0) {
-      set((state) => ({
-        revision: state.document?.revision ?? state.revision,
-        ...publishChanges(state, changed),
-      }));
+      const document = get().document;
+      if (document) {
+        set({ revision: document.revision });
+        emitVoxelChanges(document, changed, value);
+      }
     }
     return changed;
   },
   finishStroke: () => {
     if (!activeStroke) return;
-    activeStroke.commit();
+    const result = activeStroke.commit();
+    activeStroke = null;
+    const document = get().document;
+    if (document) {
+      set((state) => ({
+        revision: document.revision,
+        savedRevision: document.savedRevision,
+        strokeActive: false,
+        ...(result.transaction
+          ? publishChanges(
+              state,
+              result.transaction.afterRevision,
+              result.transaction.indices,
+              result.transaction.value,
+            )
+          : {}),
+      }));
+    }
+  },
+  cancelStroke: () => {
+    if (!activeStroke) return;
+    const value = activeStroke.value === 1 ? 0 : 1;
+    const changed = activeStroke.cancel();
     activeStroke = null;
     const document = get().document;
     if (document) {
@@ -244,21 +270,7 @@ export const useEditorStore = create<EditorState>()((set, get) => ({
         savedRevision: document.savedRevision,
         strokeActive: false,
       });
-    }
-  },
-  cancelStroke: () => {
-    if (!activeStroke) return;
-    const changed = activeStroke.changedCount;
-    activeStroke.cancel();
-    activeStroke = null;
-    const document = get().document;
-    if (document) {
-      set((state) => ({
-        revision: document.revision,
-        savedRevision: document.savedRevision,
-        strokeActive: false,
-        ...(changed > 0 ? publishChanges(state, new Uint32Array(), true) : {}),
-      }));
+      emitVoxelChanges(document, changed, value);
     }
   },
 
@@ -278,11 +290,13 @@ export const useEditorStore = create<EditorState>()((set, get) => ({
     if (busyMessage !== null || strokeActive) return;
     const transaction = history?.undo();
     if (!document || !transaction) return;
+    const value = transaction.value === 1 ? 0 : 1;
     set((state) => ({
       revision: document.revision,
       savedRevision: document.savedRevision,
-      ...publishChanges(state, transaction.indices),
+      ...publishChanges(state, document.revision, transaction.indices, value),
     }));
+    emitVoxelChanges(document, transaction.indices, value);
   },
   redo: () => {
     const { busyMessage, history, document, strokeActive } = get();
@@ -292,8 +306,9 @@ export const useEditorStore = create<EditorState>()((set, get) => ({
     set((state) => ({
       revision: document.revision,
       savedRevision: document.savedRevision,
-      ...publishChanges(state, transaction.indices),
+      ...publishChanges(state, document.revision, transaction.indices, transaction.value),
     }));
+    emitVoxelChanges(document, transaction.indices, transaction.value);
   },
 
   markSaved: (revision, source) => {

@@ -25,6 +25,17 @@ export default defineConfig({
     target: "es2022",
     minify: process.env.TAURI_ENV_DEBUG ? false : "esbuild",
     sourcemap: Boolean(process.env.TAURI_ENV_DEBUG),
+    chunkSizeWarningLimit: 600,
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            { name: "three", test: /node_modules\/three\// },
+            { name: "react", test: /node_modules\/(?:react|react-dom|scheduler)\// },
+          ],
+        },
+      },
+    },
   },
   test: {
     environment: "jsdom",

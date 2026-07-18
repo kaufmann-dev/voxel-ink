@@ -3,18 +3,18 @@ import {
   chunksAffectedByIndices,
   isCurrentMeshResult,
   meshChunk,
-  requiresFullMeshRestart,
   shouldApplyMeshChanges,
 } from "./mesh";
 
 describe("chunk surface meshing", () => {
   it("emits six exposed faces for one voxel", () => {
     const result = meshChunk(new Uint8Array([1]), [1, 1, 1], { x: 0, y: 0, z: 0 });
-    expect(result.faceCount).toBe(6);
+    expect(result.quadCount).toBe(6);
+    expect(result.unitFaceCount).toBe(6);
     expect(result.indices).toHaveLength(36);
     expect(result.positions).toHaveLength(72);
     expect(result.normals).toHaveLength(72);
-    for (let face = 0; face < result.faceCount; face += 1) {
+    for (let face = 0; face < result.quadCount; face += 1) {
       const vertexOffset = face * 12;
       const ax = result.positions[vertexOffset] ?? 0;
       const ay = result.positions[vertexOffset + 1] ?? 0;
@@ -48,8 +48,8 @@ describe("chunk surface meshing", () => {
     const occupancy = new Uint8Array(33);
     occupancy[31] = 1;
     occupancy[32] = 1;
-    expect(meshChunk(occupancy, [33, 1, 1], { x: 0, y: 0, z: 0 }).faceCount).toBe(5);
-    expect(meshChunk(occupancy, [33, 1, 1], { x: 1, y: 0, z: 0 }).faceCount).toBe(5);
+    expect(meshChunk(occupancy, [33, 1, 1], { x: 0, y: 0, z: 0 }).unitFaceCount).toBe(5);
+    expect(meshChunk(occupancy, [33, 1, 1], { x: 1, y: 0, z: 0 }).unitFaceCount).toBe(5);
   });
 
   it.each([
@@ -59,8 +59,8 @@ describe("chunk surface meshing", () => {
     const occupancy = new Uint8Array(33);
     occupancy[first] = 1;
     occupancy[second] = 1;
-    expect(meshChunk(occupancy, dimensions, { x: 0, y: 0, z: 0 }).faceCount).toBe(5);
-    expect(meshChunk(occupancy, dimensions, chunk).faceCount).toBe(5);
+    expect(meshChunk(occupancy, dimensions, { x: 0, y: 0, z: 0 }).unitFaceCount).toBe(5);
+    expect(meshChunk(occupancy, dimensions, chunk).unitFaceCount).toBe(5);
   });
 
   it("emits exact half-index face bounds and handles checkerboard occupancy", () => {
@@ -68,7 +68,16 @@ describe("chunk surface meshing", () => {
     expect(Math.min(...single.positions)).toBe(-0.5);
     expect(Math.max(...single.positions)).toBe(0.5);
     const checker = Uint8Array.from([1, 0, 0, 1, 0, 1, 1, 0]);
-    expect(meshChunk(checker, [2, 2, 2], { x: 0, y: 0, z: 0 }).faceCount).toBe(24);
+    const checkerMesh = meshChunk(checker, [2, 2, 2], { x: 0, y: 0, z: 0 });
+    expect(checkerMesh.quadCount).toBe(24);
+    expect(checkerMesh.unitFaceCount).toBe(24);
+  });
+
+  it("greedily merges a solid cuboid while preserving its exact surface area", () => {
+    const result = meshChunk(new Uint8Array(4 * 3 * 2).fill(1), [4, 3, 2], { x: 0, y: 0, z: 0 });
+    expect(result.quadCount).toBe(6);
+    expect(result.unitFaceCount).toBe(52);
+    expect(result.indices).toHaveLength(36);
   });
 
   it("invalidates both chunks for a boundary edit", () => {
@@ -90,9 +99,4 @@ describe("chunk surface meshing", () => {
     expect(shouldApplyMeshChanges({ revision: 10, generation: 3 }, current)).toBe(false);
   });
 
-  it("restarts from a transferable snapshot for large or full invalidations", () => {
-    expect(requiresFullMeshRestart(65_536, false)).toBe(false);
-    expect(requiresFullMeshRestart(65_537, false)).toBe(true);
-    expect(requiresFullMeshRestart(1, true)).toBe(true);
-  });
 });

@@ -32,7 +32,8 @@ interface EditorBenchmarkResult {
   readonly snapshotCopyMs: number;
   readonly snapshotTransferMs: number;
   readonly boundedChunkMeshMs: number;
-  readonly boundedChunkFaces: number;
+  readonly boundedChunkQuads: number;
+  readonly boundedChunkUnitFaces: number;
   readonly gpuNavigation: string;
 }
 
@@ -152,10 +153,10 @@ function runEditorBenchmark(dimensions: Dimensions): EditorBenchmarkResult {
   const meshStarted = performance.now();
   const mesh = meshChunk(document.occupancy, dimensions, chunk);
   const boundedChunkMeshMs = performance.now() - meshStarted;
-  expect(mesh.faceCount).toBeGreaterThan(0);
-  expect(mesh.positions.length).toBe(mesh.faceCount * 12);
+  expect(mesh.quadCount).toBeGreaterThan(0);
+  expect(mesh.positions.length).toBe(mesh.quadCount * 12);
   expect(mesh.normals.length).toBe(mesh.positions.length);
-  expect(mesh.indices.length).toBe(mesh.faceCount * 6);
+  expect(mesh.indices.length).toBe(mesh.quadCount * 6);
 
   return {
     dimensions,
@@ -168,7 +169,8 @@ function runEditorBenchmark(dimensions: Dimensions): EditorBenchmarkResult {
     snapshotCopyMs,
     snapshotTransferMs,
     boundedChunkMeshMs,
-    boundedChunkFaces: mesh.faceCount,
+    boundedChunkQuads: mesh.quadCount,
+    boundedChunkUnitFaces: mesh.unitFaceCount,
     gpuNavigation:
       "Not measured by this CPU benchmark; 30 fps navigation is verified separately by the native/browser smoke check.",
   };

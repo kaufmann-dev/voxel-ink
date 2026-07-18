@@ -119,4 +119,51 @@ describe("slice keyboard editing", () => {
     expect(useEditorStore.getState().strokeActive).toBe(false);
     expect(useEditorStore.getState().history?.undoCount).toBe(1);
   });
+
+  it("coalesces pointer moves into one gap-free edit per animation frame", () => {
+    let nextFrame = 1;
+    const frames = new Map<number, FrameRequestCallback>();
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      const id = nextFrame;
+      nextFrame += 1;
+      frames.set(id, callback);
+      return id;
+    });
+    vi.spyOn(window, "cancelAnimationFrame").mockImplementation((id) => {
+      frames.delete(id);
+    });
+    const flushFrame = () => {
+      const callbacks = [...frames.values()];
+      frames.clear();
+      callbacks.forEach((callback) => callback(performance.now()));
+    };
+
+    render(<SliceView axis={2} label="Axial" shortLabel="Z" />);
+    const canvas = screen.getByRole("application", { name: "Axial slice" });
+    vi.spyOn(canvas, "getBoundingClientRect").mockReturnValue({
+      bottom: 300,
+      height: 300,
+      left: 0,
+      right: 300,
+      top: 0,
+      width: 300,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+
+    fireEvent.pointerDown(canvas, { clientX: 50, clientY: 150, pointerId: 9 });
+    fireEvent.pointerMove(canvas, { clientX: 150, clientY: 150, pointerId: 9 });
+    fireEvent.pointerMove(canvas, { clientX: 250, clientY: 150, pointerId: 9 });
+    expect(useEditorStore.getState().document?.occupiedCount).toBe(1);
+    expect(useEditorStore.getState().pendingMeshChanges).toHaveLength(0);
+
+    act(flushFrame);
+    expect(useEditorStore.getState().document?.occupiedCount).toBe(3);
+    fireEvent.pointerUp(window, { clientX: 250, clientY: 150, pointerId: 9 });
+
+    const pending = useEditorStore.getState().pendingMeshChanges;
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.indices).toHaveLength(3);
+  });
 });

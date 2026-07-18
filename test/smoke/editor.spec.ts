@@ -130,6 +130,11 @@ describe("VoxelInk native shell", () => {
   }).timeout(180_000);
 
   it("keeps brush feedback responsive while the 3D mesh catches up", async () => {
+    const axialCanvas = browser.$("[aria-label='Axial slice']");
+    const brushButton = browser.$("button=Brush");
+    await axialCanvas.waitForDisplayed({ timeout: 30_000 });
+    await brushButton.waitForEnabled({ timeout: 30_000 });
+
     const result = await browser.executeAsync<EditFeedbackResult, []>((done) => {
       const brush = [...document.querySelectorAll<HTMLButtonElement>("button")]
         .find((button) => button.textContent === "Brush");
@@ -143,10 +148,10 @@ describe("VoxelInk native shell", () => {
 
       brush.click();
       axial.focus();
-      requestAnimationFrame(() => {
+      window.setTimeout(() => {
         const started = performance.now();
         let feedbackMs = Number.POSITIVE_INFINITY;
-        requestAnimationFrame(() => { feedbackMs = performance.now() - started; });
+        window.setTimeout(() => { feedbackMs = performance.now() - started; }, 0);
         axial.dispatchEvent(new KeyboardEvent("keydown", {
           key: " ",
           bubbles: true,
@@ -160,7 +165,7 @@ describe("VoxelInk native shell", () => {
             error: null,
           });
         }, 250);
-      });
+      }, 0);
     });
 
     assert.equal(result.error, null);

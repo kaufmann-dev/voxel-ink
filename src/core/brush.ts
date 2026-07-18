@@ -9,6 +9,9 @@ import {
 export const MIN_BRUSH_DIAMETER = 1;
 export const MAX_BRUSH_DIAMETER = 31;
 
+const diskOffsetCache = new Map<string, readonly GridCoordinate[]>();
+const sphereOffsetCache = new Map<number, readonly GridCoordinate[]>();
+
 export function validateBrushDiameter(diameter: number): number {
   if (
     !Number.isInteger(diameter) ||
@@ -43,6 +46,9 @@ export function diskOffsets(
   if (!Number.isInteger(sliceAxis) || sliceAxis < 0 || sliceAxis > 2) {
     throw new RangeError("Slice axis must be 0, 1, or 2");
   }
+  const cacheKey = `${sliceAxis}:${diameter}`;
+  const cached = diskOffsetCache.get(cacheKey);
+  if (cached) return cached;
   const radius = (diameter - 1) / 2;
   const offsets: GridCoordinate[] = [];
 
@@ -67,11 +73,14 @@ export function diskOffsets(
       offsets.push(offset);
     }
   }
+  diskOffsetCache.set(cacheKey, offsets);
   return offsets;
 }
 
 export function sphereOffsets(diameter: number): readonly GridCoordinate[] {
   validateBrushDiameter(diameter);
+  const cached = sphereOffsetCache.get(diameter);
+  if (cached) return cached;
   const radius = (diameter - 1) / 2;
   const offsets: GridCoordinate[] = [];
 
@@ -84,6 +93,7 @@ export function sphereOffsets(diameter: number): readonly GridCoordinate[] {
       }
     }
   }
+  sphereOffsetCache.set(diameter, offsets);
   return offsets;
 }
 

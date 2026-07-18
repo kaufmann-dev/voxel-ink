@@ -54,7 +54,7 @@ describe("mesh worker protocol", () => {
     dispatch({
       type: "apply",
       indices: Uint32Array.of(0).buffer,
-      values: Uint8Array.of(0).buffer,
+      value: 0,
       revision: 4,
       generation: 2,
     });
@@ -68,6 +68,6 @@ describe("mesh worker protocol", () => {
     const result = posted.mock.calls.map(([message]) => message).find(
       (message) => message.type === "mesh" && message.revision === 4,
     );
-    expect(result?.payload?.faceCount).toBe(0);
+    expect(result?.payload?.quadCount).toBe(0);
   });
 });

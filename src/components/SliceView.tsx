@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
 import { brushStrokeIndices, diskBrushIndices } from "../core/brush";
 import type { GridCoordinate, SliceAxis, VolumeDocument } from "../core/volume";
-import { useEditorStore } from "../editor/store";
+import { subscribeVoxelChanges, useEditorStore } from "../editor/store";
+import {
+  createSliceRaster,
+  sliceShape,
+  updateSliceRaster,
+  type SliceRaster,
+} from "../render/slice";
 
 interface SliceViewProps {
   readonly axis: SliceAxis;
@@ -15,11 +21,6 @@ interface Layout {
   readonly offsetY: number;
   readonly width: number;
   readonly height: number;
-}
-
-function sliceShape(document: VolumeDocument, axis: SliceAxis): readonly [number, number] {
-  const [nx, ny, nz] = document.dimensions;
-  return axis === 0 ? [ny, nz] : axis === 1 ? [nx, nz] : [nx, ny];
 }
 
 function layoutFor(canvas: HTMLCanvasElement, document: VolumeDocument, axis: SliceAxis): Layout {
@@ -54,7 +55,6 @@ function coordinateToPlane(axis: SliceAxis, coordinate: GridCoordinate): readonl
 export function SliceView({ axis, label, shortLabel }: SliceViewProps) {
   const document = useEditorStore((state) => state.document);
   const cursor = useEditorStore((state) => state.document?.cursor ?? null);
-  const revision = useEditorStore((state) => state.revision);
   const busy = useEditorStore((state) => state.busyMessage !== null);
   const strokeActive = useEditorStore((state) => state.strokeActive);
   const mode = useEditorStore((state) => state.mode);
@@ -67,9 +67,19 @@ export function SliceView({ axis, label, shortLabel }: SliceViewProps) {
   const cancelStroke = useEditorStore((state) => state.cancelStroke);
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const sourceCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const sourceImageRef = useRef<ImageData | null>(null);
+  const rasterRef = useRef<SliceRaster | null>(null);
+  const cursorRef = useRef(cursor);
   const activePointer = useRef<number | null>(null);
-  const previousCoordinate = useRef<GridCoordinate | null>(null);
+  const lastAppliedCoordinate = useRef<GridCoordinate | null>(null);
+  const pendingCoordinate = useRef<GridCoordinate | null>(null);
+  const pointerFrame = useRef<number | null>(null);
   const [canvasSize, setCanvasSize] = useState({ width: 320, height: 240 });
+
+  useEffect(() => {
+    cursorRef.current = cursor;
+  }, [cursor]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -88,7 +98,7 @@ export function SliceView({ axis, label, shortLabel }: SliceViewProps) {
     return () => observer.disconnect();
   }, []);
 
-  useEffect(() => {
+  const draw = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const context = canvas.getContext("2d");
@@ -97,7 +107,8 @@ export function SliceView({ axis, label, shortLabel }: SliceViewProps) {
     context.fillStyle = "#0d1418";
     context.fillRect(0, 0, canvas.width, canvas.height);
 
-    if (!document || !cursor) {
+    const currentCursor = cursorRef.current;
+    if (!document || !currentCursor) {
       context.fillStyle = "#829198";
       context.font = `${Math.max(12, canvas.width / 26)}px system-ui`;
       context.textAlign = "center";
@@ -106,26 +117,8 @@ export function SliceView({ axis, label, shortLabel }: SliceViewProps) {
       return;
     }
 
-    const sliceNumber = cursor[axis];
-    const slice = document.extractSlice(axis, sliceNumber);
-    const source = window.document.createElement("canvas");
-    source.width = slice.width;
-    source.height = slice.height;
-    const sourceContext = source.getContext("2d");
-    if (!sourceContext) return;
-    const image = sourceContext.createImageData(slice.width, slice.height);
-    for (let v = 0; v < slice.height; v += 1) {
-      for (let u = 0; u < slice.width; u += 1) {
-        const inputIndex = u + slice.width * v;
-        const outputIndex = 4 * (u + slice.width * (slice.height - 1 - v));
-        const occupied = slice.data[inputIndex] === 1;
-        image.data[outputIndex] = occupied ? 78 : 22;
-        image.data[outputIndex + 1] = occupied ? 211 : 33;
-        image.data[outputIndex + 2] = occupied ? 177 : 39;
-        image.data[outputIndex + 3] = 255;
-      }
-    }
-    sourceContext.putImageData(image, 0, 0);
+    const source = sourceCanvasRef.current;
+    if (!source) return;
     const layout = layoutFor(canvas, document, axis);
     context.imageSmoothingEnabled = false;
     context.drawImage(
@@ -153,7 +146,7 @@ export function SliceView({ axis, label, shortLabel }: SliceViewProps) {
       context.stroke();
     }
 
-    const [cursorU, cursorV] = coordinateToPlane(axis, cursor);
+    const [cursorU, cursorV] = coordinateToPlane(axis, currentCursor);
     const crosshairX = layout.offsetX + (cursorU + 0.5) * layout.scale;
     const crosshairY = layout.offsetY + (layout.height - cursorV - 0.5) * layout.scale;
     context.strokeStyle = "#ffb454";
@@ -164,20 +157,104 @@ export function SliceView({ axis, label, shortLabel }: SliceViewProps) {
     context.moveTo(crosshairX, layout.offsetY);
     context.lineTo(crosshairX, layout.offsetY + layout.height * layout.scale);
     context.stroke();
-  }, [axis, canvasSize, cursor, document, revision]);
+  }, [axis, document]);
 
-  const coordinateFromPointer = useCallback((event: PointerEvent<HTMLCanvasElement>): GridCoordinate | null => {
+  const sliceNumber = cursor?.[axis] ?? -1;
+  useEffect(() => {
+    if (!document || sliceNumber < 0) {
+      sourceCanvasRef.current = null;
+      sourceImageRef.current = null;
+      rasterRef.current = null;
+      draw();
+      return;
+    }
+    const created = createSliceRaster(document, axis, sliceNumber);
+    const source = window.document.createElement("canvas");
+    source.width = created.width;
+    source.height = created.height;
+    const sourceContext = source.getContext("2d");
+    if (!sourceContext) return;
+    const image = sourceContext.createImageData(created.width, created.height);
+    image.data.set(created.pixels);
+    sourceContext.putImageData(image, 0, 0);
+    sourceCanvasRef.current = source;
+    sourceImageRef.current = image;
+    rasterRef.current = { ...created, pixels: image.data };
+    draw();
+  }, [axis, document, draw, sliceNumber]);
+
+  useEffect(() => {
+    draw();
+  }, [canvasSize, cursor, draw]);
+
+  useEffect(() => {
+    if (!document) return;
+    const pending: Array<{ indices: Uint32Array; value: 0 | 1 }> = [];
+    let frame: number | null = null;
+    const flush = () => {
+      frame = null;
+      const raster = rasterRef.current;
+      const source = sourceCanvasRef.current;
+      const image = sourceImageRef.current;
+      const sourceContext = source?.getContext("2d");
+      if (!raster || !image || !sourceContext) {
+        pending.length = 0;
+        return;
+      }
+      let minX = raster.width;
+      let minY = raster.height;
+      let maxX = -1;
+      let maxY = -1;
+      for (const change of pending.splice(0)) {
+        const dirty = updateSliceRaster(raster, document, change.indices, change.value);
+        if (!dirty) continue;
+        minX = Math.min(minX, dirty.x);
+        minY = Math.min(minY, dirty.y);
+        maxX = Math.max(maxX, dirty.x + dirty.width - 1);
+        maxY = Math.max(maxY, dirty.y + dirty.height - 1);
+      }
+      if (maxX >= minX) {
+        sourceContext.putImageData(
+          image,
+          0,
+          0,
+          minX,
+          minY,
+          maxX - minX + 1,
+          maxY - minY + 1,
+        );
+        draw();
+      }
+    };
+    const unsubscribe = subscribeVoxelChanges((change) => {
+      if (change.document !== document) return;
+      pending.push({ indices: change.indices, value: change.value });
+      if (frame === null) frame = requestAnimationFrame(flush);
+    });
+    return () => {
+      unsubscribe();
+      if (frame !== null) cancelAnimationFrame(frame);
+    };
+  }, [document, draw]);
+
+  const coordinateFromClient = useCallback((clientX: number, clientY: number): GridCoordinate | null => {
     const canvas = canvasRef.current;
     if (!canvas || !document || !cursor) return null;
     const bounds = canvas.getBoundingClientRect();
-    const x = (event.clientX - bounds.left) * canvas.width / bounds.width;
-    const y = (event.clientY - bounds.top) * canvas.height / bounds.height;
+    const x = (clientX - bounds.left) * canvas.width / bounds.width;
+    const y = (clientY - bounds.top) * canvas.height / bounds.height;
     const layout = layoutFor(canvas, document, axis);
     const u = Math.floor((x - layout.offsetX) / layout.scale);
     const displayV = Math.floor((y - layout.offsetY) / layout.scale);
     if (u < 0 || displayV < 0 || u >= layout.width || displayV >= layout.height) return null;
     return planeToCoordinate(axis, cursor[axis], u, layout.height - 1 - displayV);
   }, [axis, cursor, document]);
+
+  const coordinateFromPointer = useCallback(
+    (event: PointerEvent<HTMLCanvasElement>): GridCoordinate | null =>
+      coordinateFromClient(event.clientX, event.clientY),
+    [coordinateFromClient],
+  );
 
   const applyAt = useCallback((coordinate: GridCoordinate, previous?: GridCoordinate) => {
     if (!document || mode === "inspect" || busy) return;
@@ -186,6 +263,55 @@ export function SliceView({ axis, label, shortLabel }: SliceViewProps) {
       : diskBrushIndices(document.dimensions, coordinate, axis, brushDiameter);
     extendStroke(indices);
   }, [axis, brushDiameter, busy, document, extendStroke, mode]);
+
+  const applyPendingCoordinate = useCallback(() => {
+    pointerFrame.current = null;
+    const coordinate = pendingCoordinate.current;
+    pendingCoordinate.current = null;
+    if (!coordinate) return;
+    const previous = lastAppliedCoordinate.current;
+    setCursor(coordinate);
+    applyAt(coordinate, previous ?? undefined);
+    lastAppliedCoordinate.current = coordinate;
+  }, [applyAt, setCursor]);
+
+  const queueCoordinate = useCallback((coordinate: GridCoordinate) => {
+    pendingCoordinate.current = coordinate;
+    if (pointerFrame.current === null) {
+      pointerFrame.current = requestAnimationFrame(applyPendingCoordinate);
+    }
+  }, [applyPendingCoordinate]);
+
+  const flushCoordinate = useCallback(() => {
+    if (pointerFrame.current !== null) {
+      cancelAnimationFrame(pointerFrame.current);
+      pointerFrame.current = null;
+    }
+    applyPendingCoordinate();
+  }, [applyPendingCoordinate]);
+
+  const clearQueuedCoordinate = useCallback(() => {
+    if (pointerFrame.current !== null) cancelAnimationFrame(pointerFrame.current);
+    pointerFrame.current = null;
+    pendingCoordinate.current = null;
+    lastAppliedCoordinate.current = null;
+  }, []);
+
+  const finishPointerStroke = useCallback((pointerId: number, coordinate?: GridCoordinate | null) => {
+    if (activePointer.current !== pointerId) return;
+    if (coordinate) pendingCoordinate.current = coordinate;
+    flushCoordinate();
+    activePointer.current = null;
+    lastAppliedCoordinate.current = null;
+    finishStroke();
+  }, [finishStroke, flushCoordinate]);
+
+  const cancelPointerStroke = useCallback((pointerId: number) => {
+    if (activePointer.current !== pointerId) return;
+    activePointer.current = null;
+    clearQueuedCoordinate();
+    cancelStroke();
+  }, [cancelStroke, clearQueuedCoordinate]);
 
   const handlePointerDown = (event: PointerEvent<HTMLCanvasElement>) => {
     if (busy || strokeActive) return;
@@ -198,7 +324,8 @@ export function SliceView({ axis, label, shortLabel }: SliceViewProps) {
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
     activePointer.current = event.pointerId;
-    previousCoordinate.current = coordinate;
+    lastAppliedCoordinate.current = coordinate;
+    pendingCoordinate.current = null;
     beginStroke(mode === "brush" ? 1 : 0);
     applyAt(coordinate);
   };
@@ -208,45 +335,30 @@ export function SliceView({ axis, label, shortLabel }: SliceViewProps) {
     if (activePointer.current !== event.pointerId) return;
     const coordinate = coordinateFromPointer(event);
     if (!coordinate) return;
-    const previous = previousCoordinate.current;
-    setCursor(coordinate);
-    applyAt(coordinate, previous ?? undefined);
-    previousCoordinate.current = coordinate;
+    queueCoordinate(coordinate);
   };
 
   const handlePointerUp = (event: PointerEvent<HTMLCanvasElement>) => {
     if (activePointer.current !== event.pointerId) return;
-    activePointer.current = null;
-    previousCoordinate.current = null;
+    finishPointerStroke(event.pointerId, coordinateFromPointer(event));
     event.currentTarget.releasePointerCapture(event.pointerId);
-    finishStroke();
   };
 
   const handlePointerCancel = (event: PointerEvent<HTMLCanvasElement>) => {
     if (activePointer.current !== event.pointerId) return;
-    activePointer.current = null;
-    previousCoordinate.current = null;
-    cancelStroke();
+    cancelPointerStroke(event.pointerId);
   };
 
   useEffect(() => {
     const finishWindowStroke = (event: globalThis.PointerEvent) => {
-      if (activePointer.current !== event.pointerId) return;
-      activePointer.current = null;
-      previousCoordinate.current = null;
-      finishStroke();
+      finishPointerStroke(event.pointerId, coordinateFromClient(event.clientX, event.clientY));
     };
     const cancelWindowStroke = (event: globalThis.PointerEvent) => {
-      if (activePointer.current !== event.pointerId) return;
-      activePointer.current = null;
-      previousCoordinate.current = null;
-      cancelStroke();
+      cancelPointerStroke(event.pointerId);
     };
     const cancelInterruptedStroke = () => {
       if (activePointer.current === null) return;
-      activePointer.current = null;
-      previousCoordinate.current = null;
-      cancelStroke();
+      cancelPointerStroke(activePointer.current);
     };
     const handleVisibilityChange = () => {
       if (window.document.visibilityState !== "visible") cancelInterruptedStroke();
@@ -262,7 +374,7 @@ export function SliceView({ axis, label, shortLabel }: SliceViewProps) {
       window.removeEventListener("blur", cancelInterruptedStroke);
       window.document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [cancelStroke, finishStroke]);
+  }, [cancelPointerStroke, coordinateFromClient, finishPointerStroke]);
 
   const handleKeyDown = (event: KeyboardEvent<HTMLCanvasElement>) => {
     if (busy || strokeActive) {

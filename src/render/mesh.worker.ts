@@ -16,7 +16,7 @@ interface InitMessage {
 interface ApplyMessage {
   readonly type: "apply";
   readonly indices: ArrayBuffer;
-  readonly values: ArrayBuffer;
+  readonly value: 0 | 1;
   readonly revision: number;
   readonly generation: number;
 }
@@ -48,10 +48,8 @@ self.onmessage = (event: MessageEvent<WorkerMessage>) => {
   if (message.type === "apply") {
     if (!shouldApplyMeshChanges(message, { revision, generation })) return;
     const indices = new Uint32Array(message.indices);
-    const values = new Uint8Array(message.values);
-    if (indices.length !== values.length) return;
     for (let offset = 0; offset < indices.length; offset += 1) {
-      occupancy[indices[offset]!] = values[offset]!;
+      occupancy[indices[offset]!] = message.value;
     }
     revision = message.revision;
     return;

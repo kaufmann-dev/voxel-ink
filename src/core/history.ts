@@ -67,18 +67,20 @@ export class VoxelStroke<TSaveState = unknown> {
     return this.owner.finishStroke(this, this.changedIndices, this.expectedRevision);
   }
 
-  cancel(): void {
+  cancel(): Uint32Array {
     this.assertOpen();
     this.assertUninterrupted();
     this.closed = true;
-    if (this.changedIndices.length > 0) {
+    const indices = Uint32Array.from(this.changedIndices);
+    if (indices.length > 0) {
       this.owner.document.applyHistoryState(
-        Uint32Array.from(this.changedIndices),
+        indices,
         this.value === 1 ? 0 : 1,
         this.beforeRevision,
       );
     }
     this.owner.cancelStroke(this);
+    return indices;
   }
 
   private assertOpen(): void {

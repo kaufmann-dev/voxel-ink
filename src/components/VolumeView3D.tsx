@@ -5,13 +5,11 @@ import { brushStrokeIndices, sphereBrushIndices } from "../core/brush";
 import { adjacentCoordinate, firstOccupiedVoxel, intersectActiveSlice } from "../core/dda";
 import { indexRayFromWorld, transformPoint } from "../core/affine";
 import type { GridCoordinate } from "../core/volume";
-import { combineMeshChangeIndices, useEditorStore } from "../editor/store";
+import { useEditorStore } from "../editor/store";
 import {
   chunkKey,
   chunksAffectedByIndices,
   chunksForDimensions,
-  isCurrentMeshResult,
-  requiresFullMeshRestart,
   type ChunkCoordinate,
   type MeshPayload,
 } from "../render/mesh";
@@ -33,6 +31,7 @@ interface WorkerReadyMessage {
 type MeshWorkerMessage = WorkerMeshMessage | WorkerReadyMessage;
 
 const GEOMETRY_BUDGET = 256 * 1024 * 1024;
+const MAX_WORKER_DELTA_INDICES = 262_144;
 
 export function VolumeView3D() {
   const document = useEditorStore((state) => state.document);
@@ -67,9 +66,10 @@ export function VolumeView3D() {
   const meshesRef = useRef(new Map<string, THREE.Mesh>());
   const geometryBytesRef = useRef(0);
   const requestRenderRef = useRef<() => void>(() => undefined);
-  const restartWorkerRef = useRef<() => void>(() => undefined);
   const activePointer = useRef<number | null>(null);
-  const previousCoordinate = useRef<GridCoordinate | null>(null);
+  const lastAppliedCoordinate = useRef<GridCoordinate | null>(null);
+  const pendingCoordinate = useRef<GridCoordinate | null>(null);
+  const pointerFrame = useRef<number | null>(null);
   const [status, setStatus] = useState("3D preview idle");
 
   useEffect(() => {
@@ -91,7 +91,10 @@ export function VolumeView3D() {
     if (!worker || !readyRef.current || inFlightRef.current) return;
     const chunk = queueRef.current.shift();
     if (!chunk) {
-      setStatus("3D preview ready");
+      setStatus(useEditorStore.getState().strokeActive
+        ? "3D preview paused while painting"
+        : "3D preview ready");
+      requestRenderRef.current();
       return;
     }
     queuedKeysRef.current.delete(chunkKey(chunk));
@@ -250,8 +253,10 @@ export function VolumeView3D() {
           return;
         }
         inFlightRef.current = false;
-        if (isCurrentMeshResult(message, { revision: revisionRef.current, generation: generationRef.current })) {
-          const key = chunkKey(message.chunk);
+        const key = chunkKey(message.chunk);
+        const superseded = message.revision !== revisionRef.current
+          && queuedKeysRef.current.has(key);
+        if (!superseded) {
           const previous = meshesRef.current.get(key);
           if (previous) {
             geometryBytesRef.current -= previous.geometry.getAttribute("position").array.byteLength;
@@ -261,7 +266,7 @@ export function VolumeView3D() {
             group.remove(previous);
             meshesRef.current.delete(key);
           }
-          if (message.payload.faceCount > 0) {
+          if (message.payload.quadCount > 0) {
             const payloadBytes = message.payload.positions.byteLength + message.payload.normals.byteLength + message.payload.indices.byteLength;
             if (geometryBytesRef.current + payloadBytes > GEOMETRY_BUDGET) {
               queueRef.current = [];
@@ -274,14 +279,27 @@ export function VolumeView3D() {
             geometry.setAttribute("position", new THREE.BufferAttribute(message.payload.positions, 3));
             geometry.setAttribute("normal", new THREE.BufferAttribute(message.payload.normals, 3));
             geometry.setIndex(new THREE.BufferAttribute(message.payload.indices, 1));
-            geometry.computeBoundingSphere();
+            const [dimensionX, dimensionY, dimensionZ] = document.dimensions;
+            const startX = message.chunk.x * 32;
+            const startY = message.chunk.y * 32;
+            const startZ = message.chunk.z * 32;
+            const sizeX = Math.min(32, dimensionX - startX);
+            const sizeY = Math.min(32, dimensionY - startY);
+            const sizeZ = Math.min(32, dimensionZ - startZ);
+            geometry.boundingSphere = new THREE.Sphere(
+              new THREE.Vector3(
+                startX + (sizeX - 1) / 2,
+                startY + (sizeY - 1) / 2,
+                startZ + (sizeZ - 1) / 2,
+              ),
+              Math.hypot(sizeX, sizeY, sizeZ) / 2,
+            );
             const mesh = new THREE.Mesh(geometry, material);
             mesh.frustumCulled = true;
             meshesRef.current.set(key, mesh);
             group.add(mesh);
             geometryBytesRef.current += payloadBytes;
           }
-          requestRenderRef.current();
         }
         pump();
       };
@@ -303,7 +321,6 @@ export function VolumeView3D() {
         useEditorStore.getState().acknowledgeMeshChanges(latestPending.sequence);
       }
     };
-    restartWorkerRef.current = startWorker;
     startWorker();
     requestRenderRef.current();
 
@@ -326,45 +343,44 @@ export function VolumeView3D() {
     );
     if (changes.length === 0) return;
     const throughSequence = changes.at(-1)!.sequence;
-    const indexCount = changes.reduce((count, change) => count + change.indices.length, 0);
-    if (
-      changes.some((change) => change.full)
-      || requiresFullMeshRestart(indexCount, false)
-    ) {
-      restartWorkerRef.current();
-      return;
-    }
     const worker = workerRef.current;
-    if (!worker || indexCount === 0) return;
-    const indices = combineMeshChangeIndices(changes);
-    const values = new Uint8Array(indices.length);
-    for (let offset = 0; offset < indices.length; offset += 1) {
-      values[offset] = document.occupancy[indices[offset]!]!;
+    if (!worker) return;
+    const affectedChunks = new Map<string, ChunkCoordinate>();
+    for (const change of changes) {
+      for (const chunk of chunksAffectedByIndices(change.indices, document.dimensions)) {
+        affectedChunks.set(chunkKey(chunk), chunk);
+      }
+      for (let offset = 0; offset < change.indices.length; offset += MAX_WORKER_DELTA_INDICES) {
+        const segment = change.indices.slice(
+          offset,
+          Math.min(change.indices.length, offset + MAX_WORKER_DELTA_INDICES),
+        );
+        worker.postMessage({
+          type: "apply",
+          indices: segment.buffer,
+          value: change.value,
+          revision: change.revision,
+          generation: generationRef.current,
+        }, [segment.buffer]);
+      }
     }
-    const affectedChunks = chunksAffectedByIndices(indices, document.dimensions);
-    worker.postMessage({
-      type: "apply",
-      indices: indices.buffer,
-      values: values.buffer,
-      revision: document.revision,
-      generation: generationRef.current,
-    }, [indices.buffer, values.buffer]);
-    enqueue(affectedChunks);
+    enqueue([...affectedChunks.values()]);
+    setStatus(strokeActive ? "3D preview paused while painting" : "Updating 3D preview…");
     pump();
     handledSequenceRef.current = throughSequence;
     acknowledgeMeshChanges(throughSequence);
-  }, [acknowledgeMeshChanges, document, enqueue, pendingMeshChanges, pump]);
+  }, [acknowledgeMeshChanges, document, enqueue, pendingMeshChanges, pump, strokeActive]);
 
   useEffect(() => {
     if (controlsRef.current) controlsRef.current.enabled = mode === "inspect" && !busy;
   }, [busy, mode]);
 
-  const coordinateFromPointer = useCallback((event: PointerEvent<HTMLCanvasElement>): GridCoordinate | null => {
+  const coordinateFromClient = useCallback((clientX: number, clientY: number): GridCoordinate | null => {
     if (!document || !cameraRef.current || !canvasRef.current) return null;
     const bounds = canvasRef.current.getBoundingClientRect();
     const pointer = new THREE.Vector2(
-      ((event.clientX - bounds.left) / bounds.width) * 2 - 1,
-      -((event.clientY - bounds.top) / bounds.height) * 2 + 1,
+      ((clientX - bounds.left) / bounds.width) * 2 - 1,
+      -((clientY - bounds.top) / bounds.height) * 2 + 1,
     );
     const raycaster = new THREE.Raycaster();
     raycaster.setFromCamera(pointer, cameraRef.current);
@@ -380,6 +396,12 @@ export function VolumeView3D() {
     return intersectActiveSlice(ray, document.dimensions, activeAxis, document.cursor[activeAxis]);
   }, [activeAxis, document, mode]);
 
+  const coordinateFromPointer = useCallback(
+    (event: PointerEvent<HTMLCanvasElement>): GridCoordinate | null =>
+      coordinateFromClient(event.clientX, event.clientY),
+    [coordinateFromClient],
+  );
+
   const applyAt = useCallback((coordinate: GridCoordinate, previous?: GridCoordinate) => {
     if (!document || mode === "inspect" || busy) return;
     const indices = previous
@@ -388,6 +410,55 @@ export function VolumeView3D() {
     extendStroke(indices);
   }, [brushDiameter, busy, document, extendStroke, mode]);
 
+  const applyPendingCoordinate = useCallback(() => {
+    pointerFrame.current = null;
+    const coordinate = pendingCoordinate.current;
+    pendingCoordinate.current = null;
+    if (!coordinate) return;
+    const previous = lastAppliedCoordinate.current;
+    setCursor(coordinate);
+    applyAt(coordinate, previous ?? undefined);
+    lastAppliedCoordinate.current = coordinate;
+  }, [applyAt, setCursor]);
+
+  const queueCoordinate = useCallback((coordinate: GridCoordinate) => {
+    pendingCoordinate.current = coordinate;
+    if (pointerFrame.current === null) {
+      pointerFrame.current = requestAnimationFrame(applyPendingCoordinate);
+    }
+  }, [applyPendingCoordinate]);
+
+  const flushCoordinate = useCallback(() => {
+    if (pointerFrame.current !== null) {
+      cancelAnimationFrame(pointerFrame.current);
+      pointerFrame.current = null;
+    }
+    applyPendingCoordinate();
+  }, [applyPendingCoordinate]);
+
+  const clearQueuedCoordinate = useCallback(() => {
+    if (pointerFrame.current !== null) cancelAnimationFrame(pointerFrame.current);
+    pointerFrame.current = null;
+    pendingCoordinate.current = null;
+    lastAppliedCoordinate.current = null;
+  }, []);
+
+  const finishPointerStroke = useCallback((pointerId: number, coordinate?: GridCoordinate | null) => {
+    if (activePointer.current !== pointerId) return;
+    if (coordinate) pendingCoordinate.current = coordinate;
+    flushCoordinate();
+    activePointer.current = null;
+    lastAppliedCoordinate.current = null;
+    finishStroke();
+  }, [finishStroke, flushCoordinate]);
+
+  const cancelPointerStroke = useCallback((pointerId: number) => {
+    if (activePointer.current !== pointerId) return;
+    activePointer.current = null;
+    clearQueuedCoordinate();
+    cancelStroke();
+  }, [cancelStroke, clearQueuedCoordinate]);
+
   const handlePointerDown = (event: PointerEvent<HTMLCanvasElement>) => {
     if (mode === "inspect" || busy || strokeActive) return;
     const coordinate = coordinateFromPointer(event);
@@ -395,7 +466,8 @@ export function VolumeView3D() {
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
     activePointer.current = event.pointerId;
-    previousCoordinate.current = coordinate;
+    lastAppliedCoordinate.current = coordinate;
+    pendingCoordinate.current = null;
     setCursor(coordinate);
     beginStroke(mode === "brush" ? 1 : 0);
     applyAt(coordinate);
@@ -405,45 +477,30 @@ export function VolumeView3D() {
     if (activePointer.current !== event.pointerId) return;
     const coordinate = coordinateFromPointer(event);
     if (!coordinate) return;
-    const previous = previousCoordinate.current;
-    setCursor(coordinate);
-    applyAt(coordinate, previous ?? undefined);
-    previousCoordinate.current = coordinate;
+    queueCoordinate(coordinate);
   };
 
   const handlePointerUp = (event: PointerEvent<HTMLCanvasElement>) => {
     if (activePointer.current !== event.pointerId) return;
-    activePointer.current = null;
-    previousCoordinate.current = null;
+    finishPointerStroke(event.pointerId, coordinateFromPointer(event));
     event.currentTarget.releasePointerCapture(event.pointerId);
-    finishStroke();
   };
 
   const handlePointerCancel = (event: PointerEvent<HTMLCanvasElement>) => {
     if (activePointer.current !== event.pointerId) return;
-    activePointer.current = null;
-    previousCoordinate.current = null;
-    cancelStroke();
+    cancelPointerStroke(event.pointerId);
   };
 
   useEffect(() => {
     const finishWindowStroke = (event: globalThis.PointerEvent) => {
-      if (activePointer.current !== event.pointerId) return;
-      activePointer.current = null;
-      previousCoordinate.current = null;
-      finishStroke();
+      finishPointerStroke(event.pointerId, coordinateFromClient(event.clientX, event.clientY));
     };
     const cancelWindowStroke = (event: globalThis.PointerEvent) => {
-      if (activePointer.current !== event.pointerId) return;
-      activePointer.current = null;
-      previousCoordinate.current = null;
-      cancelStroke();
+      cancelPointerStroke(event.pointerId);
     };
     const cancelInterruptedStroke = () => {
       if (activePointer.current === null) return;
-      activePointer.current = null;
-      previousCoordinate.current = null;
-      cancelStroke();
+      cancelPointerStroke(activePointer.current);
     };
     const handleVisibilityChange = () => {
       if (window.document.visibilityState !== "visible") cancelInterruptedStroke();
@@ -459,13 +516,15 @@ export function VolumeView3D() {
       window.removeEventListener("blur", cancelInterruptedStroke);
       window.document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [cancelStroke, finishStroke]);
+  }, [cancelPointerStroke, coordinateFromClient, finishPointerStroke]);
+
+  const displayedStatus = strokeActive ? "3D preview paused while painting" : status;
 
   return (
     <section className="pane volume-pane" aria-labelledby="volume-title">
       <header className="pane-header">
         <h2 id="volume-title">3D volume</h2>
-        <span aria-live="polite">{document ? status : "Open a volume to prepare 3D"}</span>
+        <span aria-live="polite">{document ? displayedStatus : "Open a volume to prepare 3D"}</span>
       </header>
       <div className="volume-canvas-wrap">
         <canvas
