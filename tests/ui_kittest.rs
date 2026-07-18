@@ -168,10 +168,36 @@ fn loaded_repair_cards_keep_their_gutter_when_the_scrollbar_appears() {
 #[test]
 fn expanded_workspace_keeps_repair_cards_inside_the_parent_gutter() {
     let directory = tempdir().unwrap();
-    let path = directory.path().join("expanded-repair-panel.binvox");
-    write_binvox(&path, [5, 5, 5], &[0; 125]);
-    let mut harness = app_harness_with_size(Some(path), [900.0, 700.0]);
+    let path = directory.path().join("expanded-repair-panel.nii");
+    write_nifti_u8(&path, [5, 5, 5], &[0; 125]);
+    let mut harness = app_harness_with_size(Some(path), [1_293.0, 816.0]);
     wait_for_label(&mut harness, "5 × 5 × 5");
+    let initial_panel = harness
+        .get_by_role_and_label(Role::Pane, "Repair volume controls")
+        .rect();
+    assert!(
+        initial_panel.width() <= 321.0,
+        "millimetre controls expanded the repair panel without user input: {initial_panel:?}"
+    );
+    let resize_start = egui::pos2(initial_panel.right(), initial_panel.center().y);
+    let resize_target = resize_start + egui::vec2(160.0, 0.0);
+    harness.hover_at(resize_start);
+    harness.step();
+    harness.drag_at(resize_start);
+    harness.step();
+    harness.hover_at(resize_target);
+    harness.step();
+    harness.drop_at(resize_target);
+    for _ in 0..3 {
+        harness.step();
+    }
+    let resized_panel = harness
+        .get_by_role_and_label(Role::Pane, "Repair volume controls")
+        .rect();
+    assert!(
+        resized_panel.width() > initial_panel.width() + 50.0,
+        "the regression must exercise a wide repair panel: {initial_panel:?} -> {resized_panel:?}"
+    );
     harness.key_press(egui::Key::B);
     harness.step();
     harness.get_by_label("Full screen 3D").click_accesskit();
@@ -184,8 +210,10 @@ fn expanded_workspace_keeps_repair_cards_inside_the_parent_gutter() {
         .rect();
     for label in ["Seal openings workflow", "Fill interior workflow"] {
         let card = harness.get_by_label(label).rect();
+        let left_margin = card.left() - panel.left();
+        let right_margin = panel.right() - card.right();
         assert!(
-            card.left() - panel.left() >= 11.0 && panel.right() - card.right() >= 11.0,
+            left_margin >= 11.0 && right_margin >= 11.0 && (left_margin - right_margin).abs() < 1.0,
             "{label:?} escaped the repair panel gutter in the expanded workspace: panel {panel:?}, card {card:?}"
         );
     }
@@ -196,7 +224,7 @@ fn zoomed_focused_slice_outline_is_clipped_to_its_editor() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("focused-slice-outline.binvox");
     write_binvox(&path, [4, 3, 2], &[0; 24]);
-    let mut harness = app_harness(Some(path));
+    let mut harness = app_harness_with_size(Some(path), [900.0, 700.0]);
     wait_for_label(&mut harness, "4 × 3 × 2");
 
     let editor = harness
@@ -252,6 +280,79 @@ fn zoomed_focused_slice_outline_is_clipped_to_its_editor() {
     assert!(
         (clip_rect.min - editor.min).length() < 1.0 && (clip_rect.max - editor.max).length() < 1.0,
         "the focused slice outline clip {clip_rect:?} does not match its editor {editor:?}"
+    );
+
+    fn collect_painted_shapes<'a>(
+        shape: &'a egui::epaint::Shape,
+        shapes: &mut Vec<&'a egui::epaint::Shape>,
+    ) {
+        if let egui::epaint::Shape::Vec(children) = shape {
+            for child in children {
+                collect_painted_shapes(child, shapes);
+            }
+        } else {
+            shapes.push(shape);
+        }
+    }
+
+    let mut painted_shapes = Vec::new();
+    for clipped in &harness.output().shapes {
+        collect_painted_shapes(&clipped.shape, &mut painted_shapes);
+    }
+    let (hint_text_index, hint_text) = painted_shapes
+        .iter()
+        .enumerate()
+        .find_map(|(index, shape)| match shape {
+            egui::epaint::Shape::Text(text) if text.galley.text().starts_with("Wheel") => {
+                Some((index, text))
+            }
+            _ => None,
+        })
+        .expect("the slice interaction hint should be painted");
+    let hint_text_rect = hint_text.visual_bounding_rect();
+    let (hint_background_index, hint_rect) = painted_shapes[..hint_text_index]
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, shape)| match shape {
+            egui::epaint::Shape::Rect(rect)
+                if rect.fill.a() > 200 && rect.rect.contains_rect(hint_text_rect) =>
+            {
+                Some((index, rect.rect))
+            }
+            _ => None,
+        })
+        .expect("the slice interaction hint should have an opaque background");
+    let yellow = egui::Color32::from_rgb(255, 193, 49);
+    let overlapping_slice_marks = painted_shapes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, shape)| match shape {
+            egui::epaint::Shape::LineSegment { points, stroke }
+                if stroke.color == yellow
+                    && egui::Rect::from_two_pos(points[0], points[1])
+                        .expand(stroke.width.max(0.5))
+                        .intersects(hint_rect) =>
+            {
+                Some(index)
+            }
+            egui::epaint::Shape::Rect(rect)
+                if rect.stroke.color == yellow && rect.rect.intersects(hint_rect) =>
+            {
+                Some(index)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        overlapping_slice_marks.len() >= 2,
+        "the regression needs both focused-slice and crosshair marks under the hint: {overlapping_slice_marks:?}"
+    );
+    assert!(
+        overlapping_slice_marks
+            .iter()
+            .all(|index| *index < hint_background_index),
+        "slice marks were painted above the interaction hint: marks {overlapping_slice_marks:?}, hint background {hint_background_index}"
     );
 }
 
@@ -864,4 +965,38 @@ fn relative_luminance(color: egui::Color32) -> f32 {
             linear * weight
         })
         .sum()
+}
+
+fn write_nifti_u8(path: &std::path::Path, dimensions: [u32; 3], occupancy: &[u8]) {
+    let expected_len = dimensions
+        .into_iter()
+        .map(|axis| axis as usize)
+        .product::<usize>();
+    assert_eq!(occupancy.len(), expected_len);
+
+    let mut bytes = vec![0_u8; 352 + occupancy.len()];
+    bytes[0..4].copy_from_slice(&348_i32.to_le_bytes());
+    let dimensions = dimensions.map(|axis| i16::try_from(axis).unwrap());
+    for (index, value) in [3_i16, dimensions[0], dimensions[1], dimensions[2]]
+        .into_iter()
+        .enumerate()
+    {
+        let offset = 40 + index * 2;
+        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    for index in 4..8 {
+        let offset = 40 + index * 2;
+        bytes[offset..offset + 2].copy_from_slice(&1_i16.to_le_bytes());
+    }
+    bytes[70..72].copy_from_slice(&2_i16.to_le_bytes());
+    bytes[72..74].copy_from_slice(&8_i16.to_le_bytes());
+    for index in 1..=3 {
+        let offset = 76 + index * 4;
+        bytes[offset..offset + 4].copy_from_slice(&1.0_f32.to_le_bytes());
+    }
+    bytes[108..112].copy_from_slice(&352.0_f32.to_le_bytes());
+    bytes[123] = 2;
+    bytes[344..348].copy_from_slice(b"n+1\0");
+    bytes[352..].copy_from_slice(occupancy);
+    fs::write(path, bytes).expect("NIfTI fixture should be written");
 }

@@ -1224,25 +1224,48 @@ impl VoxelInkApp {
                                             },
                                         );
                                     });
-                                    ui.spacing_mut().slider_width =
-                                        (ui.available_width() - 62.0).max(80.0);
                                     match self.brush_size_unit {
                                         BrushSizeUnit::Voxels => {
                                             let label = ui.add(
                                                 egui::Label::new("Brush diameter in voxels").wrap(),
                                             );
-                                            let changed = ui
-                                                .add(
-                                                    egui::Slider::new(
+                                            let mut changed = false;
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2(
+                                                    ui.available_width(),
+                                                    CONTROL_MIN_HEIGHT,
+                                                ),
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    changed |= ui
+                                                        .add(
+                                                            egui::DragValue::new(
+                                                                &mut self.brush_voxel_diameter,
+                                                            )
+                                                            .range(
+                                                                BrushSize::MIN_VOXELS
+                                                                    ..=BrushSize::MAX_VOXELS,
+                                                            )
+                                                            .speed(2.0)
+                                                            .suffix(" vox"),
+                                                        )
+                                                        .labelled_by(label.id)
+                                                        .changed();
+                                                    ui.spacing_mut().slider_width =
+                                                        ui.available_width().max(1.0);
+                                                    let slider = egui::Slider::new(
                                                         &mut self.brush_voxel_diameter,
                                                         BrushSize::MIN_VOXELS
                                                             ..=BrushSize::MAX_VOXELS,
                                                     )
                                                     .step_by(2.0)
-                                                    .suffix(" vox"),
-                                                )
-                                                .labelled_by(label.id)
-                                                .changed();
+                                                    .show_value(false);
+                                                    changed |= ui
+                                                        .add(slider)
+                                                        .labelled_by(label.id)
+                                                        .changed();
+                                                },
+                                            );
                                             if changed
                                                 && self.brush_voxel_diameter.is_multiple_of(2)
                                             {
@@ -1259,16 +1282,40 @@ impl VoxelInkApp {
                                                 )
                                                 .wrap(),
                                             );
-                                            ui.add(
-                                                egui::Slider::new(
-                                                    &mut self.brush_millimeters,
-                                                    BrushSize::MIN_MILLIMETERS
-                                                        ..=BrushSize::MAX_MILLIMETERS,
-                                                )
-                                                .step_by(0.5)
-                                                .suffix(" mm"),
-                                            )
-                                            .labelled_by(label.id);
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2(
+                                                    ui.available_width(),
+                                                    CONTROL_MIN_HEIGHT,
+                                                ),
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.add(
+                                                        egui::DragValue::new(
+                                                            &mut self.brush_millimeters,
+                                                        )
+                                                        .range(
+                                                            BrushSize::MIN_MILLIMETERS
+                                                                ..=BrushSize::MAX_MILLIMETERS,
+                                                        )
+                                                        .speed(0.5)
+                                                        .fixed_decimals(1)
+                                                        .suffix(" mm"),
+                                                    )
+                                                    .labelled_by(label.id);
+                                                    ui.spacing_mut().slider_width =
+                                                        ui.available_width().max(1.0);
+                                                    ui.add(
+                                                        egui::Slider::new(
+                                                            &mut self.brush_millimeters,
+                                                            BrushSize::MIN_MILLIMETERS
+                                                                ..=BrushSize::MAX_MILLIMETERS,
+                                                        )
+                                                        .step_by(0.5)
+                                                        .show_value(false),
+                                                    )
+                                                    .labelled_by(label.id);
+                                                },
+                                            );
                                         }
                                     }
                             });
@@ -1818,16 +1865,6 @@ impl VoxelInkApp {
                 self.forced_colors,
             );
         }
-        paint_interaction_hint(
-            ui.painter(),
-            content,
-            if content.width() < 400.0 {
-                "Wheel slice · Ctrl+wheel zoom · Drag move"
-            } else {
-                "Wheel: slice · Ctrl+wheel: zoom · Middle/right drag: move"
-            },
-            self.forced_colors,
-        );
         let interaction_rect = image_rect.intersect(content);
         let response = ui.interact(
             interaction_rect,
@@ -1910,6 +1947,16 @@ impl VoxelInkApp {
                 height,
             );
         }
+        paint_interaction_hint(
+            ui.painter(),
+            content,
+            if content.width() < 400.0 {
+                "Wheel slice · Ctrl+wheel zoom · Drag move"
+            } else {
+                "Wheel: slice · Ctrl+wheel: zoom · Middle/right drag: move"
+            },
+            self.forced_colors,
+        );
         let displayed_cursor = self.summary.as_ref().map(|summary| {
             let mut cursor = summary.cursor;
             cursor[axis.normal_axis()] = coordinate;
