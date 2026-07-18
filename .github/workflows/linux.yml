@@ -74,10 +74,22 @@ jobs:
 
       - name: Run Rust tests with Mesa Vulkan
         env:
-          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
           VOXEL_INK_REQUIRE_SOFTWARE_VULKAN: 1
           WGPU_BACKEND: vulkan
-        run: cargo test --locked --all-features
+        run: |
+          mapfile -t lavapipe_manifests < <(
+            dpkg-query --listfiles mesa-vulkan-drivers |
+              awk '/\/lvp_icd[^/]*\.json$/'
+          )
+          if [[ "${#lavapipe_manifests[@]}" -ne 1 ]]; then
+            printf 'expected exactly one Lavapipe ICD manifest, found %d\n' \
+              "${#lavapipe_manifests[@]}" >&2
+            exit 1
+          fi
+          VK_DRIVER_FILES="${lavapipe_manifests[0]}"
+          test -r "$VK_DRIVER_FILES"
+          export VK_DRIVER_FILES
+          cargo test --locked --all-features
 
       - name: Build release binary
         run: cargo build --locked --release
