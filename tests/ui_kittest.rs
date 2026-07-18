@@ -119,6 +119,36 @@ fn repair_panel_guidance_and_controls_stay_inside_the_panel() {
 }
 
 #[test]
+fn loaded_repair_cards_keep_symmetric_margins_when_the_scrollbar_appears() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("scrolling-repair-panel.binvox");
+    write_binvox(&path, [5, 5, 5], &[0; 125]);
+    let mut harness = app_harness_with_size(Some(path), [900.0, 620.0]);
+    wait_for_label(&mut harness, "5 × 5 × 5");
+    harness.key_press(egui::Key::B);
+    for _ in 0..4 {
+        harness.step();
+    }
+
+    let panel = harness
+        .get_by_role_and_label(Role::Pane, "Repair volume controls")
+        .rect();
+    for label in ["Seal openings workflow", "Fill interior workflow"] {
+        let card = harness.get_by_label(label).rect();
+        let left_margin = card.left() - panel.left();
+        let right_margin = panel.right() - card.right();
+        assert!(
+            left_margin >= 11.0 && right_margin >= 11.0,
+            "{label:?} lost its panel margin after scrolling: panel {panel:?}, card {card:?}"
+        );
+        assert!(
+            (left_margin - right_margin).abs() < 1.0,
+            "{label:?} has asymmetric margins after scrolling: {left_margin} vs {right_margin}"
+        );
+    }
+}
+
+#[test]
 fn loaded_document_has_synchronized_named_panes_and_keyboard_editing() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("keyboard.binvox");

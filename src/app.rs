@@ -887,9 +887,10 @@ impl VoxelInkApp {
             .frame(
                 egui::Frame::new()
                     .fill(surface)
-                    .stroke(egui::Stroke::new(1.0, self.line_color()))
+                    .stroke(egui::Stroke::NONE)
                     .inner_margin(egui::Margin::symmetric(10, 7)),
             )
+            .show_separator_line(true)
             .show(root, |ui| {
                 ui.horizontal(|ui| {
                     ui.add(
@@ -1001,12 +1002,13 @@ impl VoxelInkApp {
                 egui::Frame::new()
                     .fill(surface)
                     .stroke(egui::Stroke::NONE)
-                    .inner_margin(egui::Margin::same(12)),
+                    .inner_margin(egui::Margin::ZERO),
             )
             .show(root, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("voxel-ink-repair-scroll")
                     .auto_shrink([false, false])
+                    .content_margin(egui::Margin::same(12))
                     .show(ui, |ui| {
                         let has_document = self.summary.is_some();
                         let ready = has_document
@@ -1030,7 +1032,7 @@ impl VoxelInkApp {
                             .stroke(egui::Stroke::new(1.0, self.line_color()))
                             .corner_radius(CARD_RADIUS)
                             .inner_margin(egui::Margin::same(12));
-                        card.show(ui, |ui| {
+                        let seal_card = card.show(ui, |ui| {
                             ui.set_width(
                                 (card_width - card.total_margin().sum().x).max(1.0),
                             );
@@ -1051,7 +1053,7 @@ impl VoxelInkApp {
                                         &mut columns[0],
                                         "Inspect (I)",
                                         self.tool == Tool::Inspect,
-                                        TEAL,
+                                        tool_accent(Tool::Inspect),
                                         self.forced_colors,
                                     )
                                     .on_hover_text(
@@ -1065,7 +1067,7 @@ impl VoxelInkApp {
                                         &mut columns[1],
                                         "Paint (B)",
                                         self.tool == Tool::Paint,
-                                        PAINT_GREEN,
+                                        tool_accent(Tool::Paint),
                                         self.forced_colors,
                                     )
                                     .on_hover_text("Fill the highlighted voxels")
@@ -1080,7 +1082,7 @@ impl VoxelInkApp {
                                         &mut columns[0],
                                         "Erase (E)",
                                         self.tool == Tool::Erase,
-                                        ERASE_RED,
+                                        tool_accent(Tool::Erase),
                                         self.forced_colors,
                                     )
                                     .on_hover_text("Remove the highlighted voxels")
@@ -1092,7 +1094,7 @@ impl VoxelInkApp {
                                         &mut columns[1],
                                         "Bridge (L)",
                                         self.tool == Tool::Bridge,
-                                        BRIDGE_AMBER,
+                                        tool_accent(Tool::Bridge),
                                         self.forced_colors,
                                     )
                                     .on_hover_text(
@@ -1109,17 +1111,25 @@ impl VoxelInkApp {
                             }
 
                             if self.tool != Tool::Inspect {
+                                let brush_accent = tool_accent(self.tool);
                                 ui.add_space(12.0);
                                 ui.separator();
                                 ui.add_space(8.0);
                                 ui.add_enabled_ui(ready, |ui| {
+                                    if !self.forced_colors {
+                                        let visuals = ui.visuals_mut();
+                                        visuals.selection.bg_fill = brush_accent;
+                                        visuals.widgets.hovered.bg_stroke =
+                                            egui::Stroke::new(1.0, brush_accent);
+                                        visuals.widgets.active.bg_fill = brush_accent;
+                                    }
                                     ui.label(egui::RichText::new("Shape").small().strong());
                                     ui.columns(2, |columns| {
                                         if selection_button(
                                             &mut columns[0],
                                             "Round",
                                             self.brush_shape == BrushShape::Round,
-                                            TEAL,
+                                            brush_accent,
                                             self.forced_colors,
                                         )
                                         .clicked()
@@ -1130,7 +1140,7 @@ impl VoxelInkApp {
                                             &mut columns[1],
                                             "Square",
                                             self.brush_shape == BrushShape::Square,
-                                            TEAL,
+                                            brush_accent,
                                             self.forced_colors,
                                         )
                                         .clicked()
@@ -1145,7 +1155,7 @@ impl VoxelInkApp {
                                             &mut columns[0],
                                             "One slice",
                                             self.brush_depth == BrushDepth::Slice,
-                                            TEAL,
+                                            brush_accent,
                                             self.forced_colors,
                                         )
                                         .clicked()
@@ -1156,7 +1166,7 @@ impl VoxelInkApp {
                                             &mut columns[1],
                                             "3D volume",
                                             self.brush_depth == BrushDepth::Volume,
-                                            TEAL,
+                                            brush_accent,
                                             self.forced_colors,
                                         )
                                         .clicked()
@@ -1191,6 +1201,7 @@ impl VoxelInkApp {
                                                         "mm",
                                                         self.brush_size_unit
                                                             == BrushSizeUnit::Millimeters,
+                                                        brush_accent,
                                                         self.forced_colors,
                                                     )
                                                     .clicked()
@@ -1203,6 +1214,7 @@ impl VoxelInkApp {
                                                     ui,
                                                     "voxels",
                                                     self.brush_size_unit == BrushSizeUnit::Voxels,
+                                                    brush_accent,
                                                     self.forced_colors,
                                                 )
                                                 .clicked()
@@ -1262,10 +1274,17 @@ impl VoxelInkApp {
                                 });
                             }
                         });
+                        seal_card.response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Other,
+                                true,
+                                "Seal openings workflow",
+                            )
+                        });
 
                         ui.add_space(10.0);
                         let card_width = ui.available_width();
-                        card.show(ui, |ui| {
+                        let fill_card = card.show(ui, |ui| {
                             ui.set_width(
                                 (card_width - card.total_margin().sum().x).max(1.0),
                             );
@@ -1306,6 +1325,13 @@ impl VoxelInkApp {
                                 }
                             }
                         });
+                        fill_card.response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Other,
+                                true,
+                                "Fill interior workflow",
+                            )
+                        });
                     });
             });
         panel.response.widget_info(|| {
@@ -1319,9 +1345,10 @@ impl VoxelInkApp {
             .frame(
                 egui::Frame::new()
                     .fill(surface)
-                    .stroke(egui::Stroke::new(1.0, self.line_color()))
+                    .stroke(egui::Stroke::NONE)
                     .inner_margin(egui::Margin::symmetric(8, 6)),
             )
+            .show_separator_line(true)
             .show(root, |ui| {
                 ui.horizontal(|ui| {
                     if let Some(summary) = &self.summary {
@@ -3157,10 +3184,20 @@ fn selection_button(
     )
 }
 
+const fn tool_accent(tool: Tool) -> Color32 {
+    match tool {
+        Tool::Inspect => TEAL,
+        Tool::Paint => PAINT_GREEN,
+        Tool::Erase => ERASE_RED,
+        Tool::Bridge => BRIDGE_AMBER,
+    }
+}
+
 fn compact_selection_button(
     ui: &mut egui::Ui,
     label: &str,
     selected: bool,
+    accent: Color32,
     forced_colors: bool,
 ) -> egui::Response {
     let (fill, stroke, text) = if forced_colors {
@@ -3171,8 +3208,8 @@ fn compact_selection_button(
         }
     } else if selected {
         (
-            Color32::from_rgba_unmultiplied(TEAL.r(), TEAL.g(), TEAL.b(), 52),
-            TEAL,
+            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 52),
+            accent,
             TEXT,
         )
     } else {
