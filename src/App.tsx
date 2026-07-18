@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import appIcon from "../src-tauri/icons/icon.png";
 import "./App.css";
 import { CodecWorkerClient } from "./codecs/client";
 import type { SourceVariant } from "./codecs/types";
@@ -341,7 +342,7 @@ function App() {
       <h1 className="sr-only">VoxelInk binary voxel editor</h1>
       <header className="app-toolbar" aria-label="Editor toolbar">
         <div className="app-identity" aria-hidden="true">
-          <span className="app-mark" />
+          <img className="app-mark" src={appIcon} alt="" />
           <strong>VoxelInk</strong>
         </div>
         <div className="toolbar-group" aria-label="File actions">
