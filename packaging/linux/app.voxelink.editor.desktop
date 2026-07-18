@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=VoxelInk
+GenericName=Voxel Volume Editor
+Comment=Inspect and edit volumetric voxel masks
+Exec=voxel-ink %f
+TryExec=voxel-ink
+Icon=app.voxelink.editor
+Terminal=false
+Categories=Science;MedicalSoftware;
+Keywords=voxel;volume;mask;NIfTI;BINVOX;MagicaVoxel;
+MimeType=application/x-nifti;application/x-nifti-gzip;application/x-binvox;application/x-magica-voxel;
+StartupNotify=true
+StartupWMClass=app.voxelink.editor

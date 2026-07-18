@@ -1,0 +1,40 @@
+[package]
+name = "voxel-ink"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+description = "Native local-only volumetric voxel editor"
+
+[dependencies]
+bytemuck = { version = "1.25", features = ["derive"] }
+crossbeam-channel = "0.5.15"
+eframe = { version = "=0.35.0", default-features = false, features = ["accesskit", "default_fonts", "wayland", "x11", "wgpu_no_default_features"] }
+egui = { version = "=0.35.0", default-features = false }
+egui-wgpu = { version = "=0.35.0", default-features = false }
+flate2 = "1.1"
+glam = { version = "0.32", features = ["bytemuck"] }
+rayon = "1.11"
+rfd = { version = "=0.17.2", default-features = false, features = ["xdg-portal", "wayland"] }
+sha2 = "0.10.9"
+tempfile = "3.27"
+thiserror = "2.0"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
+wgpu = { version = "=29.0.1", default-features = false, features = ["std", "wgsl", "vulkan", "gles"] }
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+egui_kittest = { version = "=0.35.0", default-features = false, features = ["eframe"] }
+pollster = "0.4"
+
+[[bench]]
+name = "storage"
+harness = false
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+
+[lints.rust]
+unsafe_code = "forbid"

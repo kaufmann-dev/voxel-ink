@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-nifti">
+    <comment>NIfTI volume</comment>
+    <acronym>NIfTI</acronym>
+    <expanded-acronym>Neuroimaging Informatics Technology Initiative</expanded-acronym>
+    <glob pattern="*.nii" weight="80"/>
+    <magic priority="70">
+      <match type="string" value="n+2" offset="4"/>
+      <match type="string" value="n+1" offset="344"/>
+    </magic>
+  </mime-type>
+  <mime-type type="application/x-nifti-gzip">
+    <comment>Gzip-compressed NIfTI volume</comment>
+    <sub-class-of type="application/gzip"/>
+    <glob pattern="*.nii.gz" weight="90"/>
+  </mime-type>
+  <mime-type type="application/x-binvox">
+    <comment>BINVOX voxel model</comment>
+    <glob pattern="*.binvox" weight="80"/>
+    <magic priority="70">
+      <match type="string" value="#binvox " offset="0"/>
+    </magic>
+  </mime-type>
+  <mime-type type="application/x-magica-voxel">
+    <comment>MagicaVoxel model</comment>
+    <glob pattern="*.vox" weight="80"/>
+    <magic priority="70">
+      <match type="string" value="VOX " offset="0"/>
+    </magic>
+  </mime-type>
+</mime-info>
+
