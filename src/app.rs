@@ -27,6 +27,14 @@ const TEAL: Color32 = Color32::from_rgb(36, 200, 219);
 const YELLOW: Color32 = Color32::from_rgb(255, 193, 49);
 const MAX_ENGINE_EVENTS_PER_FRAME: usize = 256;
 const SLICE_POINT_SCROLL_THRESHOLD: f32 = 24.0;
+const REPAIR_PANEL_DEFAULT_WIDTH: f32 = 288.0;
+const REPAIR_PANEL_MIN_WIDTH: f32 = 240.0;
+const REPAIR_PANEL_MAX_WINDOW_FRACTION: f32 = 0.45;
+const REPAIR_PANEL_ABSOLUTE_MAX_WIDTH: f32 = 420.0;
+const WORKSPACE_GAP: f32 = 8.0;
+const WORKSPACE_MIN_PANE_WIDTH: f32 = 280.0;
+const WORKSPACE_MIN_PANE_HEIGHT: f32 = 160.0;
+const WORKSPACE_KEYBOARD_RESIZE_STEP: f32 = 16.0;
 const SLICE_TEXTURE_OPTIONS: TextureOptions = TextureOptions {
     magnification: egui::TextureFilter::Nearest,
     minification: egui::TextureFilter::Linear,
@@ -136,6 +144,16 @@ struct BridgeAnchor {
 enum WorkspacePane {
     Slice(SliceAxis),
     Volume3D,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WorkspaceGrid {
+    axial: egui::Rect,
+    coronal: egui::Rect,
+    sagittal: egui::Rect,
+    volume: egui::Rect,
+    column_splitter: egui::Rect,
+    row_splitter: egui::Rect,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -261,6 +279,8 @@ pub struct VoxelInkApp {
     stroke_completion_pending: bool,
     pane_keyboard_focus: bool,
     maximized_pane: Option<WorkspacePane>,
+    workspace_column_ratio: f32,
+    workspace_row_ratio: f32,
 }
 
 impl VoxelInkApp {
@@ -356,6 +376,8 @@ impl VoxelInkApp {
             stroke_completion_pending: false,
             pane_keyboard_focus: false,
             maximized_pane: None,
+            workspace_column_ratio: 0.5,
+            workspace_row_ratio: 0.5,
         };
         if let Some(path) = initial_path
             && let Err(error) = app.engine.start_load(path)
@@ -942,153 +964,221 @@ impl VoxelInkApp {
 
     fn repair_panel(&mut self, root: &mut egui::Ui) {
         let surface = self.surface_color();
-        egui::Panel::left("voxel-ink-repair-panel")
-            .default_size(232.0)
-            .min_size(232.0)
-            .max_size(232.0)
-            .resizable(false)
+        let maximum_width = (root.available_width() * REPAIR_PANEL_MAX_WINDOW_FRACTION)
+            .clamp(REPAIR_PANEL_MIN_WIDTH, REPAIR_PANEL_ABSOLUTE_MAX_WIDTH);
+        let panel = egui::Panel::left("voxel-ink-repair-panel")
+            .default_size(REPAIR_PANEL_DEFAULT_WIDTH)
+            .min_size(REPAIR_PANEL_MIN_WIDTH)
+            .max_size(maximum_width)
+            .resizable(true)
             .frame(
                 egui::Frame::new()
                     .fill(surface)
                     .inner_margin(egui::Margin::same(12)),
             )
             .show(root, |ui| {
-                let has_document = self.summary.is_some();
-                let ready = has_document
-                    && self.busy.is_empty()
-                    && !self.has_edit_interaction();
-                ui.heading("Repair volume");
-                ui.add_space(4.0);
-                ui.strong("1 · Seal every opening");
-                ui.label(
-                    egui::RichText::new(
-                        "Paint missing voxels or bridge two surfaces until the skull interior is closed.",
-                    )
-                    .color(MUTED),
-                );
-                ui.add_space(8.0);
-                let previous_tool = self.tool;
-                ui.add_enabled_ui(self.busy.is_empty(), |ui| {
-                    ui.selectable_value(&mut self.tool, Tool::Inspect, "Inspect / navigate (I)")
-                        .on_hover_text("Move through slices and rotate or pan the 3D view");
-                    ui.selectable_value(&mut self.tool, Tool::Paint, "Paint solid (B)")
-                        .on_hover_text("Fill the highlighted voxels with the primary mouse button");
-                    ui.selectable_value(&mut self.tool, Tool::Erase, "Erase solid (E)")
-                        .on_hover_text("Remove the highlighted voxels with the primary mouse button");
-                    ui.selectable_value(&mut self.tool, Tool::Bridge, "Bridge surfaces (L)")
-                        .on_hover_text("Drag between two points to add a solid connection in one Undo step");
-                });
-                if self.tool != previous_tool {
-                    self.cancel_edit_interaction();
-                }
-
-                ui.add_space(10.0);
-                ui.add_enabled_ui(ready && self.tool != Tool::Inspect, |ui| {
-                    ui.strong("Brush footprint");
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.brush_shape, BrushShape::Round, "Round");
-                        ui.selectable_value(&mut self.brush_shape, BrushShape::Square, "Square");
-                    });
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.brush_depth, BrushDepth::Slice, "One slice");
-                        ui.selectable_value(&mut self.brush_depth, BrushDepth::Volume, "3D volume");
-                    });
-                    ui.label(
-                        egui::RichText::new("Depth applies in slice views; 3D editing uses a 3D brush.")
-                            .small()
-                            .color(MUTED),
-                    );
-                    ui.add_space(5.0);
-
-                    let has_physical_units = self
-                        .summary
-                        .as_ref()
-                        .is_some_and(|summary| summary.units != SpatialUnits::Unknown);
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(
-                            &mut self.brush_size_unit,
-                            BrushSizeUnit::Voxels,
-                            "Voxels",
+                egui::ScrollArea::vertical()
+                    .id_salt("voxel-ink-repair-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        let has_document = self.summary.is_some();
+                        let ready = has_document
+                            && self.busy.is_empty()
+                            && !self.has_edit_interaction();
+                        ui.heading("Repair volume");
+                        ui.add_space(4.0);
+                        ui.strong("1 · Seal every opening");
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(
+                                    "Paint missing voxels or bridge two surfaces until the skull interior is closed.",
+                                )
+                                .color(MUTED),
+                            )
+                            .wrap(),
                         );
-                        ui.add_enabled_ui(has_physical_units, |ui| {
+                        ui.add_space(8.0);
+                        let previous_tool = self.tool;
+                        ui.add_enabled_ui(self.busy.is_empty(), |ui| {
                             ui.selectable_value(
-                                &mut self.brush_size_unit,
-                                BrushSizeUnit::Millimeters,
-                                "Millimetres",
+                                &mut self.tool,
+                                Tool::Inspect,
+                                "Inspect / navigate (I)",
+                            )
+                            .on_hover_text("Move through slices and rotate or pan the 3D view");
+                            ui.selectable_value(&mut self.tool, Tool::Paint, "Paint solid (B)")
+                                .on_hover_text(
+                                    "Fill the highlighted voxels with the primary mouse button",
+                                );
+                            ui.selectable_value(&mut self.tool, Tool::Erase, "Erase solid (E)")
+                                .on_hover_text(
+                                    "Remove the highlighted voxels with the primary mouse button",
+                                );
+                            ui.selectable_value(
+                                &mut self.tool,
+                                Tool::Bridge,
+                                "Bridge surfaces (L)",
+                            )
+                            .on_hover_text(
+                                "Drag between two points to add a solid connection in one Undo step",
                             );
                         });
-                    });
-                    if !has_physical_units {
-                        self.brush_size_unit = BrushSizeUnit::Voxels;
-                    }
-                    match self.brush_size_unit {
-                        BrushSizeUnit::Voxels => {
-                            let changed = ui
-                                .add(
-                                    egui::Slider::new(
-                                        &mut self.brush_voxel_diameter,
-                                        BrushSize::MIN_VOXELS..=BrushSize::MAX_VOXELS,
+                        if self.tool != previous_tool {
+                            self.cancel_edit_interaction();
+                        }
+
+                        ui.add_space(10.0);
+                        ui.add_enabled_ui(ready && self.tool != Tool::Inspect, |ui| {
+                            ui.strong("Brush footprint");
+                            ui.horizontal_wrapped(|ui| {
+                                ui.selectable_value(
+                                    &mut self.brush_shape,
+                                    BrushShape::Round,
+                                    "Round",
+                                );
+                                ui.selectable_value(
+                                    &mut self.brush_shape,
+                                    BrushShape::Square,
+                                    "Square",
+                                );
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.selectable_value(
+                                    &mut self.brush_depth,
+                                    BrushDepth::Slice,
+                                    "One slice",
+                                );
+                                ui.selectable_value(
+                                    &mut self.brush_depth,
+                                    BrushDepth::Volume,
+                                    "3D volume",
+                                );
+                            });
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(
+                                        "Depth applies in slice views; 3D editing uses a 3D brush.",
                                     )
-                                    .step_by(2.0)
-                                    .text("Brush diameter in voxels"),
+                                    .small()
+                                    .color(MUTED),
                                 )
-                                .changed();
-                            if changed && self.brush_voxel_diameter.is_multiple_of(2) {
-                                self.brush_voxel_diameter =
-                                    self.brush_voxel_diameter.saturating_add(1).min(BrushSize::MAX_VOXELS);
+                                .wrap(),
+                            );
+                            ui.add_space(5.0);
+
+                            let has_physical_units = self.summary.as_ref().is_some_and(|summary| {
+                                summary.units != SpatialUnits::Unknown
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.selectable_value(
+                                    &mut self.brush_size_unit,
+                                    BrushSizeUnit::Voxels,
+                                    "Voxels",
+                                );
+                                ui.add_enabled_ui(has_physical_units, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.brush_size_unit,
+                                        BrushSizeUnit::Millimeters,
+                                        "Millimetres",
+                                    );
+                                });
+                            });
+                            if !has_physical_units {
+                                self.brush_size_unit = BrushSizeUnit::Voxels;
+                            }
+                            let available_slider_width = ui.available_width();
+                            ui.spacing_mut().slider_width =
+                                (available_slider_width - 72.0).max(80.0);
+                            match self.brush_size_unit {
+                                BrushSizeUnit::Voxels => {
+                                    let label = ui.add(
+                                        egui::Label::new("Brush diameter in voxels").wrap(),
+                                    );
+                                    let changed = ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut self.brush_voxel_diameter,
+                                                BrushSize::MIN_VOXELS..=BrushSize::MAX_VOXELS,
+                                            )
+                                            .step_by(2.0),
+                                        )
+                                        .labelled_by(label.id)
+                                        .changed();
+                                    if changed && self.brush_voxel_diameter.is_multiple_of(2) {
+                                        self.brush_voxel_diameter = self
+                                            .brush_voxel_diameter
+                                            .saturating_add(1)
+                                            .min(BrushSize::MAX_VOXELS);
+                                    }
+                                }
+                                BrushSizeUnit::Millimeters => {
+                                    let label = ui.add(
+                                        egui::Label::new("Brush diameter in millimetres").wrap(),
+                                    );
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut self.brush_millimeters,
+                                            BrushSize::MIN_MILLIMETERS
+                                                ..=BrushSize::MAX_MILLIMETERS,
+                                        )
+                                        .step_by(0.5)
+                                        .suffix(" mm"),
+                                    )
+                                    .labelled_by(label.id);
+                                }
+                            }
+                        });
+
+                        ui.add_space(14.0);
+                        ui.separator();
+                        ui.add_space(10.0);
+                        ui.strong("2 · Fill the closed interior");
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(
+                                    "After every opening is sealed, fill all empty regions that can no longer reach a volume boundary.",
+                                )
+                                .color(MUTED),
+                            )
+                            .wrap(),
+                        );
+                        ui.add_space(8.0);
+                        if ui
+                            .add_enabled(
+                                ready,
+                                egui::Button::new(
+                                    egui::RichText::new("Fill enclosed cavities").strong(),
+                                )
+                                .min_size(egui::vec2(ui.available_width(), 34.0)),
+                            )
+                            .on_hover_text(
+                                "Fill every empty 3D region that cannot reach any outside volume face. The result is one Undo step.",
+                            )
+                            .clicked()
+                        {
+                            self.preview_notice = None;
+                            self.clear_brush_preview();
+                            self.clear_stroke_overlay();
+                            if let Err(error) = self.engine.start_fill_enclosed_cavities() {
+                                self.error_message = Some(error.to_string());
                             }
                         }
-                        BrushSizeUnit::Millimeters => {
-                            ui.add(
-                                egui::Slider::new(
-                                    &mut self.brush_millimeters,
-                                    BrushSize::MIN_MILLIMETERS..=BrushSize::MAX_MILLIMETERS,
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(
+                                    "No point selection is needed. Cancel is available while scanning.",
                                 )
-                                .step_by(0.5)
-                                .suffix(" mm")
-                                .text("Brush diameter in millimetres"),
-                            );
-                        }
-                    }
-                });
-
-                ui.add_space(14.0);
-                ui.separator();
-                ui.add_space(10.0);
-                ui.strong("2 · Fill the closed interior");
-                ui.label(
-                    egui::RichText::new(
-                        "After every opening is sealed, fill all empty regions that can no longer reach a volume boundary.",
-                    )
-                    .color(MUTED),
-                );
-                ui.add_space(8.0);
-                if ui
-                    .add_enabled(
-                        ready,
-                        egui::Button::new(
-                            egui::RichText::new("Fill enclosed cavities").strong(),
-                        )
-                        .min_size(egui::vec2(ui.available_width(), 34.0)),
-                    )
-                    .on_hover_text(
-                        "Fill every empty 3D region that cannot reach any outside volume face. The result is one Undo step.",
-                    )
-                    .clicked()
-                {
-                    self.preview_notice = None;
-                    self.clear_brush_preview();
-                    self.clear_stroke_overlay();
-                    if let Err(error) = self.engine.start_fill_enclosed_cavities() {
-                        self.error_message = Some(error.to_string());
-                    }
-                }
-                ui.label(
-                    egui::RichText::new("No point selection is needed. Cancel is available while scanning.")
-                        .small()
-                        .color(MUTED),
-                );
+                                .small()
+                                .color(MUTED),
+                            )
+                            .wrap(),
+                        );
+                    });
             });
+        panel.response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Panel, true, "Repair volume controls")
+        });
     }
 
     fn status_bar(&mut self, root: &mut egui::Ui) {
@@ -1178,45 +1268,17 @@ impl VoxelInkApp {
                         });
                     }
                     None => {
-                        let gap = 6.0;
-                        let half_width = (rect.width() - gap) * 0.5;
-                        let half_height = (rect.height() - gap) * 0.5;
-                        let panes = [
-                            (
-                                SliceAxis::Axial,
-                                egui::Rect::from_min_size(
-                                    rect.min,
-                                    Vec2::new(half_width, half_height),
-                                ),
-                            ),
-                            (
-                                SliceAxis::Coronal,
-                                egui::Rect::from_min_size(
-                                    egui::pos2(rect.min.x + half_width + gap, rect.min.y),
-                                    Vec2::new(half_width, half_height),
-                                ),
-                            ),
-                            (
-                                SliceAxis::Sagittal,
-                                egui::Rect::from_min_size(
-                                    egui::pos2(rect.min.x, rect.min.y + half_height + gap),
-                                    Vec2::new(half_width, half_height),
-                                ),
-                            ),
-                        ];
-                        for (axis, pane_rect) in panes {
+                        let grid = self.resizable_workspace_grid(ui, rect);
+                        for (axis, pane_rect) in [
+                            (SliceAxis::Axial, grid.axial),
+                            (SliceAxis::Coronal, grid.coronal),
+                            (SliceAxis::Sagittal, grid.sagittal),
+                        ] {
                             ui.scope_builder(egui::UiBuilder::new().max_rect(pane_rect), |ui| {
                                 self.slice_pane(ui, axis, &mut actions);
                             });
                         }
-                        let volume_rect = egui::Rect::from_min_size(
-                            egui::pos2(
-                                rect.min.x + half_width + gap,
-                                rect.min.y + half_height + gap,
-                            ),
-                            Vec2::new(half_width, half_height),
-                        );
-                        ui.scope_builder(egui::UiBuilder::new().max_rect(volume_rect), |ui| {
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(grid.volume), |ui| {
                             self.volume_pane(ui, &mut actions);
                         });
                     }
@@ -1229,6 +1291,168 @@ impl VoxelInkApp {
                     self.clear_brush_preview();
                 }
             });
+    }
+
+    fn resizable_workspace_grid(
+        &mut self,
+        ui: &mut egui::Ui,
+        workspace: egui::Rect,
+    ) -> WorkspaceGrid {
+        let mut grid = workspace_grid(
+            workspace,
+            self.workspace_column_ratio,
+            self.workspace_row_ratio,
+        );
+
+        let row_response = ui
+            .interact(
+                grid.row_splitter,
+                ui.id().with("workspace-row-splitter"),
+                egui::Sense::drag(),
+            )
+            .on_hover_and_drag_cursor(egui::CursorIcon::ResizeVertical);
+        row_response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::ResizeHandle,
+                true,
+                "Resize workspace rows",
+            )
+        });
+        if row_response.dragged()
+            && let Some(pointer) = row_response.interact_pointer_pos()
+        {
+            self.workspace_row_ratio = split_ratio_at_pointer(
+                pointer.y,
+                workspace.top(),
+                workspace.height(),
+                WORKSPACE_MIN_PANE_HEIGHT,
+            );
+        }
+        if row_response.has_focus() {
+            let (pixel_delta, reset) = ui.input_mut(|input| {
+                let up = input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp);
+                let down = input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown);
+                let reset = input.consume_key(egui::Modifiers::NONE, egui::Key::Home);
+                (
+                    if up {
+                        -WORKSPACE_KEYBOARD_RESIZE_STEP
+                    } else if down {
+                        WORKSPACE_KEYBOARD_RESIZE_STEP
+                    } else {
+                        0.0
+                    },
+                    reset,
+                )
+            });
+            if reset {
+                self.workspace_row_ratio = 0.5;
+            } else if pixel_delta != 0.0 {
+                self.workspace_row_ratio = split_ratio_after_delta(
+                    workspace.height(),
+                    self.workspace_row_ratio,
+                    WORKSPACE_MIN_PANE_HEIGHT,
+                    pixel_delta,
+                );
+            }
+        }
+        grid = workspace_grid(
+            workspace,
+            self.workspace_column_ratio,
+            self.workspace_row_ratio,
+        );
+
+        let column_response = ui
+            .interact(
+                grid.column_splitter,
+                ui.id().with("workspace-column-splitter"),
+                egui::Sense::drag(),
+            )
+            .on_hover_and_drag_cursor(egui::CursorIcon::ResizeHorizontal);
+        column_response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::ResizeHandle,
+                true,
+                "Resize workspace columns",
+            )
+        });
+        if column_response.dragged()
+            && let Some(pointer) = column_response.interact_pointer_pos()
+        {
+            self.workspace_column_ratio = split_ratio_at_pointer(
+                pointer.x,
+                workspace.left(),
+                workspace.width(),
+                WORKSPACE_MIN_PANE_WIDTH,
+            );
+        }
+        if column_response.has_focus() {
+            let (pixel_delta, reset) = ui.input_mut(|input| {
+                let left = input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft);
+                let right = input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight);
+                let reset = input.consume_key(egui::Modifiers::NONE, egui::Key::Home);
+                (
+                    if left {
+                        -WORKSPACE_KEYBOARD_RESIZE_STEP
+                    } else if right {
+                        WORKSPACE_KEYBOARD_RESIZE_STEP
+                    } else {
+                        0.0
+                    },
+                    reset,
+                )
+            });
+            if reset {
+                self.workspace_column_ratio = 0.5;
+            } else if pixel_delta != 0.0 {
+                self.workspace_column_ratio = split_ratio_after_delta(
+                    workspace.width(),
+                    self.workspace_column_ratio,
+                    WORKSPACE_MIN_PANE_WIDTH,
+                    pixel_delta,
+                );
+            }
+        }
+        grid = workspace_grid(
+            workspace,
+            self.workspace_column_ratio,
+            self.workspace_row_ratio,
+        );
+
+        let splitter_color = |response: &egui::Response| {
+            if response.hovered() || response.dragged() || response.has_focus() {
+                if self.forced_colors {
+                    Color32::WHITE
+                } else {
+                    TEAL
+                }
+            } else {
+                self.line_color()
+            }
+        };
+        ui.painter().rect_filled(
+            egui::Rect::from_center_size(
+                grid.row_splitter.center(),
+                egui::vec2(grid.row_splitter.width(), 2.0),
+            ),
+            0.0,
+            splitter_color(&row_response),
+        );
+        ui.painter().rect_filled(
+            egui::Rect::from_center_size(
+                grid.column_splitter.center(),
+                egui::vec2(2.0, grid.column_splitter.height()),
+            ),
+            0.0,
+            splitter_color(&column_response),
+        );
+        if row_response.dragged()
+            || column_response.dragged()
+            || row_response.has_focus()
+            || column_response.has_focus()
+        {
+            ui.ctx().request_repaint();
+        }
+        grid
     }
 
     fn slice_pane(&mut self, ui: &mut egui::Ui, axis: SliceAxis, actions: &mut FrameStrokeActions) {
@@ -2907,6 +3131,70 @@ fn step_slice_coordinate(current: u32, last: u32, steps: i32) -> u32 {
     }
 }
 
+fn workspace_grid(workspace: egui::Rect, column_ratio: f32, row_ratio: f32) -> WorkspaceGrid {
+    let column_gap = WORKSPACE_GAP.min(workspace.width().max(0.0));
+    let row_gap = WORKSPACE_GAP.min(workspace.height().max(0.0));
+    let left_width = split_extent(workspace.width(), column_ratio, WORKSPACE_MIN_PANE_WIDTH);
+    let top_height = split_extent(workspace.height(), row_ratio, WORKSPACE_MIN_PANE_HEIGHT);
+    let left_edge = workspace.left() + left_width;
+    let right_edge = left_edge + column_gap;
+    let top_edge = workspace.top() + top_height;
+    let bottom_edge = top_edge + row_gap;
+
+    WorkspaceGrid {
+        axial: egui::Rect::from_min_max(workspace.min, egui::pos2(left_edge, top_edge)),
+        coronal: egui::Rect::from_min_max(
+            egui::pos2(right_edge, workspace.top()),
+            egui::pos2(workspace.right(), top_edge),
+        ),
+        sagittal: egui::Rect::from_min_max(
+            egui::pos2(workspace.left(), bottom_edge),
+            egui::pos2(left_edge, workspace.bottom()),
+        ),
+        volume: egui::Rect::from_min_max(egui::pos2(right_edge, bottom_edge), workspace.max),
+        column_splitter: egui::Rect::from_min_max(
+            egui::pos2(left_edge, workspace.top()),
+            egui::pos2(right_edge, workspace.bottom()),
+        ),
+        row_splitter: egui::Rect::from_min_max(
+            egui::pos2(workspace.left(), top_edge),
+            egui::pos2(workspace.right(), bottom_edge),
+        ),
+    }
+}
+
+fn split_extent(span: f32, ratio: f32, minimum: f32) -> f32 {
+    let gap = WORKSPACE_GAP.min(span.max(0.0));
+    let usable = (span - gap).max(0.0);
+    if usable == 0.0 {
+        return 0.0;
+    }
+    let minimum = minimum.min(usable * 0.5);
+    let ratio = if ratio.is_finite() {
+        ratio.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    (usable * ratio).clamp(minimum, usable - minimum)
+}
+
+fn split_ratio_at_pointer(pointer: f32, start: f32, span: f32, minimum: f32) -> f32 {
+    let gap = WORKSPACE_GAP.min(span.max(0.0));
+    let usable = (span - gap).max(0.0);
+    if usable == 0.0 || !pointer.is_finite() || !start.is_finite() {
+        return 0.5;
+    }
+    let requested_extent = pointer - start - gap * 0.5;
+    let minimum = minimum.min(usable * 0.5);
+    requested_extent.clamp(minimum, usable - minimum) / usable
+}
+
+fn split_ratio_after_delta(span: f32, ratio: f32, minimum: f32, delta: f32) -> f32 {
+    let gap = WORKSPACE_GAP.min(span.max(0.0));
+    let extent = split_extent(span, ratio, minimum);
+    split_ratio_at_pointer(extent + gap * 0.5 + delta, 0.0, span, minimum)
+}
+
 fn fit_rect(available: egui::Rect, aspect: f32) -> egui::Rect {
     let size = if available.width() / available.height().max(1.0) > aspect {
         Vec2::new(available.height() * aspect, available.height())
@@ -3130,6 +3418,43 @@ mod tests {
         assert_eq!(view.wheel_steps(&[]), 0);
         assert_eq!(view.wheel_steps(&[point(-8.0)]), 0);
         assert_eq!(view.wheel_steps(&[point(-16.0)]), -1);
+    }
+
+    #[test]
+    fn workspace_grid_accounts_for_the_splitter_gap_and_minimum_sizes() {
+        let workspace =
+            egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(1_000.0, 700.0));
+        let centered = workspace_grid(workspace, 0.5, 0.5);
+        assert!((centered.axial.width() - 496.0).abs() < f32::EPSILON);
+        assert!((centered.coronal.width() - 496.0).abs() < f32::EPSILON);
+        assert!((centered.axial.height() - 346.0).abs() < f32::EPSILON);
+        assert!((centered.sagittal.height() - 346.0).abs() < f32::EPSILON);
+        assert!((centered.column_splitter.width() - WORKSPACE_GAP).abs() < f32::EPSILON);
+        assert!((centered.row_splitter.height() - WORKSPACE_GAP).abs() < f32::EPSILON);
+
+        let minimum = workspace_grid(workspace, 0.0, 1.0);
+        assert!((minimum.axial.width() - WORKSPACE_MIN_PANE_WIDTH).abs() < f32::EPSILON);
+        assert!((minimum.sagittal.height() - WORKSPACE_MIN_PANE_HEIGHT).abs() < f32::EPSILON);
+        assert!(
+            (minimum.coronal.width() - (1_000.0 - WORKSPACE_GAP - WORKSPACE_MIN_PANE_WIDTH)).abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (minimum.axial.height() - (700.0 - WORKSPACE_GAP - WORKSPACE_MIN_PANE_HEIGHT)).abs()
+                < f32::EPSILON
+        );
+    }
+
+    #[test]
+    fn workspace_grid_stays_valid_when_the_window_is_smaller_than_both_minimums() {
+        let workspace = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 200.0));
+        let grid = workspace_grid(workspace, f32::NAN, f32::INFINITY);
+        for pane in [grid.axial, grid.coronal, grid.sagittal, grid.volume] {
+            assert!(pane.width() >= 0.0);
+            assert!(pane.height() >= 0.0);
+        }
+        assert!((grid.axial.width() - grid.coronal.width()).abs() < f32::EPSILON);
+        assert!((grid.axial.height() - grid.sagittal.height()).abs() < f32::EPSILON);
     }
 
     #[test]

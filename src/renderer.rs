@@ -646,7 +646,7 @@ impl SceneBridge {
 
     pub fn orbit(&self, delta: egui::Vec2) {
         let mut state = self.state.lock().expect("3D scene state poisoned");
-        state.yaw += delta.x * 0.008;
+        state.yaw -= delta.x * 0.008;
         state.pitch = (state.pitch + delta.y * 0.008).clamp(-1.5, 1.5);
     }
 
@@ -1594,16 +1594,26 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_orbit_reverses_drag_direction() {
+    fn rightward_orbit_drag_moves_the_volume_right_on_screen() {
+        let viewport = egui::vec2(800.0, 600.0);
         let bridge = SceneBridge::default();
-        let initial_yaw = bridge.state.lock().unwrap().yaw;
+        bridge.set_aspect(viewport.x / viewport.y);
+        let landmark = Vec3::new(0.5, 0.0, 0.0);
+        let before = {
+            let state = bridge.state.lock().unwrap();
+            project_to_viewport(&state, landmark, viewport)
+        };
 
         bridge.orbit(egui::vec2(25.0, 0.0));
 
-        let state = bridge.state.lock().unwrap();
-        assert!(state.yaw > initial_yaw);
-        assert!((state.yaw - (initial_yaw + 0.2)).abs() < f32::EPSILON);
-        assert_eq!(state.pitch, SceneState::default().pitch);
+        let after = {
+            let state = bridge.state.lock().unwrap();
+            project_to_viewport(&state, landmark, viewport)
+        };
+        assert!(
+            after.x > before.x,
+            "a rightward object drag must move a visible volume landmark right ({before:?} -> {after:?})"
+        );
     }
 
     #[test]

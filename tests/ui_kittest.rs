@@ -115,6 +115,27 @@ fn toolbar_exposes_names_disabled_state_focus_order_and_tool_state() {
 }
 
 #[test]
+fn repair_panel_guidance_and_controls_stay_inside_the_panel() {
+    let harness = app_harness_with_size(None, [900.0, 620.0]);
+    let panel = harness
+        .get_by_role_and_label(Role::Pane, "Repair volume controls")
+        .rect();
+    let content_right = panel.right() - 12.0;
+
+    for label in [
+        "After every opening is sealed, fill all empty regions that can no longer reach a volume boundary.",
+        "Fill enclosed cavities",
+        "No point selection is needed. Cancel is available while scanning.",
+    ] {
+        let rect = harness.get_by_label(label).rect();
+        assert!(
+            rect.right() <= content_right,
+            "{label:?} extends beyond the repair panel {panel:?}: {rect:?}"
+        );
+    }
+}
+
+#[test]
 fn loaded_document_has_synchronized_named_panes_and_keyboard_editing() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("keyboard.binvox");
@@ -201,6 +222,78 @@ fn every_view_can_use_the_full_workspace_and_escape_restores_the_grid() {
         }
     }
     assert!(harness.query_by_label("Reset view").is_some());
+}
+
+#[test]
+fn four_view_splitters_resize_the_grid_and_survive_full_screen_restore() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("resize-panes.binvox");
+    write_binvox(&path, [4, 3, 2], &[0; 24]);
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "4 × 3 × 2");
+
+    let column = harness
+        .get_by_role_and_label(Role::Splitter, "Resize workspace columns")
+        .rect();
+    let row = harness
+        .get_by_role_and_label(Role::Splitter, "Resize workspace rows")
+        .rect();
+    let column_grab = egui::pos2(column.center().x, column.top() + column.height() * 0.25);
+    harness.hover_at(column_grab);
+    harness.step();
+    assert_eq!(
+        harness.output().platform_output.cursor_icon,
+        egui::CursorIcon::ResizeHorizontal
+    );
+
+    let target = column_grab + egui::vec2(120.0, 0.0);
+    harness.drag_at(column_grab);
+    harness.step();
+    harness.hover_at(target);
+    harness.step();
+    harness.drop_at(target);
+    harness.step();
+    harness.step();
+
+    let resized_column = harness
+        .get_by_role_and_label(Role::Splitter, "Resize workspace columns")
+        .rect();
+    let resized_row = harness
+        .get_by_role_and_label(Role::Splitter, "Resize workspace rows")
+        .rect();
+    assert!(
+        resized_column.center().x > column.center().x + 100.0,
+        "column splitter did not follow the drag: {column:?} -> {resized_column:?}"
+    );
+    assert!(
+        (resized_row.center().y - row.center().y).abs() < 1.0,
+        "column resizing unexpectedly moved the row splitter"
+    );
+
+    let saved_column_x = resized_column.center().x;
+    harness.get_by_label("Full screen Axial").click_accesskit();
+    harness.step();
+    harness.step();
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Splitter, "Resize workspace columns")
+            .is_none()
+    );
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Splitter, "Resize workspace rows")
+            .is_none()
+    );
+
+    harness.key_press(egui::Key::Escape);
+    harness.step();
+    harness.step();
+    let restored_column_x = harness
+        .get_by_role_and_label(Role::Splitter, "Resize workspace columns")
+        .rect()
+        .center()
+        .x;
+    assert!((restored_column_x - saved_column_x).abs() < 1.0);
 }
 
 #[test]
@@ -414,8 +507,15 @@ fn forced_colors_and_reduced_motion_are_applied() {
 }
 
 fn app_harness(initial_path: Option<PathBuf>) -> Harness<'static, VoxelInkApp> {
+    app_harness_with_size(initial_path, [1_600.0, 900.0])
+}
+
+fn app_harness_with_size(
+    initial_path: Option<PathBuf>,
+    size: [f32; 2],
+) -> Harness<'static, VoxelInkApp> {
     Harness::builder()
-        .with_size([1_600.0, 900.0])
+        .with_size(size)
         .with_max_steps(64)
         .build_eframe(move |creation_context| VoxelInkApp::new(creation_context, initial_path))
 }
