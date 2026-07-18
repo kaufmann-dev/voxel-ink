@@ -443,6 +443,20 @@ impl VolumeDocument {
             .map(|stroke| stroke.indices.as_slice())
     }
 
+    pub(crate) fn stroke_start_occupied(&self, index: u32) -> Option<bool> {
+        let current = self
+            .occupancy
+            .get(usize::try_from(index).ok()?)
+            .map(|&value| value == 1)?;
+        Some(self.active_stroke.as_ref().map_or(current, |stroke| {
+            if stroke.seen.contains(&index) {
+                stroke.value == 0
+            } else {
+                current
+            }
+        }))
+    }
+
     pub fn finish_stroke(&mut self) -> Option<u64> {
         let stroke = self.active_stroke.take()?;
         if stroke.indices.is_empty() {

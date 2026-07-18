@@ -398,6 +398,19 @@ pub fn ray_surface_hit(
     if occupancy.len() != expected_len {
         return None;
     }
+    ray_surface_hit_with_occupancy(geometry, world_ray, |index| {
+        occupancy
+            .get(usize::try_from(index).ok()?)
+            .map(|&value| value == 1)
+    })
+}
+
+fn ray_surface_hit_with_occupancy(
+    geometry: &VolumeGeometry,
+    world_ray: Ray,
+    mut occupied: impl FnMut(u32) -> Option<bool>,
+) -> Option<SurfaceHit> {
+    let dimensions = geometry.dimensions;
     let origin = geometry.world_point_to_index(world_ray.origin);
     let direction = geometry.world_vector_to_index(world_ray.direction);
     if direction
@@ -454,8 +467,8 @@ pub fn ray_surface_hit(
     }
     loop {
         let current = checked_voxel(voxel, dimensions)?;
-        let index = linear_index(dimensions, current)? as usize;
-        if occupancy.get(index).copied() == Some(1) {
+        let index = linear_index(dimensions, current)?;
+        if occupied(index)? {
             return Some(SurfaceHit {
                 voxel: current,
                 exterior: previous,
@@ -485,8 +498,8 @@ pub fn ray_surface_hit(
             let Some(neighbor) = checked_voxel(neighbor, dimensions) else {
                 continue;
             };
-            let neighbor_index = linear_index(dimensions, neighbor)? as usize;
-            if occupancy[neighbor_index] == 0 {
+            let neighbor_index = linear_index(dimensions, neighbor)?;
+            if !occupied(neighbor_index)? {
                 previous = Some(neighbor);
                 face_normal[axis] = i8::try_from(-step[axis]).ok()?;
                 break;
@@ -512,6 +525,19 @@ pub fn surface_edit_target(
         return None;
     }
     let hit = ray_surface_hit(occupancy, geometry, world_ray)?;
+    match tool {
+        Tool::Paint => hit.exterior,
+        Tool::Inspect | Tool::Erase | Tool::Bridge => Some(hit.voxel),
+    }
+}
+
+pub(crate) fn surface_edit_target_with_occupancy(
+    geometry: &VolumeGeometry,
+    world_ray: Ray,
+    tool: Tool,
+    occupied: impl FnMut(u32) -> Option<bool>,
+) -> Option<[u32; 3]> {
+    let hit = ray_surface_hit_with_occupancy(geometry, world_ray, occupied)?;
     match tool {
         Tool::Paint => hit.exterior,
         Tool::Inspect | Tool::Erase | Tool::Bridge => Some(hit.voxel),

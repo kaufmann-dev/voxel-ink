@@ -15,7 +15,7 @@ use crate::{
     AppError, Result,
     brush::{
         BrushDepth, BrushSpec, Ray, brush_indices_cancellable, ray_plane_voxel,
-        surface_edit_target, walk_supercover,
+        surface_edit_target_with_occupancy, walk_supercover,
     },
     cancel::CancellationToken,
     io::{SaveMode, load_path, save_document},
@@ -1090,6 +1090,9 @@ impl EngineState {
         let Some(target) = target else {
             return;
         };
+        if stroke.last_applied == Some(target) {
+            return;
+        }
         self.apply_target(target);
     }
 
@@ -2343,8 +2346,9 @@ fn edit_target(
             Some(voxel)
         }
         (StrokeSpace::Volume3D, PointerSample::Ray { ray }) => {
-            let view = document.view();
-            surface_edit_target(view.dimensions, view.occupancy, view.geometry, ray, tool)
+            surface_edit_target_with_occupancy(document.geometry(), ray, tool, |index| {
+                document.stroke_start_occupied(index)
+            })
         }
         _ => None,
     }
@@ -3129,13 +3133,13 @@ mod tests {
     }
 
     #[test]
-    fn identical_ray_sample_does_not_advance_a_surface_again() {
+    fn nearby_ray_samples_do_not_advance_a_painted_surface_within_one_stroke() {
         let mut state = state_with_empty_document([3, 1, 1]);
         let document = state.document.as_mut().unwrap();
         document.begin_stroke(1).unwrap();
         document.apply_stroke_indices([0]).unwrap();
         document.finish_stroke().unwrap();
-        let sample = PointerSample::Ray {
+        let initial_sample = PointerSample::Ray {
             ray: Ray {
                 origin: [4.0, 0.0, 0.0],
                 direction: [-1.0, 0.0, 0.0],
@@ -3147,7 +3151,7 @@ mod tests {
             Tool::Paint,
             one_voxel_brush(),
             StrokeSpace::Volume3D,
-            sample,
+            initial_sample,
             CancellationToken::default(),
         );
         assert_eq!(state.document.as_ref().unwrap().summary().occupied_count, 2);
@@ -3155,11 +3159,135 @@ mod tests {
 
         state.apply_pointer_sample(StrokeSample {
             edit_id: 77,
-            sample,
+            sample: PointerSample::Ray {
+                ray: Ray {
+                    origin: [4.0, 0.1, 0.0],
+                    direction: [-1.0, 0.0, 0.0],
+                },
+            },
         });
 
         assert_eq!(state.document.as_ref().unwrap().summary().occupied_count, 2);
         assert_eq!(state.preview_generation, generation);
+    }
+
+    #[test]
+    fn nearby_ray_samples_do_not_tunnel_through_an_erased_surface_within_one_stroke() {
+        let mut state = state_with_empty_document([3, 1, 1]);
+        let document = state.document.as_mut().unwrap();
+        document.begin_stroke(1).unwrap();
+        document.apply_stroke_indices([0, 1, 2]).unwrap();
+        document.finish_stroke().unwrap();
+
+        state.begin_stroke(
+            78,
+            Tool::Erase,
+            one_voxel_brush(),
+            StrokeSpace::Volume3D,
+            PointerSample::Ray {
+                ray: Ray {
+                    origin: [4.0, 0.0, 0.0],
+                    direction: [-1.0, 0.0, 0.0],
+                },
+            },
+            CancellationToken::default(),
+        );
+        assert_eq!(state.document.as_ref().unwrap().summary().occupied_count, 2);
+        let generation = state.preview_generation;
+
+        state.apply_pointer_sample(StrokeSample {
+            edit_id: 78,
+            sample: PointerSample::Ray {
+                ray: Ray {
+                    origin: [4.0, 0.1, 0.0],
+                    direction: [-1.0, 0.0, 0.0],
+                },
+            },
+        });
+
+        assert_eq!(state.document.as_ref().unwrap().summary().occupied_count, 2);
+        assert_eq!(state.preview_generation, generation);
+    }
+
+    #[test]
+    fn one_layer_stroke_still_follows_distinct_surface_targets() {
+        let mut state = state_with_empty_document([3, 2, 1]);
+        let document = state.document.as_mut().unwrap();
+        document.begin_stroke(1).unwrap();
+        document.apply_stroke_indices([0, 3]).unwrap();
+        document.finish_stroke().unwrap();
+
+        state.begin_stroke(
+            79,
+            Tool::Paint,
+            one_voxel_brush(),
+            StrokeSpace::Volume3D,
+            PointerSample::Ray {
+                ray: Ray {
+                    origin: [4.0, 0.0, 0.0],
+                    direction: [-1.0, 0.0, 0.0],
+                },
+            },
+            CancellationToken::default(),
+        );
+        state.apply_pointer_sample(StrokeSample {
+            edit_id: 79,
+            sample: PointerSample::Ray {
+                ray: Ray {
+                    origin: [4.0, 1.0, 0.0],
+                    direction: [-1.0, 0.0, 0.0],
+                },
+            },
+        });
+
+        assert_eq!(state.document.as_ref().unwrap().summary().occupied_count, 4);
+        assert_eq!(
+            state.document.as_ref().unwrap().view().occupancy,
+            &[1, 1, 0, 1, 1, 0]
+        );
+    }
+
+    #[test]
+    fn a_new_stroke_can_intentionally_add_the_next_surface_layer() {
+        let mut state = state_with_empty_document([4, 1, 1]);
+        let document = state.document.as_mut().unwrap();
+        document.begin_stroke(1).unwrap();
+        document.apply_stroke_indices([0]).unwrap();
+        document.finish_stroke().unwrap();
+        let sample = PointerSample::Ray {
+            ray: Ray {
+                origin: [5.0, 0.0, 0.0],
+                direction: [-1.0, 0.0, 0.0],
+            },
+        };
+
+        state.begin_stroke(
+            80,
+            Tool::Paint,
+            one_voxel_brush(),
+            StrokeSpace::Volume3D,
+            sample,
+            CancellationToken::default(),
+        );
+        state.complete_stroke(80);
+        assert_eq!(state.document.as_ref().unwrap().summary().occupied_count, 2);
+
+        state.begin_stroke(
+            81,
+            Tool::Paint,
+            one_voxel_brush(),
+            StrokeSpace::Volume3D,
+            sample,
+            CancellationToken::default(),
+        );
+        state.complete_stroke(81);
+        assert_eq!(state.document.as_ref().unwrap().summary().occupied_count, 3);
+
+        let document = state.document.as_mut().unwrap();
+        document.undo().unwrap();
+        assert_eq!(document.summary().occupied_count, 2);
+        document.undo().unwrap();
+        assert_eq!(document.summary().occupied_count, 1);
     }
 
     #[test]

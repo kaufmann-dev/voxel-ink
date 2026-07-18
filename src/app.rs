@@ -1345,11 +1345,17 @@ impl VoxelInkApp {
                                 .wrap(),
                             );
                             ui.add_space(10.0);
-                            let action = egui::Button::new(
-                                egui::RichText::new("Fill enclosed cavities").strong(),
-                            )
-                            .min_size(egui::vec2(ui.available_width(), 38.0))
-                            .corner_radius(CONTROL_RADIUS);
+                            let mut action_text =
+                                egui::RichText::new("Fill enclosed cavities").strong();
+                            if let Some(color) = cavity_fill_action_text_color(
+                                ready,
+                                self.forced_colors,
+                            ) {
+                                action_text = action_text.color(color);
+                            }
+                            let action = egui::Button::new(action_text)
+                                .min_size(egui::vec2(ui.available_width(), 38.0))
+                                .corner_radius(CONTROL_RADIUS);
                             let action = if ready && !self.forced_colors {
                                 action
                                     .fill(TEAL)
@@ -3296,6 +3302,14 @@ fn status_chip(ui: &mut egui::Ui, label: &str, value: String, forced_colors: boo
         });
 }
 
+const fn cavity_fill_action_text_color(ready: bool, forced_colors: bool) -> Option<Color32> {
+    if ready && !forced_colors {
+        Some(BACKGROUND)
+    } else {
+        None
+    }
+}
+
 fn configure_style(ctx: &egui::Context, forced_colors: bool, reduced_motion: bool) {
     ctx.set_theme(egui::Theme::Dark);
     let mut visuals = egui::Visuals::dark();
@@ -3988,5 +4002,16 @@ mod tests {
             suggested_save_name(&summary, DialogPurpose::SaveCopy),
             "face-copy.nii.gz"
         );
+    }
+
+    #[test]
+    fn enabled_cavity_fill_action_uses_black_text_only_on_the_teal_fill() {
+        assert_eq!(
+            cavity_fill_action_text_color(true, false),
+            Some(Color32::BLACK)
+        );
+        assert_eq!(cavity_fill_action_text_color(false, false), None);
+        assert_eq!(cavity_fill_action_text_color(true, true), None);
+        assert_eq!(cavity_fill_action_text_color(false, true), None);
     }
 }
