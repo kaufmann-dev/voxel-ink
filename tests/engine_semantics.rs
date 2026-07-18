@@ -148,6 +148,81 @@ fn latest_sample_submission_remains_non_blocking_when_intermediate_samples_are_r
     }
 }
 
+#[test]
+fn engine_make_solid_handles_open_anatomy_and_undo() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("open-interior.binvox");
+    let dimensions = [5, 5, 5];
+    let mut occupancy = vec![0; 125];
+    for voxel in [[1, 2, 2], [3, 2, 2], [2, 1, 2], [2, 3, 2]] {
+        let index = voxel[0] + dimensions[0] * (voxel[1] + dimensions[1] * voxel[2]);
+        occupancy[index as usize] = 1;
+    }
+    write_binvox(&path, dimensions, &occupancy);
+
+    let engine = EngineHandle::spawn(egui::Context::default());
+    engine.start_load(path).unwrap();
+    let replaced = wait_for_event(&engine, |event| {
+        matches!(event, EngineEvent::DocumentReplaced { .. })
+    });
+    let EngineEvent::DocumentReplaced { epoch, .. } = replaced else {
+        unreachable!()
+    };
+
+    let job_id = engine.start_make_solid().unwrap();
+    let made_solid = wait_for_event(&engine, |event| {
+        matches!(
+            event,
+            EngineEvent::MadeSolid {
+                epoch: event_epoch,
+                revision: 2,
+                added_voxels: 1,
+            } if *event_epoch == epoch
+        )
+    });
+    assert!(matches!(
+        made_solid,
+        EngineEvent::MadeSolid {
+            added_voxels: 1,
+            ..
+        }
+    ));
+    wait_for_event(&engine, |event| {
+        matches!(
+            event,
+            EngineEvent::Busy {
+                job_id: event_job,
+                active: false,
+                ..
+            } if *event_job == job_id
+        )
+    });
+
+    engine.send(EngineCommand::Undo).unwrap();
+    let undone = wait_for_event(&engine, |event| {
+        matches!(
+            event,
+            EngineEvent::Summary { epoch: event_epoch, summary }
+                if *event_epoch == epoch && summary.revision == 1
+        )
+    });
+    let EngineEvent::Summary { summary, .. } = undone else {
+        unreachable!()
+    };
+    assert_eq!(summary.occupied_count, 4);
+    assert!(summary.can_redo);
+    wait_for_event(&engine, |event| {
+        matches!(
+            event,
+            EngineEvent::MeshReset {
+                epoch: event_epoch,
+                revision: 1,
+                ..
+            } if *event_epoch == epoch
+        )
+    });
+}
+
 fn wait_for_summary(
     engine: &EngineHandle,
     expected_epoch: u64,

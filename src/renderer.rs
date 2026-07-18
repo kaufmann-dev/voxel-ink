@@ -147,6 +147,7 @@ struct SceneState {
     yaw: f32,
     pitch: f32,
     zoom: f32,
+    pan_ndc: egui::Vec2,
     aspect: f32,
     updates: VecDeque<SceneUpdate>,
 }
@@ -166,6 +167,7 @@ impl Default for SceneState {
             yaw: 0.65,
             pitch: -0.45,
             zoom: 1.0,
+            pan_ndc: egui::Vec2::ZERO,
             aspect: 1.0,
             updates: VecDeque::new(),
         }
@@ -186,6 +188,9 @@ impl SceneBridge {
 
     pub fn reset(&self, epoch: u64, revision: u64, dimensions: [u32; 3], affine: Matrix4) {
         let mut state = self.state.lock().expect("3D scene state poisoned");
+        if state.epoch != epoch {
+            reset_navigation(&mut state);
+        }
         state.epoch = epoch;
         state.revision = revision;
         state.dimensions = dimensions;
@@ -223,8 +228,30 @@ impl SceneBridge {
 
     pub fn orbit(&self, delta: egui::Vec2) {
         let mut state = self.state.lock().expect("3D scene state poisoned");
-        state.yaw += delta.x * 0.008;
+        state.yaw -= delta.x * 0.008;
         state.pitch = (state.pitch + delta.y * 0.008).clamp(-1.5, 1.5);
+    }
+
+    pub fn pan(&self, delta_pixels: egui::Vec2, viewport_size: egui::Vec2) {
+        if !delta_pixels.x.is_finite()
+            || !delta_pixels.y.is_finite()
+            || !viewport_size.x.is_finite()
+            || !viewport_size.y.is_finite()
+            || viewport_size.x <= 0.0
+            || viewport_size.y <= 0.0
+        {
+            return;
+        }
+        let mut state = self.state.lock().expect("3D scene state poisoned");
+        state.pan_ndc += egui::vec2(
+            2.0 * delta_pixels.x / viewport_size.x,
+            -2.0 * delta_pixels.y / viewport_size.y,
+        );
+    }
+
+    pub fn reset_view(&self) {
+        let mut state = self.state.lock().expect("3D scene state poisoned");
+        reset_navigation(&mut state);
     }
 
     pub fn zoom(&self, factor: f32) {
@@ -254,6 +281,14 @@ impl SceneBridge {
     pub fn take_remesh_request(&self) -> bool {
         self.needs_remesh.swap(false, Ordering::AcqRel)
     }
+}
+
+fn reset_navigation(state: &mut SceneState) {
+    let defaults = SceneState::default();
+    state.yaw = defaults.yaw;
+    state.pitch = defaults.pitch;
+    state.zoom = defaults.zoom;
+    state.pan_ndc = defaults.pan_ndc;
 }
 
 pub struct VolumePaintCallback {
@@ -530,12 +565,13 @@ fn scene_camera(state: &SceneState) -> (Mat4, Mat4, Mat4) {
     );
     let eye = center + direction * radius * 2.6 / state.zoom;
     let view = Mat4::look_at_rh(eye, center, Vec3::Z);
-    let projection = Mat4::perspective_rh(
-        45_f32.to_radians(),
-        state.aspect,
-        radius * 0.01,
-        radius * 12.0,
-    );
+    let projection = Mat4::from_translation(Vec3::new(state.pan_ndc.x, state.pan_ndc.y, 0.0))
+        * Mat4::perspective_rh(
+            45_f32.to_radians(),
+            state.aspect,
+            radius * 0.01,
+            radius * 12.0,
+        );
     (view, projection, affine)
 }
 
@@ -611,6 +647,107 @@ mod tests {
         let (view, _, _) = scene_camera(&state);
         let eye = view.inverse().transform_point3(Vec3::ZERO);
         assert!(eye.length() > 200.0);
+    }
+
+    #[test]
+    fn horizontal_orbit_reverses_drag_direction() {
+        let bridge = SceneBridge::default();
+        let initial_yaw = bridge.state.lock().unwrap().yaw;
+
+        bridge.orbit(egui::vec2(25.0, 0.0));
+
+        let state = bridge.state.lock().unwrap();
+        assert!(state.yaw < initial_yaw);
+        assert!((state.yaw - (initial_yaw - 0.2)).abs() < f32::EPSILON);
+        assert_eq!(state.pitch, SceneState::default().pitch);
+    }
+
+    #[test]
+    fn pan_moves_projected_volume_by_the_drag_delta() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let drag = egui::vec2(80.0, -45.0);
+        let bridge = SceneBridge::default();
+        bridge.set_aspect(viewport.x / viewport.y);
+        let before = {
+            let state = bridge.state.lock().unwrap();
+            project_to_viewport(&state, Vec3::ZERO, viewport)
+        };
+
+        bridge.pan(drag, viewport);
+
+        let after = {
+            let state = bridge.state.lock().unwrap();
+            project_to_viewport(&state, Vec3::ZERO, viewport)
+        };
+        let projected_delta = after - before;
+        assert!((projected_delta.x - drag.x).abs() < 0.001);
+        assert!((projected_delta.y - drag.y).abs() < 0.001);
+    }
+
+    #[test]
+    fn navigation_survives_remesh_reset_and_clears_for_a_new_document() {
+        let bridge = SceneBridge::default();
+        let affine = SceneState::default().affine;
+        bridge.reset(4, 1, [32; 3], affine);
+        bridge.pan(egui::vec2(40.0, -30.0), egui::vec2(800.0, 600.0));
+        bridge.orbit(egui::vec2(25.0, 10.0));
+        bridge.zoom(1.5);
+        let navigation = {
+            let state = bridge.state.lock().unwrap();
+            (state.pan_ndc, state.yaw, state.pitch, state.zoom)
+        };
+
+        bridge.reset(4, 2, [32; 3], affine);
+        {
+            let state = bridge.state.lock().unwrap();
+            assert_eq!(
+                (state.pan_ndc, state.yaw, state.pitch, state.zoom),
+                navigation
+            );
+        }
+
+        bridge.reset(5, 1, [32; 3], affine);
+        let state = bridge.state.lock().unwrap();
+        let defaults = SceneState::default();
+        assert_eq!(state.pan_ndc, defaults.pan_ndc);
+        assert_eq!(state.yaw, defaults.yaw);
+        assert_eq!(state.pitch, defaults.pitch);
+        assert_eq!(state.zoom, defaults.zoom);
+    }
+
+    #[test]
+    fn reset_view_restores_navigation_defaults_without_changing_the_document() {
+        let bridge = SceneBridge::default();
+        let affine = SceneState::default().affine;
+        bridge.reset(7, 12, [32; 3], affine);
+        bridge.orbit(egui::vec2(40.0, 25.0));
+        bridge.pan(egui::vec2(80.0, -30.0), egui::vec2(800.0, 600.0));
+        bridge.zoom(2.0);
+
+        bridge.reset_view();
+
+        let state = bridge.state.lock().unwrap();
+        let defaults = SceneState::default();
+        assert_eq!(state.epoch, 7);
+        assert_eq!(state.revision, 12);
+        assert_eq!(state.dimensions, [32; 3]);
+        assert_eq!(state.yaw, defaults.yaw);
+        assert_eq!(state.pitch, defaults.pitch);
+        assert_eq!(state.zoom, defaults.zoom);
+        assert_eq!(state.pan_ndc, defaults.pan_ndc);
+    }
+
+    fn project_to_viewport(
+        state: &SceneState,
+        world_position: Vec3,
+        viewport: egui::Vec2,
+    ) -> egui::Vec2 {
+        let (view, projection, _) = scene_camera(state);
+        let ndc = (projection * view).project_point3(world_position);
+        egui::vec2(
+            (ndc.x + 1.0) * 0.5 * viewport.x,
+            (1.0 - ndc.y) * 0.5 * viewport.y,
+        )
     }
 
     #[test]

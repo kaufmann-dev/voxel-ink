@@ -36,6 +36,12 @@ fn toolbar_exposes_names_disabled_state_focus_order_and_tool_state() {
             "{label} should be disabled without a document"
         );
     }
+    assert!(
+        harness
+            .get_by_label("Make solid left ↔ right")
+            .accesskit_node()
+            .is_disabled()
+    );
 
     assert_eq!(tool_toggled(&harness, "Inspect (I)"), Some(Toggled::True));
     assert_eq!(tool_toggled(&harness, "Brush (B)"), Some(Toggled::False));
@@ -60,7 +66,7 @@ fn toolbar_exposes_names_disabled_state_focus_order_and_tool_state() {
     assert_eq!(tool_toggled(&harness, "Brush (B)"), Some(Toggled::True));
     assert!(
         !harness
-            .get_by_role_and_label(Role::Slider, "brush diameter")
+            .get_by_role_and_label(Role::Slider, "brush size in voxels")
             .accesskit_node()
             .is_disabled()
     );
@@ -73,7 +79,7 @@ fn toolbar_exposes_names_disabled_state_focus_order_and_tool_state() {
     assert_eq!(tool_toggled(&harness, "Inspect (I)"), Some(Toggled::True));
     assert!(
         harness
-            .get_by_role_and_label(Role::Slider, "brush diameter")
+            .get_by_role_and_label(Role::Slider, "brush size in voxels")
             .accesskit_node()
             .is_disabled()
     );
@@ -117,6 +123,76 @@ fn loaded_document_has_synchronized_named_panes_and_keyboard_editing() {
     wait_for_label(&mut harness, "1 occupied");
     wait_for_label(&mut harness, "modified");
     assert_eq!(tool_toggled(&harness, "Brush (B)"), Some(Toggled::True));
+}
+
+#[test]
+fn every_view_can_use_the_full_workspace_and_escape_restores_the_grid() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("maximize.binvox");
+    write_binvox(&path, [4, 3, 2], &[0; 24]);
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "4 × 3 × 2");
+
+    for (button, visible_editor) in [
+        ("Full screen Axial", "Axial slice editor"),
+        ("Full screen Coronal", "Coronal slice editor"),
+        ("Full screen Sagittal", "Sagittal slice editor"),
+        ("Full screen 3D", "Interactive 3D volume editor"),
+    ] {
+        harness.get_by_label(button).click_accesskit();
+        harness.step();
+        harness.step();
+        assert!(harness.query_by_label("Restore four views").is_some());
+        for editor in [
+            "Axial slice editor",
+            "Coronal slice editor",
+            "Sagittal slice editor",
+            "Interactive 3D volume editor",
+        ] {
+            assert_eq!(
+                harness.query_by_label(editor).is_some(),
+                editor == visible_editor,
+                "{button} showed the wrong workspace content"
+            );
+        }
+
+        harness.key_press(egui::Key::Escape);
+        harness.step();
+        harness.step();
+        for editor in [
+            "Axial slice editor",
+            "Coronal slice editor",
+            "Sagittal slice editor",
+            "Interactive 3D volume editor",
+        ] {
+            assert!(harness.query_by_label(editor).is_some());
+        }
+    }
+    assert!(harness.query_by_label("Reset view").is_some());
+}
+
+#[test]
+fn make_solid_is_a_single_clear_action_with_visible_feedback() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("make-solid.binvox");
+    let dimensions = [5, 5, 5];
+    let mut occupancy = vec![0; 125];
+    for x in [1, 3] {
+        occupancy[(x + dimensions[0] * (2 + dimensions[1] * 2)) as usize] = 1;
+    }
+    write_binvox(&path, dimensions, &occupancy);
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "2 occupied");
+
+    let action = harness.get_by_label("Make solid left ↔ right");
+    assert!(!action.accesskit_node().is_disabled());
+    action.click();
+    harness.step();
+
+    wait_for_label(&mut harness, "3 occupied");
+    wait_for_label(&mut harness, "Solid left ↔ right: +1 voxel");
+    wait_for_label(&mut harness, "modified");
+    assert!(!harness.get_by_label("Undo").accesskit_node().is_disabled());
 }
 
 #[test]
@@ -262,6 +338,25 @@ fn forced_colors_and_reduced_motion_are_applied() {
         assert_eq!(visuals.selection.bg_fill, egui::Color32::WHITE);
         assert_eq!(visuals.widgets.inactive.bg_fill, egui::Color32::BLACK);
         assert_eq!(visuals.widgets.hovered.bg_fill, egui::Color32::WHITE);
+        assert_eq!(visuals.window_corner_radius, egui::CornerRadius::ZERO);
+        assert_eq!(visuals.menu_corner_radius, egui::CornerRadius::ZERO);
+        assert_eq!(
+            visuals.widgets.noninteractive.corner_radius,
+            egui::CornerRadius::ZERO
+        );
+        assert_eq!(
+            visuals.widgets.inactive.corner_radius,
+            egui::CornerRadius::ZERO
+        );
+        assert_eq!(
+            visuals.widgets.hovered.corner_radius,
+            egui::CornerRadius::ZERO
+        );
+        assert_eq!(
+            visuals.widgets.active.corner_radius,
+            egui::CornerRadius::ZERO
+        );
+        assert_eq!(visuals.widgets.open.corner_radius, egui::CornerRadius::ZERO);
         assert_eq!(harness.state().animation_time, 0.0);
         assert!(contrast_ratio(egui::Color32::WHITE, egui::Color32::BLACK) >= 7.0);
         return;

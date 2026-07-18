@@ -2,6 +2,7 @@ use std::{collections::HashSet, path::PathBuf, time::SystemTime};
 
 use crate::{
     AppError, Result,
+    cancel::CancellationToken,
     codecs::{CodecSaveState, SourceVariant},
     error::checked_voxel_count,
 };
@@ -154,7 +155,7 @@ pub struct VolumeView<'a> {
 
 #[derive(Clone, Debug)]
 struct Transaction {
-    indices: Vec<u32>,
+    changes: TransactionChanges,
     value: u8,
     before_revision: u64,
     after_revision: u64,
@@ -162,8 +163,51 @@ struct Transaction {
 
 impl Transaction {
     const fn bytes(&self) -> usize {
-        self.indices.len() * size_of::<u32>()
+        self.changes.bytes()
     }
+
+    fn voxel_count(&self) -> u64 {
+        self.changes.voxel_count()
+    }
+
+    fn indices(&self) -> Option<&[u32]> {
+        match &self.changes {
+            TransactionChanges::Indices(indices) => Some(indices),
+            TransactionChanges::Spans(_) => None,
+        }
+    }
+
+    const fn requires_full_mesh_reset(&self) -> bool {
+        matches!(&self.changes, TransactionChanges::Spans(_))
+    }
+}
+
+#[derive(Clone, Debug)]
+enum TransactionChanges {
+    Indices(Vec<u32>),
+    Spans(Vec<IndexSpan>),
+}
+
+impl TransactionChanges {
+    const fn bytes(&self) -> usize {
+        match self {
+            Self::Indices(indices) => indices.len() * size_of::<u32>(),
+            Self::Spans(spans) => spans.len() * size_of::<IndexSpan>(),
+        }
+    }
+
+    fn voxel_count(&self) -> u64 {
+        match self {
+            Self::Indices(indices) => indices.len() as u64,
+            Self::Spans(spans) => spans.iter().map(|span| u64::from(span.len)).sum(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IndexSpan {
+    start: u32,
+    len: u32,
 }
 
 #[derive(Debug)]
@@ -394,7 +438,7 @@ impl VolumeDocument {
         }
         let after_revision = self.allocate_revision();
         let transaction = Transaction {
-            indices: stroke.indices,
+            changes: TransactionChanges::Indices(stroke.indices),
             value: stroke.value,
             before_revision: stroke.before_revision,
             after_revision,
@@ -423,6 +467,129 @@ impl VolumeDocument {
         }
     }
 
+    /// Fill gaps between the first and last occupied voxel on each left-to-right
+    /// scanline. This solidifies open anatomy without relying on a watertight shell.
+    pub fn make_solid(&mut self, cancel: &CancellationToken) -> Result<u64> {
+        self.cancel_stroke();
+        cancel.check()?;
+
+        let [nx, ny, nz] = self.geometry.dimensions.map(|axis| axis as usize);
+        let fill_axis = left_right_axis(&self.geometry);
+        let line_count = match fill_axis {
+            0 => ny.checked_mul(nz),
+            1 => nx.checked_mul(nz),
+            2 => nx.checked_mul(ny),
+            _ => unreachable!("a volume has exactly three axes"),
+        }
+        .ok_or(AppError::Allocation { bytes: usize::MAX })?;
+        let mut line_bounds = allocate_line_bounds(line_count)?;
+        let plane = nx
+            .checked_mul(ny)
+            .ok_or(AppError::Allocation { bytes: usize::MAX })?;
+
+        for z in 0..nz {
+            cancel.check()?;
+            for y in 0..ny {
+                let row = z * plane + y * nx;
+                for x in 0..nx {
+                    if self.occupancy[row + x] == 0 {
+                        continue;
+                    }
+                    let (line, coordinate) = match fill_axis {
+                        0 => (z * ny + y, x as u32),
+                        1 => (z * nx + x, y as u32),
+                        2 => (y * nx + x, z as u32),
+                        _ => unreachable!("a volume has exactly three axes"),
+                    };
+                    update_line_bounds(&mut line_bounds[line], coordinate);
+                }
+            }
+        }
+
+        let max_spans = HISTORY_BYTES / size_of::<IndexSpan>();
+        let mut spans: Vec<IndexSpan> = Vec::new();
+        let initial_capacity = line_count.min(64 * 1024);
+        spans
+            .try_reserve(initial_capacity)
+            .map_err(|_| AppError::Allocation {
+                bytes: initial_capacity * size_of::<IndexSpan>(),
+            })?;
+        let mut added = 0_u64;
+        for z in 0..nz {
+            cancel.check()?;
+            for y in 0..ny {
+                let row = z * plane + y * nx;
+                for x in 0..nx {
+                    let index = row + x;
+                    if self.occupancy[index] != 0 {
+                        continue;
+                    }
+                    let (line, coordinate) = match fill_axis {
+                        0 => (z * ny + y, x as u32),
+                        1 => (z * nx + x, y as u32),
+                        2 => (y * nx + x, z as u32),
+                        _ => unreachable!("a volume has exactly three axes"),
+                    };
+                    if !is_between(coordinate, line_bounds[line]) {
+                        continue;
+                    }
+                    added += 1;
+                    let index = index as u32;
+                    if let Some(last) = spans.last_mut()
+                        && last.start.checked_add(last.len) == Some(index)
+                    {
+                        last.len += 1;
+                        continue;
+                    }
+                    if spans.len() == max_spans {
+                        return Err(AppError::UndoHistoryLimit {
+                            bytes: HISTORY_BYTES + size_of::<IndexSpan>(),
+                            limit: HISTORY_BYTES,
+                        });
+                    }
+                    if spans.len() == spans.capacity() {
+                        let additional = (64 * 1024).min(max_spans - spans.len());
+                        spans
+                            .try_reserve(additional)
+                            .map_err(|_| AppError::Allocation {
+                                bytes: (spans.len() + additional) * size_of::<IndexSpan>(),
+                            })?;
+                    }
+                    spans.push(IndexSpan {
+                        start: index,
+                        len: 1,
+                    });
+                }
+            }
+        }
+
+        cancel.check()?;
+        if spans.is_empty() {
+            return Ok(0);
+        }
+        for span in &spans {
+            let start = span.start as usize;
+            let end = start + span.len as usize;
+            self.occupancy[start..end].fill(1);
+        }
+        self.occupied_count += added;
+        let before_revision = self.revision;
+        let after_revision = self.allocate_revision();
+        let transaction = Transaction {
+            changes: TransactionChanges::Spans(spans),
+            value: 1,
+            before_revision,
+            after_revision,
+        };
+        self.history_bytes += transaction.bytes();
+        self.undo.push(transaction);
+        self.history_bytes -= self.redo.iter().map(Transaction::bytes).sum::<usize>();
+        self.redo.clear();
+        self.revision = after_revision;
+        self.trim_history();
+        Ok(added)
+    }
+
     pub fn undo(&mut self) -> Option<u64> {
         self.cancel_stroke();
         let transaction = self.undo.pop()?;
@@ -445,16 +612,26 @@ impl VolumeDocument {
 
     #[must_use]
     pub(crate) fn latest_undo_indices(&self) -> Option<&[u32]> {
-        self.undo
-            .last()
-            .map(|transaction| transaction.indices.as_slice())
+        self.undo.last().and_then(Transaction::indices)
     }
 
     #[must_use]
     pub(crate) fn latest_redo_indices(&self) -> Option<&[u32]> {
+        self.redo.last().and_then(Transaction::indices)
+    }
+
+    #[must_use]
+    pub(crate) fn latest_undo_requires_full_mesh_reset(&self) -> bool {
+        self.undo
+            .last()
+            .is_some_and(Transaction::requires_full_mesh_reset)
+    }
+
+    #[must_use]
+    pub(crate) fn latest_redo_requires_full_mesh_reset(&self) -> bool {
         self.redo
             .last()
-            .map(|transaction| transaction.indices.as_slice())
+            .is_some_and(Transaction::requires_full_mesh_reset)
     }
 
     pub fn mark_saved(&mut self, identity: SourceIdentity, variant: SourceVariant, adopt: bool) {
@@ -531,10 +708,21 @@ impl VolumeDocument {
     }
 
     fn apply_transaction(&mut self, transaction: &Transaction, value: u8) {
-        for &index in &transaction.indices {
-            self.occupancy[index as usize] = value;
+        match &transaction.changes {
+            TransactionChanges::Indices(indices) => {
+                for &index in indices {
+                    self.occupancy[index as usize] = value;
+                }
+            }
+            TransactionChanges::Spans(spans) => {
+                for span in spans {
+                    let start = span.start as usize;
+                    let end = start + span.len as usize;
+                    self.occupancy[start..end].fill(value);
+                }
+            }
         }
-        let count = transaction.indices.len() as u64;
+        let count = transaction.voxel_count();
         if value == 1 {
             self.occupied_count += count;
         } else {
@@ -548,6 +736,36 @@ impl VolumeDocument {
             self.history_bytes -= removed.bytes();
         }
     }
+}
+
+fn allocate_line_bounds(len: usize) -> Result<Vec<[u32; 2]>> {
+    let bytes = len
+        .checked_mul(size_of::<[u32; 2]>())
+        .ok_or(AppError::Allocation { bytes: usize::MAX })?;
+    let mut bounds = Vec::new();
+    bounds
+        .try_reserve_exact(len)
+        .map_err(|_| AppError::Allocation { bytes })?;
+    bounds.resize(len, [u32::MAX, 0]);
+    Ok(bounds)
+}
+
+fn update_line_bounds(bounds: &mut [u32; 2], coordinate: u32) {
+    bounds[0] = bounds[0].min(coordinate);
+    bounds[1] = bounds[1].max(coordinate);
+}
+
+const fn is_between(coordinate: u32, bounds: [u32; 2]) -> bool {
+    bounds[0] < coordinate && coordinate < bounds[1]
+}
+
+fn left_right_axis(geometry: &VolumeGeometry) -> usize {
+    (0..3)
+        .max_by(|&left, &right| {
+            (geometry.index_to_world[0][left].abs() / geometry.spacing[left])
+                .total_cmp(&(geometry.index_to_world[0][right].abs() / geometry.spacing[right]))
+        })
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -687,5 +905,34 @@ mod tests {
         for axis in 0..3 {
             assert!((recovered[axis] - point[axis]).abs() < 1.0e-10);
         }
+    }
+
+    #[test]
+    fn left_right_fill_axis_uses_affine_orientation_not_voxel_scale() {
+        let geometry = VolumeGeometry::new(
+            [3, 3, 3],
+            [
+                [0.0, -4.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 3.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            SpatialUnits::Millimeter,
+        )
+        .unwrap();
+
+        assert_eq!(left_right_axis(&geometry), 1);
+    }
+
+    #[test]
+    fn solidification_history_cost_tracks_runs_instead_of_voxels() {
+        let changes = TransactionChanges::Spans(vec![IndexSpan {
+            start: 7,
+            len: 50_000_000,
+        }]);
+
+        assert_eq!(changes.voxel_count(), 50_000_000);
+        assert_eq!(changes.bytes(), size_of::<IndexSpan>());
+        assert!(changes.bytes() < HISTORY_BYTES);
     }
 }

@@ -3,6 +3,7 @@ mod common;
 use std::{path::PathBuf, time::SystemTime};
 
 use voxel_ink::{
+    cancel::CancellationToken,
     codecs::SourceVariant,
     volume::{HISTORY_BYTES, HISTORY_TRANSACTIONS, SourceIdentity},
 };
@@ -129,4 +130,51 @@ fn invalid_stroke_inputs_do_not_silently_corrupt_the_document() {
     document.cancel_stroke();
     assert_eq!(document.view().occupancy, &[0, 0]);
     assert_eq!(document.occupied_count(), 0);
+}
+
+#[test]
+fn make_solid_fills_leaky_interiors_as_one_undoable_edit() {
+    let dimensions = [5, 5, 5];
+    let mut occupancy = vec![0; 125];
+    for voxel in [[1, 2, 2], [3, 2, 2], [2, 1, 2], [2, 3, 2]] {
+        let index = voxel[0] + dimensions[0] * (voxel[1] + dimensions[1] * voxel[2]);
+        occupancy[index as usize] = 1;
+    }
+    let mut document = make_document(dimensions, occupancy.clone(), false);
+
+    assert_eq!(
+        document.make_solid(&CancellationToken::default()).unwrap(),
+        1
+    );
+    assert_eq!(document.value([2, 2, 2]), Some(1));
+    assert_eq!(document.value([2, 2, 0]), Some(0));
+    assert_eq!(document.revision(), 2);
+    assert_eq!(document.occupied_count(), 5);
+    assert!(document.summary().can_undo);
+
+    assert_eq!(document.undo(), Some(1));
+    assert_eq!(document.view().occupancy, occupancy);
+    assert_eq!(document.redo(), Some(2));
+    assert_eq!(document.value([2, 2, 2]), Some(1));
+    assert_eq!(
+        document.make_solid(&CancellationToken::default()).unwrap(),
+        0,
+        "an already-solid volume must not create an empty revision"
+    );
+    assert_eq!(document.revision(), 2);
+}
+
+#[test]
+fn make_solid_cancellation_is_atomic() {
+    let mut document = make_document([3, 3, 3], vec![0; 27], false);
+    let cancel = CancellationToken::default();
+    cancel.cancel();
+
+    assert!(matches!(
+        document.make_solid(&cancel),
+        Err(voxel_ink::AppError::Cancelled)
+    ));
+    assert_eq!(document.view().occupancy, &[0; 27]);
+    assert_eq!(document.revision(), 1);
+    assert!(!document.summary().can_undo);
 }

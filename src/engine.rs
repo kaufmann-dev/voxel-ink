@@ -34,6 +34,7 @@ pub type JobId = u64;
 pub enum BusyKind {
     Loading,
     Saving,
+    MakingSolid,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,6 +83,10 @@ pub enum EngineCommand {
     CancelStroke,
     Undo,
     Redo,
+    MakeSolid {
+        job_id: JobId,
+        cancel: CancellationToken,
+    },
     Save {
         job_id: JobId,
         destination: PathBuf,
@@ -143,6 +148,11 @@ pub enum EngineEvent {
         job_id: JobId,
         mode: SaveMode,
         summary: DocumentSummary,
+    },
+    MadeSolid {
+        epoch: u64,
+        revision: u64,
+        added_voxels: u64,
     },
     MeshReset {
         epoch: u64,
@@ -267,6 +277,26 @@ impl EngineHandle {
             mode,
             cancel,
         }) {
+            Ok(()) => Ok(job_id),
+            Err(error) => {
+                self.jobs
+                    .lock()
+                    .expect("job registry poisoned")
+                    .remove(&job_id);
+                Err(match error {
+                    TrySendError::Full(_) => AppError::EngineBusy,
+                    TrySendError::Disconnected(_) => AppError::ChannelDisconnected,
+                })
+            }
+        }
+    }
+
+    pub fn start_make_solid(&self) -> Result<JobId> {
+        let (job_id, cancel) = self.new_job();
+        match self
+            .commands
+            .try_send(EngineCommand::MakeSolid { job_id, cancel })
+        {
             Ok(()) => Ok(job_id),
             Err(error) => {
                 self.jobs
@@ -452,6 +482,7 @@ impl EngineState {
             EngineCommand::CancelStroke => self.cancel_stroke(),
             EngineCommand::Undo => self.undo(),
             EngineCommand::Redo => self.redo(),
+            EngineCommand::MakeSolid { job_id, cancel } => self.make_solid(job_id, cancel),
             EngineCommand::Save {
                 job_id,
                 destination,
@@ -555,6 +586,65 @@ impl EngineState {
             Err(error) => self.emit_error(Some(job_id), error),
         }
         self.finish_job(job_id, BusyKind::Saving);
+    }
+
+    fn make_solid(&mut self, job_id: JobId, cancel: CancellationToken) {
+        self.emit(EngineEvent::Busy {
+            job_id,
+            kind: BusyKind::MakingSolid,
+            active: true,
+        });
+        self.cancel_stroke();
+        self.mesh_cancel.cancel();
+        let result = self
+            .document
+            .as_mut()
+            .ok_or(AppError::NoDocument)
+            .and_then(|document| document.make_solid(&cancel));
+        match result {
+            Ok(added_voxels) => {
+                let Some(document) = self.document.as_ref() else {
+                    self.finish_job(job_id, BusyKind::MakingSolid);
+                    return;
+                };
+                let summary = document.summary();
+                let revision = document.revision();
+                let slices = match visible_slices(document) {
+                    Ok(slices) => slices,
+                    Err(error) => {
+                        self.emit_error(Some(job_id), error);
+                        self.reset_mesh_preview();
+                        self.finish_job(job_id, BusyKind::MakingSolid);
+                        return;
+                    }
+                };
+                self.emit(EngineEvent::Summary {
+                    epoch: self.epoch,
+                    summary,
+                });
+                self.emit(EngineEvent::SlicesReplaced {
+                    epoch: self.epoch,
+                    revision,
+                    slices,
+                });
+                if added_voxels == 0 {
+                    self.resume_mesh_after_cancel();
+                } else {
+                    self.reset_mesh_preview();
+                }
+                self.emit(EngineEvent::MadeSolid {
+                    epoch: self.epoch,
+                    revision,
+                    added_voxels,
+                });
+            }
+            Err(AppError::Cancelled) => self.resume_mesh_after_cancel(),
+            Err(error) => {
+                self.resume_mesh_after_cancel();
+                self.emit_error(Some(job_id), error);
+            }
+        }
+        self.finish_job(job_id, BusyKind::MakingSolid);
     }
 
     fn finish_job(&self, job_id: JobId, kind: BusyKind) {
@@ -861,16 +951,20 @@ impl EngineState {
         if document.undo().is_none() {
             return;
         }
-        let invalidated = document
-            .latest_redo_indices()
-            .map(|indices| {
-                invalidated_chunks_for_indices_bounded(
-                    document.geometry().dimensions,
-                    indices.iter().copied(),
-                    self.mesh_capacity,
-                )
-            })
-            .unwrap_or_else(|| Some(Vec::new()));
+        let invalidated = if document.latest_redo_requires_full_mesh_reset() {
+            None
+        } else {
+            document
+                .latest_redo_indices()
+                .map(|indices| {
+                    invalidated_chunks_for_indices_bounded(
+                        document.geometry().dimensions,
+                        indices.iter().copied(),
+                        self.mesh_capacity,
+                    )
+                })
+                .unwrap_or_else(|| Some(Vec::new()))
+        };
         let revision = document.revision();
         let summary = document.summary();
         let slices = match visible_slices(document) {
@@ -904,16 +998,20 @@ impl EngineState {
         if document.redo().is_none() {
             return;
         }
-        let invalidated = document
-            .latest_undo_indices()
-            .map(|indices| {
-                invalidated_chunks_for_indices_bounded(
-                    document.geometry().dimensions,
-                    indices.iter().copied(),
-                    self.mesh_capacity,
-                )
-            })
-            .unwrap_or_else(|| Some(Vec::new()));
+        let invalidated = if document.latest_undo_requires_full_mesh_reset() {
+            None
+        } else {
+            document
+                .latest_undo_indices()
+                .map(|indices| {
+                    invalidated_chunks_for_indices_bounded(
+                        document.geometry().dimensions,
+                        indices.iter().copied(),
+                        self.mesh_capacity,
+                    )
+                })
+                .unwrap_or_else(|| Some(Vec::new()))
+        };
         let revision = document.revision();
         let summary = document.summary();
         let slices = match visible_slices(document) {

@@ -13,7 +13,7 @@ use crate::{
     engine::{BusyKind, JobId, PointerSample, SlicePatch, StrokeSpace},
     io::SaveMode,
     renderer::{SceneBridge, VolumePaintCallback},
-    volume::{DocumentSummary, SliceAxis, SliceImage, Tool},
+    volume::{DocumentSummary, SliceAxis, SliceImage, SpatialUnits, Tool},
 };
 
 const LOGO_BYTES: &[u8] = include_bytes!("../assets/voxel-ink.png");
@@ -80,6 +80,12 @@ struct FrameStrokeActions {
     complete: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkspacePane {
+    Slice(SliceAxis),
+    Volume3D,
+}
+
 pub struct VoxelInkApp {
     egui_ctx: egui::Context,
     engine: EngineHandle,
@@ -109,6 +115,7 @@ pub struct VoxelInkApp {
     stroke_active: bool,
     stroke_completion_pending: bool,
     pane_keyboard_focus: bool,
+    maximized_pane: Option<WorkspacePane>,
 }
 
 impl VoxelInkApp {
@@ -180,6 +187,7 @@ impl VoxelInkApp {
             stroke_active: false,
             stroke_completion_pending: false,
             pane_keyboard_focus: false,
+            maximized_pane: None,
         };
         if let Some(path) = initial_path
             && let Err(error) = app.engine.start_load(path)
@@ -240,6 +248,7 @@ impl VoxelInkApp {
                     self.summary = Some(summary);
                     self.stroke_active = false;
                     self.stroke_completion_pending = false;
+                    self.maximized_pane = None;
                     self.replace_slices(ctx, slices);
                     self.preview_notice = None;
                 }
@@ -252,11 +261,19 @@ impl VoxelInkApp {
                     self.slice_preview_generation = 0;
                     self.stroke_active = false;
                     self.stroke_completion_pending = false;
+                    self.maximized_pane = None;
                     self.scene.clear();
                     self.preview_notice = None;
                 }
                 EngineEvent::Summary { epoch, summary } if epoch == self.epoch => {
+                    let revision_changed = self
+                        .summary
+                        .as_ref()
+                        .is_some_and(|current| current.revision != summary.revision);
                     self.summary = Some(summary);
+                    if revision_changed {
+                        self.preview_notice = None;
+                    }
                 }
                 EngineEvent::SlicesReplaced {
                     epoch,
@@ -308,6 +325,17 @@ impl VoxelInkApp {
                             self.execute_guard(action);
                         }
                     }
+                }
+                EngineEvent::MadeSolid {
+                    epoch,
+                    revision: _,
+                    added_voxels,
+                } if epoch == self.epoch => {
+                    self.preview_notice = Some(if added_voxels == 0 {
+                        "Already solid left ↔ right".into()
+                    } else {
+                        solidify_notice(self.summary.as_ref(), added_voxels)
+                    });
                 }
                 EngineEvent::MeshReset {
                     epoch,
@@ -398,6 +426,12 @@ impl VoxelInkApp {
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         if self.prompt.is_some() || self.error_message.is_some() || !self.busy.is_empty() {
             return;
+        }
+        if self.maximized_pane.is_some()
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.maximized_pane = None;
+            ctx.request_repaint();
         }
         let open = consume_shortcut(ctx, egui::Modifiers::CTRL, egui::Key::O);
         let save = consume_shortcut(ctx, egui::Modifiers::CTRL, egui::Key::S);
@@ -509,7 +543,7 @@ impl VoxelInkApp {
                     .inner_margin(egui::Margin::same(8)),
             )
             .show(root, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.add(
                         egui::Image::new(&self.logo)
                             .fit_to_exact_size(Vec2::splat(34.0))
@@ -518,29 +552,30 @@ impl VoxelInkApp {
                     ui.heading("VoxelInk");
                     ui.separator();
                     if ui
-                        .button("Open…")
+                        .add_enabled(self.busy.is_empty(), egui::Button::new("Open…"))
                         .on_hover_text("Open volume (Ctrl+O)")
                         .clicked()
                     {
                         self.guard_or_execute(GuardAction::OpenDialog);
                     }
                     let has_document = self.summary.is_some();
+                    let ready = has_document && self.busy.is_empty();
                     if ui
-                        .add_enabled(has_document, egui::Button::new("Save"))
+                        .add_enabled(ready, egui::Button::new("Save"))
                         .on_hover_text("Save (Ctrl+S)")
                         .clicked()
                     {
                         self.request_overwrite(None);
                     }
                     if ui
-                        .add_enabled(has_document, egui::Button::new("Save As…"))
+                        .add_enabled(ready, egui::Button::new("Save As…"))
                         .on_hover_text("Save As (Ctrl+Shift+S)")
                         .clicked()
                     {
                         self.open_save_dialog(DialogPurpose::SaveAs);
                     }
                     if ui
-                        .add_enabled(has_document, egui::Button::new("Close"))
+                        .add_enabled(ready, egui::Button::new("Close"))
                         .on_hover_text("Close volume (Ctrl+W)")
                         .clicked()
                     {
@@ -556,34 +591,56 @@ impl VoxelInkApp {
                         .as_ref()
                         .is_some_and(|summary| summary.can_redo);
                     if ui
-                        .add_enabled(can_undo, egui::Button::new("Undo"))
+                        .add_enabled(ready && can_undo, egui::Button::new("Undo"))
                         .on_hover_text("Undo (Ctrl+Z)")
                         .clicked()
                     {
                         let _ = self.send_command(EngineCommand::Undo);
                     }
                     if ui
-                        .add_enabled(can_redo, egui::Button::new("Redo"))
+                        .add_enabled(ready && can_redo, egui::Button::new("Redo"))
                         .on_hover_text("Redo (Ctrl+Shift+Z or Ctrl+Y)")
                         .clicked()
                     {
                         let _ = self.send_command(EngineCommand::Redo);
                     }
                     ui.separator();
-                    ui.selectable_value(&mut self.tool, Tool::Inspect, "Inspect (I)")
-                        .on_hover_text("Inspect voxels and orbit the 3D view");
-                    ui.selectable_value(&mut self.tool, Tool::Brush, "Brush (B)")
-                        .on_hover_text("Fill voxels");
-                    ui.selectable_value(&mut self.tool, Tool::Eraser, "Eraser (E)")
-                        .on_hover_text("Clear voxels");
-                    ui.add_enabled_ui(self.tool != Tool::Inspect, |ui| {
-                        ui.label("Diameter");
+                    ui.strong("VOLUME");
+                    if ui
+                        .add_enabled(
+                            ready,
+                            egui::Button::new(
+                                egui::RichText::new("Make solid left ↔ right").strong(),
+                            ),
+                        )
+                        .on_hover_text(
+                            "Fill every gap between the model's left and right surfaces in one undoable step; this also fills internal openings such as eye sockets and sinuses",
+                        )
+                        .clicked()
+                    {
+                        self.preview_notice = None;
+                        if let Err(error) = self.engine.start_make_solid() {
+                            self.error_message = Some(error.to_string());
+                        }
+                    }
+                    ui.separator();
+                    ui.strong("TOOLS");
+                    ui.add_enabled_ui(self.busy.is_empty(), |ui| {
+                        ui.selectable_value(&mut self.tool, Tool::Inspect, "Inspect (I)")
+                            .on_hover_text("Inspect slices; drag the 3D view to rotate it");
+                        ui.selectable_value(&mut self.tool, Tool::Brush, "Brush (B)")
+                            .on_hover_text("Add filled voxels with the primary mouse button");
+                        ui.selectable_value(&mut self.tool, Tool::Eraser, "Eraser (E)")
+                            .on_hover_text("Remove voxels with the primary mouse button");
+                    });
+                    ui.add_enabled_ui(self.tool != Tool::Inspect && self.busy.is_empty(), |ui| {
+                        ui.label("Brush size (voxels)");
                         let changed = ui
                             .add(
                                 egui::Slider::new(&mut self.brush_diameter, 1..=31)
                                     .step_by(2.0)
                                     .show_value(true)
-                                    .text("brush diameter"),
+                                    .text("brush size in voxels"),
                             )
                             .changed();
                         if changed && self.brush_diameter.is_multiple_of(2) {
@@ -620,7 +677,7 @@ impl VoxelInkApp {
                     .inner_margin(egui::Margin::symmetric(8, 5)),
             )
             .show(root, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if let Some(summary) = &self.summary {
                         ui.label(format!(
                             "{} × {} × {}   {} occupied   cursor {}, {}, {}",
@@ -650,6 +707,7 @@ impl VoxelInkApp {
                         ui.label(match kind {
                             BusyKind::Loading => "Loading…",
                             BusyKind::Saving => "Saving…",
+                            BusyKind::MakingSolid => "Making the volume solid…",
                         });
                         if ui.button("Cancel").clicked() {
                             self.engine.cancel_job(job_id);
@@ -673,45 +731,62 @@ impl VoxelInkApp {
             )
             .show(root, |ui| {
                 let rect = ui.max_rect();
-                let gap = 6.0;
-                let half_width = (rect.width() - gap) * 0.5;
-                let half_height = (rect.height() - gap) * 0.5;
-                let panes = [
-                    (
-                        SliceAxis::Axial,
-                        egui::Rect::from_min_size(rect.min, Vec2::new(half_width, half_height)),
-                    ),
-                    (
-                        SliceAxis::Coronal,
-                        egui::Rect::from_min_size(
-                            egui::pos2(rect.min.x + half_width + gap, rect.min.y),
-                            Vec2::new(half_width, half_height),
-                        ),
-                    ),
-                    (
-                        SliceAxis::Sagittal,
-                        egui::Rect::from_min_size(
-                            egui::pos2(rect.min.x, rect.min.y + half_height + gap),
-                            Vec2::new(half_width, half_height),
-                        ),
-                    ),
-                ];
                 let mut actions = FrameStrokeActions::default();
-                for (axis, pane_rect) in panes {
-                    ui.scope_builder(egui::UiBuilder::new().max_rect(pane_rect), |ui| {
-                        self.slice_pane(ui, axis, &mut actions);
-                    });
+                match self.maximized_pane {
+                    Some(WorkspacePane::Slice(axis)) => {
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                            self.slice_pane(ui, axis, &mut actions);
+                        });
+                    }
+                    Some(WorkspacePane::Volume3D) => {
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                            self.volume_pane(ui, &mut actions);
+                        });
+                    }
+                    None => {
+                        let gap = 6.0;
+                        let half_width = (rect.width() - gap) * 0.5;
+                        let half_height = (rect.height() - gap) * 0.5;
+                        let panes = [
+                            (
+                                SliceAxis::Axial,
+                                egui::Rect::from_min_size(
+                                    rect.min,
+                                    Vec2::new(half_width, half_height),
+                                ),
+                            ),
+                            (
+                                SliceAxis::Coronal,
+                                egui::Rect::from_min_size(
+                                    egui::pos2(rect.min.x + half_width + gap, rect.min.y),
+                                    Vec2::new(half_width, half_height),
+                                ),
+                            ),
+                            (
+                                SliceAxis::Sagittal,
+                                egui::Rect::from_min_size(
+                                    egui::pos2(rect.min.x, rect.min.y + half_height + gap),
+                                    Vec2::new(half_width, half_height),
+                                ),
+                            ),
+                        ];
+                        for (axis, pane_rect) in panes {
+                            ui.scope_builder(egui::UiBuilder::new().max_rect(pane_rect), |ui| {
+                                self.slice_pane(ui, axis, &mut actions);
+                            });
+                        }
+                        let volume_rect = egui::Rect::from_min_size(
+                            egui::pos2(
+                                rect.min.x + half_width + gap,
+                                rect.min.y + half_height + gap,
+                            ),
+                            Vec2::new(half_width, half_height),
+                        );
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(volume_rect), |ui| {
+                            self.volume_pane(ui, &mut actions);
+                        });
+                    }
                 }
-                let volume_rect = egui::Rect::from_min_size(
-                    egui::pos2(
-                        rect.min.x + half_width + gap,
-                        rect.min.y + half_height + gap,
-                    ),
-                    Vec2::new(half_width, half_height),
-                );
-                ui.scope_builder(egui::UiBuilder::new().max_rect(volume_rect), |ui| {
-                    self.volume_pane(ui, &mut actions);
-                });
                 if let Some(sample) = actions.sample
                     && let Err(error) = self.engine.send_latest_sample(sample)
                 {
@@ -726,10 +801,10 @@ impl VoxelInkApp {
     fn slice_pane(&mut self, ui: &mut egui::Ui, axis: SliceAxis, actions: &mut FrameStrokeActions) {
         let pane_rect = ui.max_rect();
         ui.painter()
-            .rect_filled(pane_rect, 5.0, self.surface_color());
+            .rect_filled(pane_rect, 0.0, self.surface_color());
         ui.painter().rect_stroke(
             pane_rect,
-            5.0,
+            0.0,
             egui::Stroke::new(1.0, self.line_color()),
             egui::StrokeKind::Inside,
         );
@@ -742,13 +817,44 @@ impl VoxelInkApp {
             .summary
             .as_ref()
             .map_or(0, |summary| summary.cursor[axis.normal_axis()]);
+        let last_coordinate = self.summary.as_ref().map_or(0, |summary| {
+            summary.dimensions[axis.normal_axis()].saturating_sub(1)
+        });
         ui.painter().text(
             pane_rect.min + egui::vec2(9.0, 8.0),
             egui::Align2::LEFT_TOP,
-            format!("{title}  {coordinate}"),
+            format!("{title}  {coordinate} / {last_coordinate}"),
             egui::FontId::proportional(14.0),
             TEXT,
         );
+        let pane = WorkspacePane::Slice(axis);
+        let maximized = self.maximized_pane == Some(pane);
+        let maximize_label = if maximized {
+            "Restore four views".to_owned()
+        } else {
+            format!("Full screen {title}")
+        };
+        let button_width = if maximized { 132.0 } else { 148.0 };
+        let button_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                pane_rect.right() - button_width - 5.0,
+                pane_rect.top() + 4.0,
+            ),
+            egui::vec2(button_width, 22.0),
+        );
+        if ui
+            .put(button_rect, egui::Button::new(maximize_label))
+            .on_hover_text(if maximized {
+                "Return to the four-view layout (Esc)"
+            } else {
+                "Use the full workspace for this view"
+            })
+            .clicked()
+        {
+            self.active_slice = axis;
+            self.maximized_pane = if maximized { None } else { Some(pane) };
+            ui.ctx().request_repaint();
+        }
         let content = egui::Rect::from_min_max(
             pane_rect.min + egui::vec2(6.0, 30.0),
             pane_rect.max - egui::vec2(6.0, 6.0),
@@ -774,6 +880,13 @@ impl VoxelInkApp {
             image_rect,
             egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
             Color32::WHITE,
+        );
+        ui.painter().text(
+            image_rect.left_bottom() + egui::vec2(8.0, -8.0),
+            egui::Align2::LEFT_BOTTOM,
+            "Wheel: change slice   Shift + wheel: jump 10",
+            egui::FontId::proportional(12.0),
+            MUTED,
         );
         let response = ui.interact(
             image_rect,
@@ -807,26 +920,50 @@ impl VoxelInkApp {
             response.request_focus();
             self.active_slice = axis;
         }
+        if response.hovered()
+            && self.busy.is_empty()
+            && !self.stroke_active
+            && !self.stroke_completion_pending
+        {
+            let (scroll, fast) = ui.input(|input| {
+                let delta = input.smooth_scroll_delta;
+                let dominant = if delta.y.abs() >= delta.x.abs() {
+                    delta.y
+                } else {
+                    delta.x
+                };
+                (dominant, input.modifiers.shift)
+            });
+            if scroll.abs() > f32::EPSILON
+                && let Some(summary) = &self.summary
+            {
+                let mut cursor = summary.cursor;
+                let normal = axis.normal_axis();
+                let step = if fast { 10 } else { 1 };
+                cursor[normal] = if scroll > 0.0 {
+                    cursor[normal]
+                        .saturating_add(step)
+                        .min(summary.dimensions[normal] - 1)
+                } else {
+                    cursor[normal].saturating_sub(step)
+                };
+                self.active_slice = axis;
+                let _ = self.send_command(EngineCommand::SetCursor(cursor));
+            }
+        }
         if let Some(summary) = &self.summary {
             paint_crosshair(
                 ui.painter(),
                 image_rect,
                 axis,
                 summary.cursor,
-                slice.width,
-                slice.height,
+                width,
+                height,
             );
         }
         let pointer_voxel = response.interact_pointer_pos().and_then(|position| {
             self.summary.as_ref().map(|summary| {
-                slice_pointer_to_voxel(
-                    axis,
-                    position,
-                    image_rect,
-                    slice.width,
-                    slice.height,
-                    summary.cursor,
-                )
+                slice_pointer_to_voxel(axis, position, image_rect, width, height, summary.cursor)
             })
         });
         if !self.busy.is_empty() {
@@ -876,26 +1013,68 @@ impl VoxelInkApp {
     fn volume_pane(&mut self, ui: &mut egui::Ui, actions: &mut FrameStrokeActions) {
         let pane_rect = ui.max_rect();
         ui.painter()
-            .rect_filled(pane_rect, 5.0, self.surface_color());
+            .rect_filled(pane_rect, 0.0, self.surface_color());
         ui.painter().rect_stroke(
             pane_rect,
-            5.0,
+            0.0,
             egui::Stroke::new(1.0, self.line_color()),
             egui::StrokeKind::Inside,
         );
         ui.painter().text(
             pane_rect.min + egui::vec2(9.0, 8.0),
             egui::Align2::LEFT_TOP,
-            "3D Preview",
+            "3D View",
             egui::FontId::proportional(14.0),
             TEXT,
         );
+        let pane = WorkspacePane::Volume3D;
+        let maximized = self.maximized_pane == Some(pane);
+        let maximize_label = if maximized {
+            "Restore four views"
+        } else {
+            "Full screen 3D"
+        };
+        let maximize_width = if maximized { 132.0 } else { 126.0 };
+        let maximize_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                pane_rect.right() - maximize_width - 5.0,
+                pane_rect.top() + 4.0,
+            ),
+            egui::vec2(maximize_width, 22.0),
+        );
+        if ui
+            .put(maximize_rect, egui::Button::new(maximize_label))
+            .on_hover_text(if maximized {
+                "Return to the four-view layout (Esc)"
+            } else {
+                "Use the full workspace for the 3D view"
+            })
+            .clicked()
+        {
+            self.maximized_pane = if maximized { None } else { Some(pane) };
+            ui.ctx().request_repaint();
+        }
+        let reset_width = 82.0;
+        let reset_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                maximize_rect.left() - reset_width - 5.0,
+                pane_rect.top() + 4.0,
+            ),
+            egui::vec2(reset_width, 22.0),
+        );
+        if ui
+            .put(reset_rect, egui::Button::new("Reset view"))
+            .on_hover_text("Center the volume and restore the default rotation and zoom")
+            .clicked()
+        {
+            self.scene.reset_view();
+        }
         let content = egui::Rect::from_min_max(
             pane_rect.min + egui::vec2(6.0, 30.0),
             pane_rect.max - egui::vec2(6.0, 6.0),
         );
         ui.painter()
-            .rect_filled(content, 3.0, self.background_color());
+            .rect_filled(content, 0.0, self.background_color());
         self.scene
             .set_aspect(content.width() / content.height().max(1.0));
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
@@ -914,6 +1093,18 @@ impl VoxelInkApp {
                 "Interactive 3D volume editor",
             )
         });
+        let controls = if self.tool == Tool::Inspect {
+            "Left / middle drag: rotate   Right drag: move   Wheel: zoom"
+        } else {
+            "Left drag: edit   Middle drag: rotate   Right drag: move   Wheel: zoom"
+        };
+        ui.painter().text(
+            content.left_bottom() + egui::vec2(8.0, -8.0),
+            egui::Align2::LEFT_BOTTOM,
+            controls,
+            egui::FontId::proportional(12.0),
+            MUTED,
+        );
         if response.has_focus() {
             self.pane_keyboard_focus = true;
             ui.painter().rect_stroke(
@@ -936,10 +1127,11 @@ impl VoxelInkApp {
                 self.scene.zoom((scroll * 0.002).exp());
             }
         }
-        let orbiting = self.tool == Tool::Inspect
-            || response.dragged_by(egui::PointerButton::Secondary)
-            || response.dragged_by(egui::PointerButton::Middle);
-        if orbiting && response.dragged() {
+        if response.dragged_by(egui::PointerButton::Secondary) {
+            self.scene.pan(response.drag_delta(), content.size());
+        } else if response.dragged_by(egui::PointerButton::Middle)
+            || (self.tool == Tool::Inspect && response.dragged_by(egui::PointerButton::Primary))
+        {
             self.scene.orbit(response.drag_delta());
         }
         if self.tool == Tool::Inspect || self.summary.is_none() {
@@ -1473,6 +1665,13 @@ impl eframe::App for VoxelInkApp {
 fn configure_style(ctx: &egui::Context, forced_colors: bool, reduced_motion: bool) {
     ctx.set_theme(egui::Theme::Dark);
     let mut visuals = egui::Visuals::dark();
+    visuals.window_corner_radius = egui::CornerRadius::ZERO;
+    visuals.menu_corner_radius = egui::CornerRadius::ZERO;
+    visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::ZERO;
+    visuals.widgets.inactive.corner_radius = egui::CornerRadius::ZERO;
+    visuals.widgets.hovered.corner_radius = egui::CornerRadius::ZERO;
+    visuals.widgets.active.corner_radius = egui::CornerRadius::ZERO;
+    visuals.widgets.open.corner_radius = egui::CornerRadius::ZERO;
     visuals.panel_fill = if forced_colors {
         Color32::BLACK
     } else {
@@ -1517,6 +1716,46 @@ fn configure_style(ctx: &egui::Context, forced_colors: bool, reduced_motion: boo
     if reduced_motion {
         ctx.style_mut_of(egui::Theme::Dark, |style| style.animation_time = 0.0);
     }
+}
+
+fn solidify_notice(summary: Option<&DocumentSummary>, added_voxels: u64) -> String {
+    let count = format_count(added_voxels);
+    let voxel_label = if added_voxels == 1 { "voxel" } else { "voxels" };
+    let physical_volume = summary.and_then(|summary| {
+        let voxel_volume = summary.spacing.into_iter().product::<f64>();
+        let cubic_centimeters = match summary.units {
+            SpatialUnits::Meter => voxel_volume * 1_000_000.0,
+            SpatialUnits::Millimeter => voxel_volume / 1_000.0,
+            SpatialUnits::Micron => voxel_volume / 1_000_000_000_000.0,
+            SpatialUnits::Unknown => return None,
+        } * added_voxels as f64;
+        cubic_centimeters.is_finite().then_some(cubic_centimeters)
+    });
+    physical_volume.map_or_else(
+        || format!("Solid left ↔ right: +{count} {voxel_label} · Undo restores original"),
+        |volume| {
+            let volume = if volume >= 0.1 {
+                format!("{volume:.1}")
+            } else {
+                format!("{volume:.3}")
+            };
+            format!(
+                "Solid left ↔ right: +{count} {voxel_label} ({volume} cm³) · Undo restores original"
+            )
+        },
+    )
+}
+
+fn format_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index != 0 && (digits.len() - index).is_multiple_of(3) {
+            formatted.push(',');
+        }
+        formatted.push(digit);
+    }
+    formatted
 }
 
 fn env_flag(name: &str) -> bool {

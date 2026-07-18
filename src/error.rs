@@ -22,6 +22,8 @@ pub enum AppError {
     InputLimit,
     #[error("not enough memory to allocate {bytes} bytes for the volume")]
     Allocation { bytes: usize },
+    #[error("edit needs {bytes} bytes of undo history; the limit is {limit} bytes")]
+    UndoHistoryLimit { bytes: usize, limit: usize },
     #[error("the affine transform is singular or non-finite")]
     InvalidAffine,
     #[error("the source file changed outside VoxelInk: {0}")]

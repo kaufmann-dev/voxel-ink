@@ -6,7 +6,7 @@ use std::{
 
 use tempfile::tempdir;
 use voxel_ink::{
-    EngineCommand, EngineEvent, EngineHandle, SliceAxis, Tool,
+    EngineCommand, EngineEvent, EngineHandle, SliceAxis, Tool, VolumeDocument,
     brush::BrushDiameter,
     cancel::CancellationToken,
     engine::{PointerSample, StrokeSpace},
@@ -183,4 +183,24 @@ fn local_craniofacial_nifti_loads_when_available() {
             .map(|&value| u64::from(value))
             .sum::<u64>()
     );
+
+    let decoded = loaded.decoded;
+    let mut document = VolumeDocument::new(
+        decoded.geometry,
+        decoded.occupancy,
+        loaded.identity,
+        decoded.source_variant,
+        decoded.save_state,
+        decoded.normalized_non_binary,
+    )
+    .unwrap();
+    let started = Instant::now();
+    let added = document.make_solid(&CancellationToken::default()).unwrap();
+    eprintln!(
+        "local craniofacial solid fill {:?}: {added} voxels added",
+        started.elapsed()
+    );
+    assert_eq!(added, 18_725_586);
+    assert_eq!(document.occupied_count(), 24_541_095);
+    assert!(document.summary().can_undo);
 }
