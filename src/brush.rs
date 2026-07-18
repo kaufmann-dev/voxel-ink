@@ -1,38 +1,76 @@
+use std::mem::size_of;
+
 use crate::{
     AppError, Result,
-    volume::{SliceAxis, Tool, VolumeGeometry, linear_index},
+    cancel::CancellationToken,
+    volume::{SpatialUnits, Tool, VolumeGeometry, linear_index, transform_vector},
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BrushDiameter(u8);
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BrushShape {
+    #[default]
+    Round,
+    Square,
+}
 
-impl BrushDiameter {
-    pub const MIN: u8 = 1;
-    pub const MAX: u8 = 31;
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BrushDepth {
+    #[default]
+    Slice,
+    Volume,
+}
 
-    pub fn new(value: u8) -> Result<Self> {
-        if !(Self::MIN..=Self::MAX).contains(&value) || value.is_multiple_of(2) {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BrushSize {
+    Voxels(u8),
+    Millimeters(f32),
+}
+
+impl BrushSize {
+    pub const MIN_VOXELS: u8 = 1;
+    pub const MAX_VOXELS: u8 = 101;
+    pub const MIN_MILLIMETERS: f32 = 0.5;
+    pub const MAX_MILLIMETERS: f32 = 50.0;
+
+    pub fn voxels(diameter: u8) -> Result<Self> {
+        if !(Self::MIN_VOXELS..=Self::MAX_VOXELS).contains(&diameter) || diameter.is_multiple_of(2)
+        {
             return Err(AppError::InvalidDimensions(
-                "brush diameter must be odd and between 1 and 31".into(),
+                "voxel brush diameter must be odd and between 1 and 101".into(),
             ));
         }
-        Ok(Self(value))
+        Ok(Self::Voxels(diameter))
     }
 
-    #[must_use]
-    pub const fn get(self) -> u8 {
-        self.0
-    }
-
-    #[must_use]
-    pub const fn radius(self) -> i32 {
-        (self.0 / 2) as i32
+    pub fn millimeters(diameter: f32) -> Result<Self> {
+        if !diameter.is_finite()
+            || !(Self::MIN_MILLIMETERS..=Self::MAX_MILLIMETERS).contains(&diameter)
+        {
+            return Err(AppError::InvalidDimensions(
+                "physical brush diameter must be between 0.5 and 50 millimetres".into(),
+            ));
+        }
+        Ok(Self::Millimeters(diameter))
     }
 }
 
-impl Default for BrushDiameter {
+impl Default for BrushSize {
     fn default() -> Self {
-        Self(1)
+        Self::Voxels(5)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BrushSpec {
+    pub shape: BrushShape,
+    pub depth: BrushDepth,
+    pub size: BrushSize,
+}
+
+impl BrushSpec {
+    #[must_use]
+    pub const fn with_depth(self, depth: BrushDepth) -> Self {
+        Self { depth, ..self }
     }
 }
 
@@ -43,9 +81,9 @@ pub struct Ray {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DdaHit {
+pub struct SurfaceHit {
     pub voxel: [u32; 3],
-    pub previous: Option<[u32; 3]>,
+    pub exterior: Option<[u32; 3]>,
     pub face_normal: [i8; 3],
 }
 
@@ -132,71 +170,228 @@ pub fn supercover_line(start: [u32; 3], end: [u32; 3]) -> Result<Vec<[u32; 3]>> 
     Ok(output)
 }
 
-#[must_use]
-pub fn disk_indices(
-    dimensions: [u32; 3],
-    axis: SliceAxis,
+/// Returns the exact voxel footprint for a brush centered on `center`.
+///
+/// Voxel-sized brushes are evaluated in index space. Millimetre-sized round
+/// brushes use the complete affine metric, while square brushes remain aligned
+/// to the volume's index axes with physical extents on each axis. `normal_axis`
+/// is ignored for a volume brush and fixes the one-voxel depth of a slice brush.
+pub fn brush_indices(
+    geometry: &VolumeGeometry,
     center: [u32; 3],
-    diameter: BrushDiameter,
-) -> Vec<u32> {
-    let radius = diameter.radius();
-    let varying_axes = match axis {
-        SliceAxis::Axial => [0, 1],
-        SliceAxis::Coronal => [0, 2],
-        SliceAxis::Sagittal => [1, 2],
-    };
-    let mut output = Vec::with_capacity((diameter.get() as usize).pow(2));
-    for second in -radius..=radius {
-        for first in -radius..=radius {
-            if first * first + second * second > radius * radius {
-                continue;
-            }
-            let mut voxel = center.map(i64::from);
-            voxel[varying_axes[0]] += i64::from(first);
-            voxel[varying_axes[1]] += i64::from(second);
-            if let Some(voxel) = checked_voxel(voxel, dimensions)
-                && let Some(index) = linear_index(dimensions, voxel)
-            {
+    normal_axis: usize,
+    spec: BrushSpec,
+) -> Result<Vec<u32>> {
+    brush_indices_cancellable(
+        geometry,
+        center,
+        normal_axis,
+        spec,
+        &CancellationToken::default(),
+        None,
+    )
+}
+
+/// Cancellable brush-footprint evaluation used by latency-sensitive previews.
+///
+/// `maximum_indices` limits the number of voxels in the completed footprint,
+/// not the (usually larger) index-space bounding box examined while building
+/// it. The public [`brush_indices`] API intentionally remains convenient for
+/// edit paths that already have their own lifetime and memory bounds.
+pub(crate) fn brush_indices_cancellable(
+    geometry: &VolumeGeometry,
+    center: [u32; 3],
+    normal_axis: usize,
+    spec: BrushSpec,
+    cancel: &CancellationToken,
+    maximum_indices: Option<usize>,
+) -> Result<Vec<u32>> {
+    cancel.check()?;
+    if normal_axis >= 3 || linear_index(geometry.dimensions, center).is_none() {
+        return Err(AppError::InvalidDimensions(
+            "brush center or slice axis lies outside the volume".into(),
+        ));
+    }
+    let metric = BrushMetric::new(geometry, spec.size)?;
+    let mut bounds = brush_index_bounds(geometry, spec.shape, metric);
+    if spec.depth == BrushDepth::Slice {
+        bounds[normal_axis] = 0;
+    }
+    let ranges: [(i64, i64); 3] = std::array::from_fn(|axis| {
+        let center = i64::from(center[axis]);
+        let last = i64::from(geometry.dimensions[axis] - 1);
+        (-bounds[axis].min(center), bounds[axis].min(last - center))
+    });
+    let estimated = ranges
+        .into_iter()
+        .map(|(start, end)| usize::try_from(end - start + 1).unwrap_or(usize::MAX))
+        .try_fold(1_usize, usize::checked_mul)
+        .ok_or(AppError::Allocation { bytes: usize::MAX })?;
+    let initial_capacity = estimated
+        .min(maximum_indices.unwrap_or(usize::MAX))
+        .min(4_096);
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(initial_capacity)
+        .map_err(|_| AppError::Allocation {
+            bytes: initial_capacity.saturating_mul(size_of::<u32>()),
+        })?;
+
+    let mut examined = 0_usize;
+    for z in ranges[2].0..=ranges[2].1 {
+        for y in ranges[1].0..=ranges[1].1 {
+            for x in ranges[0].0..=ranges[0].1 {
+                examined = examined.saturating_add(1);
+                if examined & 0x0fff == 0 {
+                    cancel.check()?;
+                }
+                let delta = [x, y, z];
+                if !brush_contains_delta(geometry, delta, spec.shape, metric) {
+                    continue;
+                }
+                if maximum_indices.is_some_and(|maximum| output.len() >= maximum) {
+                    return Err(AppError::InvalidDimensions(format!(
+                        "brush footprint exceeds the {}-voxel preview safety limit",
+                        maximum_indices.expect("the limit was just matched")
+                    )));
+                }
+                let voxel = [
+                    i64::from(center[0]) + x,
+                    i64::from(center[1]) + y,
+                    i64::from(center[2]) + z,
+                ];
+                let voxel = voxel.map(|coordinate| {
+                    u32::try_from(coordinate).expect("brush ranges are clipped to the volume")
+                });
+                let index = linear_index(geometry.dimensions, voxel)
+                    .expect("brush ranges are clipped to the volume");
+                if output.len() == output.capacity() {
+                    let additional = output
+                        .capacity()
+                        .max(4_096)
+                        .min(estimated.saturating_sub(output.len()));
+                    output
+                        .try_reserve_exact(additional)
+                        .map_err(|_| AppError::Allocation {
+                            bytes: output
+                                .len()
+                                .saturating_add(additional)
+                                .saturating_mul(size_of::<u32>()),
+                        })?;
+                }
                 output.push(index);
             }
         }
     }
-    output
+    cancel.check()?;
+    Ok(output)
 }
 
-#[must_use]
-pub fn sphere_indices(dimensions: [u32; 3], center: [u32; 3], diameter: BrushDiameter) -> Vec<u32> {
-    let radius = diameter.radius();
-    let mut output = Vec::with_capacity((diameter.get() as usize).pow(3));
-    for z in -radius..=radius {
-        for y in -radius..=radius {
-            for x in -radius..=radius {
-                if x * x + y * y + z * z > radius * radius {
-                    continue;
-                }
-                let voxel = [
-                    i64::from(center[0]) + i64::from(x),
-                    i64::from(center[1]) + i64::from(y),
-                    i64::from(center[2]) + i64::from(z),
-                ];
-                if let Some(voxel) = checked_voxel(voxel, dimensions)
-                    && let Some(index) = linear_index(dimensions, voxel)
-                {
-                    output.push(index);
-                }
+#[derive(Clone, Copy)]
+enum BrushMetric {
+    Voxels { radius: i64 },
+    Physical { radius: f64 },
+}
+
+impl BrushMetric {
+    fn new(geometry: &VolumeGeometry, size: BrushSize) -> Result<Self> {
+        match size {
+            BrushSize::Voxels(diameter) => {
+                BrushSize::voxels(diameter)?;
+                Ok(Self::Voxels {
+                    radius: i64::from(diameter / 2),
+                })
+            }
+            BrushSize::Millimeters(diameter) => {
+                BrushSize::millimeters(diameter)?;
+                Ok(Self::Physical {
+                    radius: f64::from(diameter) * 0.5
+                        / millimeters_per_spatial_unit(geometry.units)?,
+                })
             }
         }
     }
-    output
 }
 
+fn brush_index_bounds(
+    geometry: &VolumeGeometry,
+    shape: BrushShape,
+    metric: BrushMetric,
+) -> [i64; 3] {
+    match metric {
+        BrushMetric::Voxels { radius } => [radius; 3],
+        BrushMetric::Physical { radius } => std::array::from_fn(|axis| {
+            let unbounded = match shape {
+                BrushShape::Round => {
+                    let inverse_row_length = (0..3)
+                        .map(|component| geometry.world_to_index[axis][component].powi(2))
+                        .sum::<f64>()
+                        .sqrt();
+                    (radius * inverse_row_length).ceil()
+                }
+                BrushShape::Square => (radius / geometry.spacing[axis]).floor(),
+            };
+            unbounded.clamp(0.0, f64::from(geometry.dimensions[axis] - 1)) as i64
+        }),
+    }
+}
+
+fn brush_contains_delta(
+    geometry: &VolumeGeometry,
+    delta: [i64; 3],
+    shape: BrushShape,
+    metric: BrushMetric,
+) -> bool {
+    match metric {
+        BrushMetric::Voxels { radius } => match shape {
+            BrushShape::Round => {
+                delta
+                    .into_iter()
+                    .map(|component| component * component)
+                    .sum::<i64>()
+                    <= radius * radius
+            }
+            BrushShape::Square => delta.into_iter().all(|component| component.abs() <= radius),
+        },
+        BrushMetric::Physical { radius } => match shape {
+            BrushShape::Round => {
+                let world = transform_vector(geometry.index_to_world, delta.map(|v| v as f64));
+                let squared_distance = world.into_iter().map(|value| value * value).sum::<f64>();
+                let squared_radius = radius * radius;
+                squared_distance <= squared_radius + squared_radius.max(1.0) * 1.0e-12
+            }
+            BrushShape::Square => delta.into_iter().enumerate().all(|(axis, component)| {
+                (component as f64).abs() * geometry.spacing[axis]
+                    <= radius + radius.max(1.0) * 1.0e-12
+            }),
+        },
+    }
+}
+
+fn millimeters_per_spatial_unit(units: SpatialUnits) -> Result<f64> {
+    match units {
+        SpatialUnits::Meter => Ok(1_000.0),
+        SpatialUnits::Millimeter => Ok(1.0),
+        SpatialUnits::Micron => Ok(0.001),
+        SpatialUnits::Unknown => Err(AppError::InvalidDimensions(
+            "this volume has no physical units; use a voxel-sized brush".into(),
+        )),
+    }
+}
+
+/// Finds the first occupied voxel crossed by `world_ray`.
+///
+/// The hit is always on existing volume data. A miss stays a miss: this helper
+/// never projects the ray onto an arbitrary slice or creates a seed in empty
+/// space. `exterior` is the face-adjacent empty voxel immediately before the
+/// hit when that voxel lies inside the volume.
 #[must_use]
-pub fn dda_first_occupied(
-    dimensions: [u32; 3],
+pub fn ray_surface_hit(
     occupancy: &[u8],
     geometry: &VolumeGeometry,
     world_ray: Ray,
-) -> Option<DdaHit> {
+) -> Option<SurfaceHit> {
+    let dimensions = geometry.dimensions;
     let expected_len = dimensions
         .into_iter()
         .try_fold(1_usize, |total, axis| total.checked_mul(axis as usize))?;
@@ -261,9 +456,9 @@ pub fn dda_first_occupied(
         let current = checked_voxel(voxel, dimensions)?;
         let index = linear_index(dimensions, current)? as usize;
         if occupancy.get(index).copied() == Some(1) {
-            return Some(DdaHit {
+            return Some(SurfaceHit {
                 voxel: current,
-                previous,
+                exterior: previous,
                 face_normal,
             });
         }
@@ -300,50 +495,86 @@ pub fn dda_first_occupied(
     }
 }
 
+/// Picks the voxel that a surface editing tool should modify.
+///
+/// Paint targets the empty voxel immediately outside the hit surface. Erase,
+/// inspect, and bridge target the occupied surface voxel itself. Nothing is
+/// returned when the ray misses the occupied surface.
 #[must_use]
-pub fn ray_edit_target(
+pub fn surface_edit_target(
     dimensions: [u32; 3],
     occupancy: &[u8],
     geometry: &VolumeGeometry,
     world_ray: Ray,
     tool: Tool,
-    active_slice: SliceAxis,
-    slice_coordinate: u32,
 ) -> Option<[u32; 3]> {
-    if let Some(hit) = dda_first_occupied(dimensions, occupancy, geometry, world_ray) {
-        return match tool {
-            Tool::Inspect | Tool::Eraser => Some(hit.voxel),
-            Tool::Brush => hit.previous.or_else(|| {
-                let candidate = [
-                    i64::from(hit.voxel[0]) + i64::from(hit.face_normal[0]),
-                    i64::from(hit.voxel[1]) + i64::from(hit.face_normal[1]),
-                    i64::from(hit.voxel[2]) + i64::from(hit.face_normal[2]),
-                ];
-                checked_voxel(candidate, dimensions)
-            }),
-        };
-    }
-    if tool != Tool::Brush {
+    if dimensions != geometry.dimensions {
         return None;
     }
-    let origin = geometry.world_point_to_index(world_ray.origin);
-    let direction = geometry.world_vector_to_index(world_ray.direction);
-    let axis = active_slice.normal_axis();
-    if direction[axis].abs() <= f64::EPSILON {
+    let hit = ray_surface_hit(occupancy, geometry, world_ray)?;
+    match tool {
+        Tool::Paint => hit.exterior,
+        Tool::Inspect | Tool::Erase | Tool::Bridge => Some(hit.voxel),
+    }
+}
+
+/// Projects a ray onto a world-space plane anchored at a voxel center.
+///
+/// This is intended for continuing a bridge after its first endpoint has been
+/// picked from an occupied surface. It does not search for or synthesize a
+/// surface hit. Parallel, backward, non-finite, and out-of-volume intersections
+/// return `None`.
+#[must_use]
+pub fn ray_plane_voxel(
+    dimensions: [u32; 3],
+    geometry: &VolumeGeometry,
+    world_ray: Ray,
+    plane_voxel: [u32; 3],
+    plane_normal: [f64; 3],
+) -> Option<[u32; 3]> {
+    if dimensions != geometry.dimensions || linear_index(dimensions, plane_voxel).is_none() {
         return None;
     }
-    let t = (f64::from(slice_coordinate) - origin[axis]) / direction[axis];
-    if t < 0.0 || !t.is_finite() {
+    if !world_ray
+        .origin
+        .iter()
+        .chain(&world_ray.direction)
+        .chain(&plane_normal)
+        .all(|value| value.is_finite())
+    {
         return None;
     }
-    let point = [
-        origin[0] + t * direction[0],
-        origin[1] + t * direction[1],
-        origin[2] + t * direction[2],
-    ];
-    let mut voxel = point.map(|value| value.round() as i64);
-    voxel[axis] = i64::from(slice_coordinate);
-    checked_voxel(voxel, dimensions)
+    let direction_length_squared = dot(world_ray.direction, world_ray.direction);
+    let normal_length_squared = dot(plane_normal, plane_normal);
+    if direction_length_squared == 0.0 || normal_length_squared == 0.0 {
+        return None;
+    }
+    let denominator = dot(world_ray.direction, plane_normal);
+    let parallel_tolerance =
+        f64::EPSILON * (direction_length_squared * normal_length_squared).sqrt() * 16.0;
+    if denominator.abs() <= parallel_tolerance {
+        return None;
+    }
+    let plane_point = geometry.index_point_to_world(plane_voxel.map(f64::from));
+    let from_origin = std::array::from_fn(|axis| plane_point[axis] - world_ray.origin[axis]);
+    let distance = dot(from_origin, plane_normal) / denominator;
+    if !distance.is_finite() || distance < 0.0 {
+        return None;
+    }
+    let world_point =
+        std::array::from_fn(|axis| world_ray.origin[axis] + world_ray.direction[axis] * distance);
+    let index_point = geometry.world_point_to_index(world_point);
+    if !index_point.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    checked_voxel(index_point.map(|value| value.round() as i64), dimensions)
+}
+
+fn dot(left: [f64; 3], right: [f64; 3]) -> f64 {
+    left.into_iter()
+        .zip(right)
+        .map(|(left, right)| left * right)
+        .sum()
 }
 
 fn checked_voxel(voxel: [i64; 3], dimensions: [u32; 3]) -> Option<[u32; 3]> {
@@ -392,7 +623,6 @@ fn ray_box(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::volume::SpatialUnits;
 
     fn identity_geometry(dimensions: [u32; 3]) -> VolumeGeometry {
         VolumeGeometry::new(
@@ -403,95 +633,48 @@ mod tests {
                 [0.0, 0.0, 1.0, 0.0],
                 [0.0, 0.0, 0.0, 1.0],
             ],
-            SpatialUnits::Unknown,
+            SpatialUnits::Millimeter,
         )
         .unwrap()
     }
 
     #[test]
-    fn disk_and_sphere_are_clipped_and_symmetric() {
-        let diameter = BrushDiameter::new(3).unwrap();
-        assert_eq!(
-            disk_indices([5, 5, 5], SliceAxis::Axial, [2, 2, 2], diameter).len(),
-            5
-        );
-        assert_eq!(sphere_indices([5, 5, 5], [2, 2, 2], diameter).len(), 7);
-        assert_eq!(sphere_indices([5, 5, 5], [0, 0, 0], diameter).len(), 4);
-    }
-
-    #[test]
-    fn supercover_includes_corner_touching_cells() {
-        let cells = supercover_line([0, 0, 0], [2, 2, 0]).unwrap();
-        assert!(cells.contains(&[1, 0, 0]));
-        assert!(cells.contains(&[0, 1, 0]));
-        assert!(cells.contains(&[1, 1, 0]));
-        assert_eq!(cells.last(), Some(&[2, 2, 0]));
-    }
-
-    #[test]
-    fn dda_hits_first_cell_and_brush_uses_outside_neighbor() {
-        let dimensions = [4, 3, 2];
-        let mut occupancy = vec![0; 24];
-        occupancy[linear_index(dimensions, [2, 1, 0]).unwrap() as usize] = 1;
-        let geometry = identity_geometry(dimensions);
-        let ray = Ray {
-            origin: [-2.0, 1.0, 0.0],
-            direction: [1.0, 0.0, 0.0],
-        };
-        let hit = dda_first_occupied(dimensions, &occupancy, &geometry, ray).unwrap();
-        assert_eq!(hit.voxel, [2, 1, 0]);
-        assert_eq!(hit.previous, Some([1, 1, 0]));
-        assert_eq!(
-            ray_edit_target(
-                dimensions,
-                &occupancy,
-                &geometry,
-                ray,
-                Tool::Brush,
-                SliceAxis::Axial,
-                0,
-            ),
-            Some([1, 1, 0])
-        );
-    }
-
-    #[test]
-    fn dda_steps_tied_axes_without_false_edge_hits() {
-        let dimensions = [2, 2, 1];
-        let geometry = identity_geometry(dimensions);
-        let ray = Ray {
-            origin: [-1.0, -1.0, 0.0],
-            direction: [1.0, 1.0, 0.0],
-        };
-        let mut occupancy = [0; 4];
-        occupancy[linear_index(dimensions, [1, 0, 0]).unwrap() as usize] = 1;
-        assert_eq!(
-            dda_first_occupied(dimensions, &occupancy, &geometry, ray),
-            None
-        );
-        occupancy.fill(0);
-        occupancy[linear_index(dimensions, [1, 1, 0]).unwrap() as usize] = 1;
-        let hit = dda_first_occupied(dimensions, &occupancy, &geometry, ray).unwrap();
-        assert_eq!(hit.voxel, [1, 1, 0]);
-        assert!(matches!(hit.previous, Some([0, 1, 0] | [1, 0, 0])));
-    }
-
-    #[test]
-    fn miss_seeds_active_slice() {
-        let dimensions = [5, 5, 5];
-        let geometry = identity_geometry(dimensions);
-        let target = ray_edit_target(
-            dimensions,
-            &[0; 125],
-            &geometry,
-            Ray {
-                origin: [2.0, 2.0, -5.0],
-                direction: [0.0, 0.0, 1.0],
+    fn cancellable_footprint_stops_before_allocating_when_cancelled() {
+        let cancel = CancellationToken::default();
+        cancel.cancel();
+        let result = brush_indices_cancellable(
+            &identity_geometry([101; 3]),
+            [50; 3],
+            0,
+            BrushSpec {
+                shape: BrushShape::Square,
+                depth: BrushDepth::Volume,
+                size: BrushSize::voxels(101).unwrap(),
             },
-            Tool::Brush,
-            SliceAxis::Axial,
-            3,
+            &cancel,
+            None,
         );
-        assert_eq!(target, Some([2, 2, 3]));
+        assert!(matches!(result, Err(AppError::Cancelled)));
+    }
+
+    #[test]
+    fn footprint_limit_allows_exact_limit_and_rejects_one_more_voxel() {
+        let geometry = identity_geometry([5; 3]);
+        let spec = BrushSpec {
+            shape: BrushShape::Square,
+            depth: BrushDepth::Volume,
+            size: BrushSize::voxels(5).unwrap(),
+        };
+        let cancel = CancellationToken::default();
+        assert_eq!(
+            brush_indices_cancellable(&geometry, [2; 3], 0, spec, &cancel, Some(125))
+                .unwrap()
+                .len(),
+            125
+        );
+        assert!(matches!(
+            brush_indices_cancellable(&geometry, [2; 3], 0, spec, &cancel, Some(124)),
+            Err(AppError::InvalidDimensions(message)) if message.contains("124-voxel")
+        ));
     }
 }

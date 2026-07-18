@@ -132,24 +132,41 @@ fn invalid_stroke_inputs_do_not_silently_corrupt_the_document() {
     assert_eq!(document.occupied_count(), 0);
 }
 
-#[test]
-fn make_solid_fills_leaky_interiors_as_one_undoable_edit() {
+fn index(dimensions: [u32; 3], voxel: [u32; 3]) -> usize {
+    (voxel[0] + dimensions[0] * (voxel[1] + dimensions[1] * voxel[2])) as usize
+}
+
+fn closed_shell() -> ([u32; 3], Vec<u8>) {
     let dimensions = [5, 5, 5];
     let mut occupancy = vec![0; 125];
-    for voxel in [[1, 2, 2], [3, 2, 2], [2, 1, 2], [2, 3, 2]] {
-        let index = voxel[0] + dimensions[0] * (voxel[1] + dimensions[1] * voxel[2]);
-        occupancy[index as usize] = 1;
+    for z in 1..=3 {
+        for y in 1..=3 {
+            for x in 1..=3 {
+                if x == 1 || x == 3 || y == 1 || y == 3 || z == 1 || z == 3 {
+                    occupancy[index(dimensions, [x, y, z])] = 1;
+                }
+            }
+        }
     }
+    (dimensions, occupancy)
+}
+
+#[test]
+fn enclosed_cavity_is_one_undoable_edit_and_is_idempotent() {
+    let (dimensions, occupancy) = closed_shell();
+    let original_count = occupancy.iter().map(|&value| u64::from(value)).sum::<u64>();
     let mut document = make_document(dimensions, occupancy.clone(), false);
 
     assert_eq!(
-        document.make_solid(&CancellationToken::default()).unwrap(),
+        document
+            .fill_enclosed_cavities(&CancellationToken::default())
+            .unwrap(),
         1
     );
     assert_eq!(document.value([2, 2, 2]), Some(1));
-    assert_eq!(document.value([2, 2, 0]), Some(0));
+    assert_eq!(document.value([0, 0, 0]), Some(0));
     assert_eq!(document.revision(), 2);
-    assert_eq!(document.occupied_count(), 5);
+    assert_eq!(document.occupied_count(), original_count + 1);
     assert!(document.summary().can_undo);
 
     assert_eq!(document.undo(), Some(1));
@@ -157,21 +174,94 @@ fn make_solid_fills_leaky_interiors_as_one_undoable_edit() {
     assert_eq!(document.redo(), Some(2));
     assert_eq!(document.value([2, 2, 2]), Some(1));
     assert_eq!(
-        document.make_solid(&CancellationToken::default()).unwrap(),
+        document
+            .fill_enclosed_cavities(&CancellationToken::default())
+            .unwrap(),
         0,
-        "an already-solid volume must not create an empty revision"
+        "a volume without empty cavities must not create an empty revision"
     );
     assert_eq!(document.revision(), 2);
 }
 
 #[test]
-fn make_solid_cancellation_is_atomic() {
+fn any_face_opening_keeps_the_shell_interior_empty() {
+    for opening in [
+        [1, 2, 2],
+        [3, 2, 2],
+        [2, 1, 2],
+        [2, 3, 2],
+        [2, 2, 1],
+        [2, 2, 3],
+    ] {
+        let (dimensions, mut occupancy) = closed_shell();
+        occupancy[index(dimensions, opening)] = 0;
+        let mut document = make_document(dimensions, occupancy.clone(), false);
+
+        assert_eq!(
+            document
+                .fill_enclosed_cavities(&CancellationToken::default())
+                .unwrap(),
+            0,
+            "opening {opening:?} must connect the cavity to the outside"
+        );
+        assert_eq!(document.view().occupancy, occupancy);
+        assert_eq!(document.revision(), 1);
+        assert!(!document.summary().can_undo);
+    }
+}
+
+#[test]
+fn multiple_disconnected_cavities_are_filled_together() {
+    let dimensions = [7, 7, 7];
+    let mut occupancy = vec![0; 343];
+    for z in 1..=5 {
+        for y in 1..=5 {
+            for x in 1..=5 {
+                occupancy[index(dimensions, [x, y, z])] = 1;
+            }
+        }
+    }
+    for cavity in [[2, 2, 2], [4, 4, 4]] {
+        occupancy[index(dimensions, cavity)] = 0;
+    }
+    let mut document = make_document(dimensions, occupancy, false);
+
+    assert_eq!(
+        document
+            .fill_enclosed_cavities(&CancellationToken::default())
+            .unwrap(),
+        2
+    );
+    assert_eq!(document.value([2, 2, 2]), Some(1));
+    assert_eq!(document.value([4, 4, 4]), Some(1));
+}
+
+#[test]
+fn corner_contact_does_not_count_as_a_six_connected_opening() {
+    let dimensions = [3, 3, 3];
+    let mut occupancy = vec![1; 27];
+    occupancy[index(dimensions, [0, 0, 0])] = 0;
+    occupancy[index(dimensions, [1, 1, 1])] = 0;
+    let mut document = make_document(dimensions, occupancy, false);
+
+    assert_eq!(
+        document
+            .fill_enclosed_cavities(&CancellationToken::default())
+            .unwrap(),
+        1
+    );
+    assert_eq!(document.value([0, 0, 0]), Some(0));
+    assert_eq!(document.value([1, 1, 1]), Some(1));
+}
+
+#[test]
+fn cavity_fill_cancellation_is_atomic() {
     let mut document = make_document([3, 3, 3], vec![0; 27], false);
     let cancel = CancellationToken::default();
     cancel.cancel();
 
     assert!(matches!(
-        document.make_solid(&cancel),
+        document.fill_enclosed_cavities(&cancel),
         Err(voxel_ink::AppError::Cancelled)
     ));
     assert_eq!(document.view().occupancy, &[0; 27]);

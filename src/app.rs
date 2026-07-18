@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -8,11 +8,11 @@ use egui::{Color32, TextureHandle, TextureOptions, Vec2};
 
 use crate::{
     EngineCommand, EngineEvent, EngineHandle,
-    brush::BrushDiameter,
+    brush::{BrushDepth, BrushShape, BrushSize, BrushSpec},
     codecs::{FormatFamily, SourceVariant},
-    engine::{BusyKind, JobId, PointerSample, SlicePatch, StrokeSpace},
+    engine::{BrushPreviewRequest, BusyKind, JobId, PointerSample, SlicePatch, StrokeSpace},
     io::SaveMode,
-    renderer::{SceneBridge, VolumePaintCallback},
+    renderer::{SceneBridge, VolumePaintCallback, VoxelPreviewKind},
     volume::{DocumentSummary, SliceAxis, SliceImage, SpatialUnits, Tool},
 };
 
@@ -26,6 +26,13 @@ const MUTED: Color32 = Color32::from_rgb(170, 185, 191);
 const TEAL: Color32 = Color32::from_rgb(36, 200, 219);
 const YELLOW: Color32 = Color32::from_rgb(255, 193, 49);
 const MAX_ENGINE_EVENTS_PER_FRAME: usize = 256;
+const SLICE_POINT_SCROLL_THRESHOLD: f32 = 24.0;
+const SLICE_TEXTURE_OPTIONS: TextureOptions = TextureOptions {
+    magnification: egui::TextureFilter::Nearest,
+    minification: egui::TextureFilter::Linear,
+    wrap_mode: egui::TextureWrapMode::ClampToEdge,
+    mipmap_mode: None,
+};
 
 #[derive(Clone, Copy, Debug)]
 enum GuardAction {
@@ -76,14 +83,132 @@ enum PromptChoice {
 
 #[derive(Default)]
 struct FrameStrokeActions {
-    sample: Option<PointerSample>,
-    complete: bool,
+    preview_hovered: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PreviewAction {
+    Stroke { complete: bool },
+    BridgeAnchor { plane_normal: [f64; 3] },
+    BridgeCommit,
+}
+
+impl PreviewAction {
+    const fn finishing_stroke(self) -> bool {
+        matches!(self, Self::Stroke { complete: true })
+    }
+
+    fn mark_stroke_complete(&mut self) {
+        if let Self::Stroke { complete } = self {
+            *complete = true;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ActionPreview {
+    request: BrushPreviewRequest,
+    action: PreviewAction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PendingPreview {
+    generation: u64,
+    request: BrushPreviewRequest,
+    action: PreviewAction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DeferredBridgeRelease {
+    sample: PointerSample,
+    spec: BrushSpec,
+    space: StrokeSpace,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BridgeAnchor {
+    voxel: [u32; 3],
+    space: StrokeSpace,
+    plane_normal: [f64; 3],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkspacePane {
     Slice(SliceAxis),
     Volume3D,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum BrushSizeUnit {
+    #[default]
+    Voxels,
+    Millimeters,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SliceViewState {
+    zoom: f32,
+    pan: Vec2,
+    point_scroll_remainder: f32,
+}
+
+impl Default for SliceViewState {
+    fn default() -> Self {
+        Self {
+            zoom: 1.0,
+            pan: Vec2::ZERO,
+            point_scroll_remainder: 0.0,
+        }
+    }
+}
+
+impl SliceViewState {
+    fn wheel_steps(&mut self, events: &[egui::Event]) -> i32 {
+        let mut steps = 0;
+        for event in events {
+            let egui::Event::MouseWheel {
+                unit, delta, phase, ..
+            } = event
+            else {
+                continue;
+            };
+            if matches!(phase, egui::TouchPhase::End | egui::TouchPhase::Cancel) {
+                self.point_scroll_remainder = 0.0;
+                continue;
+            }
+            let dominant = if delta.y.abs() >= delta.x.abs() {
+                delta.y
+            } else {
+                delta.x
+            };
+            if dominant.abs() <= f32::EPSILON {
+                continue;
+            }
+            match unit {
+                egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page => {
+                    self.point_scroll_remainder = 0.0;
+                    steps += dominant.signum() as i32;
+                }
+                egui::MouseWheelUnit::Point => {
+                    if self.point_scroll_remainder.signum() != dominant.signum()
+                        && self.point_scroll_remainder.abs() > f32::EPSILON
+                    {
+                        self.point_scroll_remainder = 0.0;
+                    }
+                    self.point_scroll_remainder += dominant;
+                    if self.point_scroll_remainder.abs() >= SLICE_POINT_SCROLL_THRESHOLD {
+                        steps += self.point_scroll_remainder.signum() as i32;
+                        self.point_scroll_remainder = 0.0;
+                    }
+                }
+            }
+        }
+        steps
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 pub struct VoxelInkApp {
@@ -95,18 +220,38 @@ pub struct VoxelInkApp {
     textures: HashMap<SliceAxis, TextureHandle>,
     slice_revision: u64,
     slice_preview_generation: u64,
+    brush_preview_generation: u64,
+    last_preview_request: Option<BrushPreviewRequest>,
+    brush_preview_tool: Option<Tool>,
+    brush_preview_target: Option<[u32; 3]>,
+    brush_preview_voxels: Vec<[u32; 3]>,
+    stroke_overlay_tool: Option<Tool>,
+    stroke_overlay_voxels: Vec<[u32; 3]>,
+    stroke_overlay_members: HashSet<[u32; 3]>,
+    stroke_overlay_revision: Option<u64>,
+    stroke_overlay_waiting_for_mesh: bool,
+    pending_preview: Option<PendingPreview>,
+    queued_action_preview: Option<ActionPreview>,
+    deferred_bridge_release: Option<DeferredBridgeRelease>,
+    bridge_anchor: Option<BridgeAnchor>,
     logo: TextureHandle,
     scene: SceneBridge,
     target_format: wgpu::TextureFormat,
     adapter_name: String,
     tool: Tool,
-    brush_diameter: u8,
+    brush_shape: BrushShape,
+    brush_depth: BrushDepth,
+    brush_size_unit: BrushSizeUnit,
+    brush_voxel_diameter: u8,
+    brush_millimeters: f32,
     active_slice: SliceAxis,
+    slice_views: HashMap<SliceAxis, SliceViewState>,
     busy: HashMap<JobId, BusyKind>,
     pending_saves: HashMap<JobId, SaveRequest>,
     prompt: Option<Prompt>,
     error_message: Option<String>,
     preview_notice: Option<String>,
+    mesh_preview_failed: bool,
     dialog: Option<(DialogPurpose, Receiver<Option<PathBuf>>)>,
     dialog_copy_request: Option<SaveRequest>,
     allow_exit: bool,
@@ -167,18 +312,41 @@ impl VoxelInkApp {
             textures: HashMap::new(),
             slice_revision: 0,
             slice_preview_generation: 0,
+            brush_preview_generation: 0,
+            last_preview_request: None,
+            brush_preview_tool: None,
+            brush_preview_target: None,
+            brush_preview_voxels: Vec::new(),
+            stroke_overlay_tool: None,
+            stroke_overlay_voxels: Vec::new(),
+            stroke_overlay_members: HashSet::new(),
+            stroke_overlay_revision: None,
+            stroke_overlay_waiting_for_mesh: false,
+            pending_preview: None,
+            queued_action_preview: None,
+            deferred_bridge_release: None,
+            bridge_anchor: None,
             logo,
             scene,
             target_format,
             adapter_name,
             tool: Tool::Inspect,
-            brush_diameter: 1,
+            brush_shape: BrushShape::Round,
+            brush_depth: BrushDepth::Slice,
+            brush_size_unit: BrushSizeUnit::Voxels,
+            brush_voxel_diameter: 5,
+            brush_millimeters: 3.0,
             active_slice: SliceAxis::Axial,
+            slice_views: [SliceAxis::Axial, SliceAxis::Coronal, SliceAxis::Sagittal]
+                .into_iter()
+                .map(|axis| (axis, SliceViewState::default()))
+                .collect(),
             busy: HashMap::new(),
             pending_saves: HashMap::new(),
             prompt: None,
             error_message: None,
             preview_notice: None,
+            mesh_preview_failed: false,
             dialog: None,
             dialog_copy_request: None,
             allow_exit: false,
@@ -199,6 +367,7 @@ impl VoxelInkApp {
 
     fn process_engine_events(&mut self, ctx: &egui::Context) {
         let mut exhausted_budget = true;
+        let mut overlay_refresh_revision = None;
         for _ in 0..MAX_ENGINE_EVENTS_PER_FRAME {
             let Some(event) = self.engine.try_event() else {
                 exhausted_budget = false;
@@ -242,15 +411,38 @@ impl VoxelInkApp {
                     summary,
                     slices,
                 } => {
+                    self.brush_size_unit = if summary.units == SpatialUnits::Unknown {
+                        BrushSizeUnit::Voxels
+                    } else {
+                        BrushSizeUnit::Millimeters
+                    };
                     self.epoch = epoch;
                     self.slice_revision = summary.revision;
                     self.slice_preview_generation = 0;
+                    self.brush_preview_generation = 0;
+                    self.last_preview_request = None;
+                    self.brush_preview_tool = None;
+                    self.brush_preview_target = None;
+                    self.brush_preview_voxels.clear();
+                    self.stroke_overlay_tool = None;
+                    self.stroke_overlay_voxels.clear();
+                    self.stroke_overlay_members.clear();
+                    self.stroke_overlay_revision = None;
+                    self.stroke_overlay_waiting_for_mesh = false;
+                    self.pending_preview = None;
+                    self.queued_action_preview = None;
+                    self.deferred_bridge_release = None;
+                    self.bridge_anchor = None;
                     self.summary = Some(summary);
                     self.stroke_active = false;
                     self.stroke_completion_pending = false;
                     self.maximized_pane = None;
+                    for view in self.slice_views.values_mut() {
+                        view.reset();
+                    }
                     self.replace_slices(ctx, slices);
                     self.preview_notice = None;
+                    self.mesh_preview_failed = false;
                 }
                 EngineEvent::DocumentClosed { epoch } => {
                     self.epoch = epoch;
@@ -259,11 +451,29 @@ impl VoxelInkApp {
                     self.textures.clear();
                     self.slice_revision = 0;
                     self.slice_preview_generation = 0;
+                    self.brush_preview_generation = 0;
+                    self.last_preview_request = None;
+                    self.brush_preview_tool = None;
+                    self.brush_preview_target = None;
+                    self.brush_preview_voxels.clear();
+                    self.stroke_overlay_tool = None;
+                    self.stroke_overlay_voxels.clear();
+                    self.stroke_overlay_members.clear();
+                    self.stroke_overlay_revision = None;
+                    self.stroke_overlay_waiting_for_mesh = false;
+                    self.pending_preview = None;
+                    self.queued_action_preview = None;
+                    self.deferred_bridge_release = None;
+                    self.bridge_anchor = None;
                     self.stroke_active = false;
                     self.stroke_completion_pending = false;
                     self.maximized_pane = None;
+                    for view in self.slice_views.values_mut() {
+                        view.reset();
+                    }
                     self.scene.clear();
                     self.preview_notice = None;
+                    self.mesh_preview_failed = false;
                 }
                 EngineEvent::Summary { epoch, summary } if epoch == self.epoch => {
                     let revision_changed = self
@@ -273,6 +483,21 @@ impl VoxelInkApp {
                     self.summary = Some(summary);
                     if revision_changed {
                         self.preview_notice = None;
+                        self.brush_preview_generation =
+                            self.brush_preview_generation.saturating_add(1);
+                        self.engine.cancel_preview();
+                        self.last_preview_request = None;
+                        self.pending_preview = None;
+                        self.queued_action_preview = None;
+                        self.deferred_bridge_release = None;
+                        self.bridge_anchor = None;
+                        self.brush_preview_target = None;
+                        self.brush_preview_voxels.clear();
+                        self.brush_preview_tool = None;
+                        if !self.stroke_overlay_waiting_for_mesh {
+                            self.clear_stroke_overlay_data();
+                        }
+                        self.refresh_scene_brush_preview(epoch, self.summary_revision());
                     }
                 }
                 EngineEvent::SlicesReplaced {
@@ -287,6 +512,11 @@ impl VoxelInkApp {
                 {
                     self.slice_revision = revision;
                     self.slice_preview_generation = 0;
+                    self.last_preview_request = None;
+                    self.brush_preview_target = None;
+                    self.brush_preview_voxels.clear();
+                    self.brush_preview_tool = None;
+                    self.refresh_scene_brush_preview(epoch, revision);
                     self.replace_slices(ctx, slices);
                 }
                 EngineEvent::SlicePatch {
@@ -309,6 +539,36 @@ impl VoxelInkApp {
                     self.slice_preview_generation = preview_generation;
                     self.apply_slice_patch(ctx, patch);
                 }
+                EngineEvent::BrushPreview {
+                    epoch,
+                    revision,
+                    generation,
+                    tool,
+                    target,
+                    voxels,
+                } if epoch == self.epoch
+                    && generation == self.brush_preview_generation
+                    && self
+                        .summary
+                        .as_ref()
+                        .is_some_and(|summary| summary.revision == revision) =>
+                {
+                    self.accept_brush_preview(epoch, revision, generation, tool, target, voxels);
+                }
+                EngineEvent::BrushPreviewFailed {
+                    epoch,
+                    revision,
+                    generation,
+                    message,
+                } if epoch == self.epoch
+                    && generation == self.brush_preview_generation
+                    && self
+                        .summary
+                        .as_ref()
+                        .is_some_and(|summary| summary.revision == revision) =>
+                {
+                    self.handle_brush_preview_failure(generation, message);
+                }
                 EngineEvent::Saved {
                     job_id,
                     mode: _,
@@ -326,15 +586,15 @@ impl VoxelInkApp {
                         }
                     }
                 }
-                EngineEvent::MadeSolid {
+                EngineEvent::CavitiesFilled {
                     epoch,
                     revision: _,
                     added_voxels,
                 } if epoch == self.epoch => {
                     self.preview_notice = Some(if added_voxels == 0 {
-                        "Already solid left ↔ right".into()
+                        "No enclosed cavities found — the interior is already filled, or an opening still reaches the outside".into()
                     } else {
-                        solidify_notice(self.summary.as_ref(), added_voxels)
+                        cavities_filled_notice(self.summary.as_ref(), added_voxels)
                     });
                 }
                 EngineEvent::MeshReset {
@@ -342,28 +602,49 @@ impl VoxelInkApp {
                     revision,
                     dimensions,
                     index_to_world,
-                } => self
-                    .scene
-                    .reset(epoch, revision, dimensions, index_to_world),
+                } => {
+                    self.mesh_preview_failed = false;
+                    self.scene
+                        .reset(epoch, revision, dimensions, index_to_world);
+                }
                 EngineEvent::MeshInvalidated {
                     epoch,
                     revision,
                     chunks,
-                } => self.scene.invalidate(epoch, revision, chunks),
-                EngineEvent::MeshChunk { tag, quads } => self.scene.insert_chunk(tag, quads),
+                } => {
+                    self.scene.invalidate(epoch, revision, chunks);
+                    if epoch == self.epoch && self.stroke_overlay_waiting_for_mesh {
+                        self.stroke_overlay_revision = Some(revision);
+                        self.stroke_overlay_waiting_for_mesh = false;
+                        self.refresh_scene_brush_preview(epoch, revision);
+                    }
+                }
+                EngineEvent::MeshChunk { tag, quads } => {
+                    self.scene.insert_chunk(tag, quads);
+                    if tag.document_epoch == self.epoch
+                        && self.stroke_overlay_revision == Some(tag.revision)
+                        && self.retire_stroke_overlay_chunk(tag.chunk)
+                    {
+                        overlay_refresh_revision = Some(tag.revision);
+                    }
+                }
                 EngineEvent::PreviewTooComplex { epoch, .. } if epoch == self.epoch => {
-                    self.preview_notice = Some(
-                        "3D preview too complex; slice editing remains fully available".into(),
-                    );
+                    self.mesh_preview_failed = true;
                 }
                 _ => {}
             }
+        }
+        if let Some(revision) = overlay_refresh_revision {
+            self.refresh_scene_brush_preview(self.epoch, revision);
         }
         if exhausted_budget {
             ctx.request_repaint();
         }
         if self.scene.take_remesh_request() && self.summary.is_some() {
             let _ = self.send_command(EngineCommand::RebuildPreview);
+        }
+        if let Some(message) = self.scene.take_preview_failure() {
+            self.error_message = Some(message.to_string());
         }
     }
 
@@ -384,6 +665,7 @@ impl VoxelInkApp {
         };
         match purpose {
             Some(DialogPurpose::Open) => {
+                self.cancel_edit_interaction();
                 if let Err(error) = self.engine.start_load(path) {
                     self.error_message = Some(error.to_string());
                 }
@@ -427,10 +709,15 @@ impl VoxelInkApp {
         if self.prompt.is_some() || self.error_message.is_some() || !self.busy.is_empty() {
             return;
         }
-        if self.maximized_pane.is_some()
+        let has_edit_interaction = self.has_edit_interaction();
+        if (has_edit_interaction || self.maximized_pane.is_some())
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
-            self.maximized_pane = None;
+            if has_edit_interaction {
+                self.cancel_edit_interaction();
+            } else {
+                self.maximized_pane = None;
+            }
             ctx.request_repaint();
         }
         let open = consume_shortcut(ctx, egui::Modifiers::CTRL, egui::Key::O);
@@ -456,32 +743,46 @@ impl VoxelInkApp {
             egui::Key::Z,
         );
         let redo_y = consume_shortcut(ctx, egui::Modifiers::CTRL, egui::Key::Y);
-        if open {
+        let edit_commands_ready = !self.has_edit_interaction();
+        if open && edit_commands_ready {
             self.guard_or_execute(GuardAction::OpenDialog);
         }
-        if save_as {
+        if save_as && edit_commands_ready {
             self.open_save_dialog(DialogPurpose::SaveAs);
-        } else if save {
+        } else if save && edit_commands_ready {
             self.request_overwrite(None);
         }
-        if close {
+        if close && edit_commands_ready {
             self.guard_or_execute(GuardAction::CloseDocument);
         }
-        if redo_shift || redo_y {
+        if (redo_shift || redo_y) && edit_commands_ready {
+            self.clear_brush_preview();
+            self.clear_stroke_overlay();
             let _ = self.send_command(EngineCommand::Redo);
-        } else if undo {
+        } else if undo && edit_commands_ready {
+            self.clear_brush_preview();
+            self.clear_stroke_overlay();
             let _ = self.send_command(EngineCommand::Undo);
         }
+        let previous_tool = self.tool;
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::I)) {
             self.tool = Tool::Inspect;
         }
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::B)) {
-            self.tool = Tool::Brush;
+            self.tool = Tool::Paint;
         }
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::E)) {
-            self.tool = Tool::Eraser;
+            self.tool = Tool::Erase;
         }
-        if self.pane_keyboard_focus || !ctx.egui_wants_keyboard_input() {
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::L)) {
+            self.tool = Tool::Bridge;
+        }
+        if self.tool != previous_tool {
+            self.cancel_edit_interaction();
+        }
+        if !self.has_edit_interaction()
+            && (self.pane_keyboard_focus || !ctx.egui_wants_keyboard_input())
+        {
             self.handle_cursor_keys(ctx);
         }
     }
@@ -522,15 +823,21 @@ impl VoxelInkApp {
             input.consume_key(egui::Modifiers::NONE, egui::Key::Space)
                 || input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
         });
-        if edit && self.tool != Tool::Inspect {
-            let diameter = BrushDiameter::new(self.brush_diameter).unwrap_or_default();
-            if self.begin_stroke(self.tool, diameter, StrokeSpace::Slice(self.active_slice)) {
-                let _ = self.send_command(EngineCommand::SliceSample {
-                    axis: self.active_slice,
-                    voxel: cursor,
-                });
-                let _ = self.complete_active_stroke();
-            }
+        if edit && matches!(self.tool, Tool::Paint | Tool::Erase) {
+            let space = StrokeSpace::Slice(self.active_slice);
+            self.request_action_preview(
+                BrushPreviewRequest::Brush {
+                    generation: 0,
+                    tool: self.tool,
+                    spec: self.brush_spec(),
+                    space,
+                    sample: PointerSample::Slice {
+                        axis: self.active_slice,
+                        voxel: cursor,
+                    },
+                },
+                PreviewAction::Stroke { complete: true },
+            );
         }
     }
 
@@ -551,15 +858,19 @@ impl VoxelInkApp {
                     );
                     ui.heading("VoxelInk");
                     ui.separator();
+                    let edit_commands_ready = !self.has_edit_interaction();
                     if ui
-                        .add_enabled(self.busy.is_empty(), egui::Button::new("Open…"))
+                        .add_enabled(
+                            self.busy.is_empty() && edit_commands_ready,
+                            egui::Button::new("Open…"),
+                        )
                         .on_hover_text("Open volume (Ctrl+O)")
                         .clicked()
                     {
                         self.guard_or_execute(GuardAction::OpenDialog);
                     }
                     let has_document = self.summary.is_some();
-                    let ready = has_document && self.busy.is_empty();
+                    let ready = has_document && self.busy.is_empty() && edit_commands_ready;
                     if ui
                         .add_enabled(ready, egui::Button::new("Save"))
                         .on_hover_text("Save (Ctrl+S)")
@@ -595,6 +906,8 @@ impl VoxelInkApp {
                         .on_hover_text("Undo (Ctrl+Z)")
                         .clicked()
                     {
+                        self.clear_brush_preview();
+                        self.clear_stroke_overlay();
                         let _ = self.send_command(EngineCommand::Undo);
                     }
                     if ui
@@ -602,51 +915,10 @@ impl VoxelInkApp {
                         .on_hover_text("Redo (Ctrl+Shift+Z or Ctrl+Y)")
                         .clicked()
                     {
+                        self.clear_brush_preview();
+                        self.clear_stroke_overlay();
                         let _ = self.send_command(EngineCommand::Redo);
                     }
-                    ui.separator();
-                    ui.strong("VOLUME");
-                    if ui
-                        .add_enabled(
-                            ready,
-                            egui::Button::new(
-                                egui::RichText::new("Make solid left ↔ right").strong(),
-                            ),
-                        )
-                        .on_hover_text(
-                            "Fill every gap between the model's left and right surfaces in one undoable step; this also fills internal openings such as eye sockets and sinuses",
-                        )
-                        .clicked()
-                    {
-                        self.preview_notice = None;
-                        if let Err(error) = self.engine.start_make_solid() {
-                            self.error_message = Some(error.to_string());
-                        }
-                    }
-                    ui.separator();
-                    ui.strong("TOOLS");
-                    ui.add_enabled_ui(self.busy.is_empty(), |ui| {
-                        ui.selectable_value(&mut self.tool, Tool::Inspect, "Inspect (I)")
-                            .on_hover_text("Inspect slices; drag the 3D view to rotate it");
-                        ui.selectable_value(&mut self.tool, Tool::Brush, "Brush (B)")
-                            .on_hover_text("Add filled voxels with the primary mouse button");
-                        ui.selectable_value(&mut self.tool, Tool::Eraser, "Eraser (E)")
-                            .on_hover_text("Remove voxels with the primary mouse button");
-                    });
-                    ui.add_enabled_ui(self.tool != Tool::Inspect && self.busy.is_empty(), |ui| {
-                        ui.label("Brush size (voxels)");
-                        let changed = ui
-                            .add(
-                                egui::Slider::new(&mut self.brush_diameter, 1..=31)
-                                    .step_by(2.0)
-                                    .show_value(true)
-                                    .text("brush size in voxels"),
-                            )
-                            .changed();
-                        if changed && self.brush_diameter.is_multiple_of(2) {
-                            self.brush_diameter = (self.brush_diameter + 1).min(31);
-                        }
-                    });
                     if let Some(summary) = &self.summary {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let dirty = if summary.is_dirty() {
@@ -665,6 +937,157 @@ impl VoxelInkApp {
                         });
                     }
                 });
+            });
+    }
+
+    fn repair_panel(&mut self, root: &mut egui::Ui) {
+        let surface = self.surface_color();
+        egui::Panel::left("voxel-ink-repair-panel")
+            .default_size(232.0)
+            .min_size(232.0)
+            .max_size(232.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(surface)
+                    .inner_margin(egui::Margin::same(12)),
+            )
+            .show(root, |ui| {
+                let has_document = self.summary.is_some();
+                let ready = has_document
+                    && self.busy.is_empty()
+                    && !self.has_edit_interaction();
+                ui.heading("Repair volume");
+                ui.add_space(4.0);
+                ui.strong("1 · Seal every opening");
+                ui.label(
+                    egui::RichText::new(
+                        "Paint missing voxels or bridge two surfaces until the skull interior is closed.",
+                    )
+                    .color(MUTED),
+                );
+                ui.add_space(8.0);
+                let previous_tool = self.tool;
+                ui.add_enabled_ui(self.busy.is_empty(), |ui| {
+                    ui.selectable_value(&mut self.tool, Tool::Inspect, "Inspect / navigate (I)")
+                        .on_hover_text("Move through slices and rotate or pan the 3D view");
+                    ui.selectable_value(&mut self.tool, Tool::Paint, "Paint solid (B)")
+                        .on_hover_text("Fill the highlighted voxels with the primary mouse button");
+                    ui.selectable_value(&mut self.tool, Tool::Erase, "Erase solid (E)")
+                        .on_hover_text("Remove the highlighted voxels with the primary mouse button");
+                    ui.selectable_value(&mut self.tool, Tool::Bridge, "Bridge surfaces (L)")
+                        .on_hover_text("Drag between two points to add a solid connection in one Undo step");
+                });
+                if self.tool != previous_tool {
+                    self.cancel_edit_interaction();
+                }
+
+                ui.add_space(10.0);
+                ui.add_enabled_ui(ready && self.tool != Tool::Inspect, |ui| {
+                    ui.strong("Brush footprint");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.brush_shape, BrushShape::Round, "Round");
+                        ui.selectable_value(&mut self.brush_shape, BrushShape::Square, "Square");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.brush_depth, BrushDepth::Slice, "One slice");
+                        ui.selectable_value(&mut self.brush_depth, BrushDepth::Volume, "3D volume");
+                    });
+                    ui.label(
+                        egui::RichText::new("Depth applies in slice views; 3D editing uses a 3D brush.")
+                            .small()
+                            .color(MUTED),
+                    );
+                    ui.add_space(5.0);
+
+                    let has_physical_units = self
+                        .summary
+                        .as_ref()
+                        .is_some_and(|summary| summary.units != SpatialUnits::Unknown);
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.brush_size_unit,
+                            BrushSizeUnit::Voxels,
+                            "Voxels",
+                        );
+                        ui.add_enabled_ui(has_physical_units, |ui| {
+                            ui.selectable_value(
+                                &mut self.brush_size_unit,
+                                BrushSizeUnit::Millimeters,
+                                "Millimetres",
+                            );
+                        });
+                    });
+                    if !has_physical_units {
+                        self.brush_size_unit = BrushSizeUnit::Voxels;
+                    }
+                    match self.brush_size_unit {
+                        BrushSizeUnit::Voxels => {
+                            let changed = ui
+                                .add(
+                                    egui::Slider::new(
+                                        &mut self.brush_voxel_diameter,
+                                        BrushSize::MIN_VOXELS..=BrushSize::MAX_VOXELS,
+                                    )
+                                    .step_by(2.0)
+                                    .text("Brush diameter in voxels"),
+                                )
+                                .changed();
+                            if changed && self.brush_voxel_diameter.is_multiple_of(2) {
+                                self.brush_voxel_diameter =
+                                    self.brush_voxel_diameter.saturating_add(1).min(BrushSize::MAX_VOXELS);
+                            }
+                        }
+                        BrushSizeUnit::Millimeters => {
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.brush_millimeters,
+                                    BrushSize::MIN_MILLIMETERS..=BrushSize::MAX_MILLIMETERS,
+                                )
+                                .step_by(0.5)
+                                .suffix(" mm")
+                                .text("Brush diameter in millimetres"),
+                            );
+                        }
+                    }
+                });
+
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(10.0);
+                ui.strong("2 · Fill the closed interior");
+                ui.label(
+                    egui::RichText::new(
+                        "After every opening is sealed, fill all empty regions that can no longer reach a volume boundary.",
+                    )
+                    .color(MUTED),
+                );
+                ui.add_space(8.0);
+                if ui
+                    .add_enabled(
+                        ready,
+                        egui::Button::new(
+                            egui::RichText::new("Fill enclosed cavities").strong(),
+                        )
+                        .min_size(egui::vec2(ui.available_width(), 34.0)),
+                    )
+                    .on_hover_text(
+                        "Fill every empty 3D region that cannot reach any outside volume face. The result is one Undo step.",
+                    )
+                    .clicked()
+                {
+                    self.preview_notice = None;
+                    self.clear_brush_preview();
+                    self.clear_stroke_overlay();
+                    if let Err(error) = self.engine.start_fill_enclosed_cavities() {
+                        self.error_message = Some(error.to_string());
+                    }
+                }
+                ui.label(
+                    egui::RichText::new("No point selection is needed. Cancel is available while scanning.")
+                        .small()
+                        .color(MUTED),
+                );
             });
     }
 
@@ -698,6 +1121,17 @@ impl VoxelInkApp {
                     if let Some(notice) = &self.preview_notice {
                         ui.colored_label(YELLOW, notice);
                     }
+                    if self.mesh_preview_failed {
+                        ui.colored_label(
+                            YELLOW,
+                            "3D preview paused at its memory limit; slice editing is unaffected",
+                        );
+                        if ui.button("Retry 3D preview").clicked()
+                            && self.send_command(EngineCommand::RebuildPreview)
+                        {
+                            self.mesh_preview_failed = false;
+                        }
+                    }
                     if let Some((&job_id, kind)) = self.busy.iter().next() {
                         if self.reduced_motion {
                             ui.label("Working");
@@ -707,7 +1141,7 @@ impl VoxelInkApp {
                         ui.label(match kind {
                             BusyKind::Loading => "Loading…",
                             BusyKind::Saving => "Saving…",
-                            BusyKind::MakingSolid => "Making the volume solid…",
+                            BusyKind::FillingCavities => "Finding enclosed cavities…",
                         });
                         if ui.button("Cancel").clicked() {
                             self.engine.cancel_job(job_id);
@@ -787,13 +1221,12 @@ impl VoxelInkApp {
                         });
                     }
                 }
-                if let Some(sample) = actions.sample
-                    && let Err(error) = self.engine.send_latest_sample(sample)
+                if !actions.preview_hovered
+                    && !self.stroke_active
+                    && self.bridge_anchor.is_none()
+                    && self.pending_preview.is_none()
                 {
-                    self.error_message = Some(error.to_string());
-                }
-                if actions.complete {
-                    let _ = self.complete_active_stroke();
+                    self.clear_brush_preview();
                 }
             });
     }
@@ -855,6 +1288,41 @@ impl VoxelInkApp {
             self.maximized_pane = if maximized { None } else { Some(pane) };
             ui.ctx().request_repaint();
         }
+        let fit_button_rect = egui::Rect::from_min_size(
+            egui::pos2(button_rect.left() - 47.0, pane_rect.top() + 4.0),
+            egui::vec2(42.0, 22.0),
+        );
+        if ui
+            .put(fit_button_rect, egui::Button::new("Fit"))
+            .on_hover_text("Fit the complete slice in this pane")
+            .clicked()
+            && let Some(view) = self.slice_views.get_mut(&axis)
+        {
+            view.reset();
+        }
+        let coordinate_rect = egui::Rect::from_min_size(
+            egui::pos2(fit_button_rect.left() - 75.0, pane_rect.top() + 4.0),
+            egui::vec2(70.0, 22.0),
+        );
+        let mut requested_coordinate = coordinate;
+        if ui
+            .put(
+                coordinate_rect,
+                egui::DragValue::new(&mut requested_coordinate)
+                    .range(0..=last_coordinate)
+                    .speed(1.0)
+                    .prefix("slice "),
+            )
+            .on_hover_text("Enter or drag to choose an exact slice")
+            .changed()
+            && requested_coordinate != coordinate
+            && let Some(summary) = &self.summary
+        {
+            let mut cursor = summary.cursor;
+            cursor[axis.normal_axis()] = requested_coordinate;
+            self.active_slice = axis;
+            let _ = self.send_command(EngineCommand::SetCursor(cursor));
+        }
         let content = egui::Rect::from_min_max(
             pane_rect.min + egui::vec2(6.0, 30.0),
             pane_rect.max - egui::vec2(6.0, 6.0),
@@ -874,22 +1342,58 @@ impl VoxelInkApp {
         };
         let width = slice.width;
         let height = slice.height;
-        let image_rect = fit_rect(content, width as f32 / height as f32);
+        let physical_aspect = self.summary.as_ref().map_or_else(
+            || width as f32 / height as f32,
+            |summary| slice_physical_aspect(axis, width, height, summary.spacing),
+        );
+        let fitted_rect = fit_rect(content, physical_aspect);
+        let mut view = self.slice_views.get(&axis).copied().unwrap_or_default();
+        let image_rect = egui::Rect::from_center_size(
+            fitted_rect.center() + view.pan,
+            fitted_rect.size() * view.zoom,
+        );
         ui.painter().image(
             texture_id,
             image_rect,
             egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
             Color32::WHITE,
         );
+        if let Some(preview_tool) = self.stroke_overlay_tool {
+            paint_brush_preview(
+                &ui.painter().with_clip_rect(content),
+                image_rect,
+                axis,
+                coordinate,
+                width,
+                height,
+                &self.stroke_overlay_voxels,
+                preview_tool,
+                self.forced_colors,
+            );
+        }
+        if let Some(preview_tool) = self.brush_preview_tool {
+            paint_brush_preview(
+                &ui.painter().with_clip_rect(content),
+                image_rect,
+                axis,
+                coordinate,
+                width,
+                height,
+                &self.brush_preview_voxels,
+                preview_tool,
+                self.forced_colors,
+            );
+        }
         ui.painter().text(
-            image_rect.left_bottom() + egui::vec2(8.0, -8.0),
+            content.left_bottom() + egui::vec2(8.0, -8.0),
             egui::Align2::LEFT_BOTTOM,
-            "Wheel: change slice   Shift + wheel: jump 10",
+            "Wheel: 1 slice   Ctrl + wheel: zoom   Middle / right drag: move",
             egui::FontId::proportional(12.0),
             MUTED,
         );
+        let interaction_rect = image_rect.intersect(content);
         let response = ui.interact(
-            image_rect,
+            interaction_rect,
             ui.id().with(("slice", axis)),
             egui::Sense::click_and_drag(),
         );
@@ -920,37 +1424,50 @@ impl VoxelInkApp {
             response.request_focus();
             self.active_slice = axis;
         }
+        if response.dragged_by(egui::PointerButton::Middle)
+            || response.dragged_by(egui::PointerButton::Secondary)
+        {
+            view.pan += response.drag_delta();
+        }
         if response.hovered()
             && self.busy.is_empty()
             && !self.stroke_active
             && !self.stroke_completion_pending
         {
-            let (scroll, fast) = ui.input(|input| {
-                let delta = input.smooth_scroll_delta;
-                let dominant = if delta.y.abs() >= delta.x.abs() {
-                    delta.y
-                } else {
-                    delta.x
-                };
-                (dominant, input.modifiers.shift)
-            });
-            if scroll.abs() > f32::EPSILON
-                && let Some(summary) = &self.summary
-            {
-                let mut cursor = summary.cursor;
-                let normal = axis.normal_axis();
-                let step = if fast { 10 } else { 1 };
-                cursor[normal] = if scroll > 0.0 {
-                    cursor[normal]
-                        .saturating_add(step)
-                        .min(summary.dimensions[normal] - 1)
-                } else {
-                    cursor[normal].saturating_sub(step)
-                };
-                self.active_slice = axis;
-                let _ = self.send_command(EngineCommand::SetCursor(cursor));
+            let control = ui.input(|input| input.modifiers.ctrl);
+            if control {
+                let zoom_delta = ui.input(|input| input.smooth_scroll_delta.y);
+                if zoom_delta.abs() > f32::EPSILON {
+                    let previous_zoom = view.zoom;
+                    view.zoom = (view.zoom * (zoom_delta * 0.002).exp()).clamp(0.25, 32.0);
+                    if let Some(pointer) = response.hover_pos() {
+                        let old_center = fitted_rect.center() + view.pan;
+                        let scale = view.zoom / previous_zoom;
+                        let new_center = pointer - (pointer - old_center) * scale;
+                        view.pan = new_center - fitted_rect.center();
+                    }
+                }
+                view.point_scroll_remainder = 0.0;
+            } else {
+                let steps = ui.input(|input| view.wheel_steps(&input.events));
+                if steps != 0
+                    && let Some(summary) = &self.summary
+                {
+                    let mut cursor = summary.cursor;
+                    let normal = axis.normal_axis();
+                    cursor[normal] = step_slice_coordinate(
+                        cursor[normal],
+                        summary.dimensions[normal] - 1,
+                        steps,
+                    );
+                    self.active_slice = axis;
+                    let _ = self.send_command(EngineCommand::SetCursor(cursor));
+                }
             }
+        } else if !response.hovered() {
+            view.point_scroll_remainder = 0.0;
         }
+        self.slice_views.insert(axis, view);
         if let Some(summary) = &self.summary {
             paint_crosshair(
                 ui.painter(),
@@ -961,47 +1478,149 @@ impl VoxelInkApp {
                 height,
             );
         }
-        let pointer_voxel = response.interact_pointer_pos().and_then(|position| {
-            self.summary.as_ref().map(|summary| {
-                slice_pointer_to_voxel(axis, position, image_rect, width, height, summary.cursor)
+        let pointer_voxel = response
+            .interact_pointer_pos()
+            .and_then(|position| {
+                rect_contains_half_open(interaction_rect, position).then_some(position)
             })
-        });
+            .and_then(|position| {
+                self.summary.as_ref().and_then(|summary| {
+                    slice_pointer_to_voxel(
+                        axis,
+                        position,
+                        image_rect,
+                        width,
+                        height,
+                        summary.cursor,
+                    )
+                })
+            });
         if !self.busy.is_empty() {
             return;
         }
-        if self.tool != Tool::Inspect {
-            if response.drag_started()
+        let space = StrokeSpace::Slice(axis);
+        if self.tool != Tool::Inspect
+            && response.hovered()
+            && !self.stroke_active
+            && !self.stroke_completion_pending
+            && let Some(voxel) = pointer_voxel
+        {
+            actions.preview_hovered = true;
+            let sample = PointerSample::Slice { axis, voxel };
+            let request = match self.bridge_anchor {
+                Some(anchor) if self.tool == Tool::Bridge && anchor.space == space => {
+                    BrushPreviewRequest::Bridge {
+                        generation: 0,
+                        spec: self.brush_spec(),
+                        space,
+                        anchor: anchor.voxel,
+                        plane_normal: anchor.plane_normal,
+                        sample,
+                    }
+                }
+                _ => BrushPreviewRequest::Brush {
+                    generation: 0,
+                    tool: self.tool,
+                    spec: self.brush_spec(),
+                    space,
+                    sample,
+                },
+            };
+            self.request_brush_preview(request);
+        }
+        if matches!(self.tool, Tool::Paint | Tool::Erase) {
+            if response.drag_started_by(egui::PointerButton::Primary)
                 && let Some(voxel) = pointer_voxel
             {
                 self.active_slice = axis;
-                if self.begin_stroke(
-                    self.tool,
-                    BrushDiameter::new(self.brush_diameter).unwrap_or_default(),
-                    StrokeSpace::Slice(axis),
-                ) && !self.send_command(EngineCommand::SliceSample { axis, voxel })
-                {
-                    let _ = self.complete_active_stroke();
-                }
-            } else if response.dragged()
+                self.request_action_preview(
+                    BrushPreviewRequest::Brush {
+                        generation: 0,
+                        tool: self.tool,
+                        spec: self.brush_spec(),
+                        space,
+                        sample: PointerSample::Slice { axis, voxel },
+                    },
+                    PreviewAction::Stroke { complete: false },
+                );
+            } else if response.dragged_by(egui::PointerButton::Primary)
                 && let Some(voxel) = pointer_voxel
             {
-                actions.sample = Some(PointerSample::Slice { axis, voxel });
+                self.request_action_preview(
+                    BrushPreviewRequest::Brush {
+                        generation: 0,
+                        tool: self.tool,
+                        spec: self.brush_spec(),
+                        space,
+                        sample: PointerSample::Slice { axis, voxel },
+                    },
+                    PreviewAction::Stroke { complete: false },
+                );
             }
-            if response.drag_stopped() {
+            if response.drag_stopped_by(egui::PointerButton::Primary) {
                 if let Some(voxel) = pointer_voxel {
-                    actions.sample = Some(PointerSample::Slice { axis, voxel });
+                    self.request_action_preview(
+                        BrushPreviewRequest::Brush {
+                            generation: 0,
+                            tool: self.tool,
+                            spec: self.brush_spec(),
+                            space,
+                            sample: PointerSample::Slice { axis, voxel },
+                        },
+                        PreviewAction::Stroke { complete: true },
+                    );
+                } else {
+                    self.finish_stroke_pointer_release();
                 }
-                actions.complete = true;
-            } else if response.clicked()
+            } else if response.clicked_by(egui::PointerButton::Primary)
                 && let Some(voxel) = pointer_voxel
-                && self.begin_stroke(
-                    self.tool,
-                    BrushDiameter::new(self.brush_diameter).unwrap_or_default(),
-                    StrokeSpace::Slice(axis),
-                )
             {
-                let _ = self.send_command(EngineCommand::SliceSample { axis, voxel });
-                let _ = self.complete_active_stroke();
+                self.request_action_preview(
+                    BrushPreviewRequest::Brush {
+                        generation: 0,
+                        tool: self.tool,
+                        spec: self.brush_spec(),
+                        space,
+                        sample: PointerSample::Slice { axis, voxel },
+                    },
+                    PreviewAction::Stroke { complete: true },
+                );
+            }
+        } else if self.tool == Tool::Bridge {
+            if response.drag_started_by(egui::PointerButton::Primary)
+                && let Some(voxel) = pointer_voxel
+            {
+                self.active_slice = axis;
+                self.request_action_preview(
+                    BrushPreviewRequest::Brush {
+                        generation: 0,
+                        tool: Tool::Bridge,
+                        spec: self.brush_spec(),
+                        space,
+                        sample: PointerSample::Slice { axis, voxel },
+                    },
+                    PreviewAction::BridgeAnchor {
+                        plane_normal: [0.0; 3],
+                    },
+                );
+            }
+            if response.drag_stopped_by(egui::PointerButton::Primary) {
+                if let Some(voxel) = pointer_voxel {
+                    let release = DeferredBridgeRelease {
+                        sample: PointerSample::Slice { axis, voxel },
+                        spec: self.brush_spec(),
+                        space,
+                    };
+                    if self.bridge_anchor.is_some() {
+                        self.request_bridge_commit(release);
+                    } else if self.pending_preview.is_some_and(|pending| {
+                        matches!(pending.action, PreviewAction::BridgeAnchor { .. })
+                    }) {
+                        self.deferred_bridge_release = Some(release);
+                    }
+                } else {
+                    self.cancel_edit_interaction();
+                }
             }
         } else if response.clicked()
             && let Some(voxel) = pointer_voxel
@@ -1093,10 +1712,14 @@ impl VoxelInkApp {
                 "Interactive 3D volume editor",
             )
         });
-        let controls = if self.tool == Tool::Inspect {
-            "Left / middle drag: rotate   Right drag: move   Wheel: zoom"
-        } else {
-            "Left drag: edit   Middle drag: rotate   Right drag: move   Wheel: zoom"
+        let controls = match self.tool {
+            Tool::Inspect => "Left / middle drag: rotate   Right drag: move   Wheel: zoom",
+            Tool::Bridge => {
+                "Left drag: bridge   Middle drag: rotate   Right drag: move   Wheel: zoom"
+            }
+            Tool::Paint | Tool::Erase => {
+                "Left drag: edit   Middle drag: rotate   Right drag: move   Wheel: zoom"
+            }
         };
         ui.painter().text(
             content.left_bottom() + egui::vec2(8.0, -8.0),
@@ -1140,63 +1763,137 @@ impl VoxelInkApp {
         if !self.busy.is_empty() {
             return;
         }
-        let pointer_ray = response.interact_pointer_pos().map(|position| {
-            let normalized = [
-                ((position.x - content.left()) / content.width()) * 2.0 - 1.0,
-                1.0 - ((position.y - content.top()) / content.height()) * 2.0,
-            ];
-            self.scene.ray_for_pointer(normalized)
-        });
-        let Some(summary) = &self.summary else {
-            return;
-        };
-        let slice_coordinate = summary.cursor[self.active_slice.normal_axis()];
-        if response.drag_started_by(egui::PointerButton::Primary)
-            && let Some(ray) = pointer_ray
-        {
-            if self.begin_stroke(
-                self.tool,
-                BrushDiameter::new(self.brush_diameter).unwrap_or_default(),
-                StrokeSpace::Volume3D,
-            ) && !self.send_command(EngineCommand::RaySample {
-                ray,
-                active_slice: self.active_slice,
-                slice_coordinate,
-            }) {
-                let _ = self.complete_active_stroke();
-            }
-        } else if response.dragged_by(egui::PointerButton::Primary)
-            && let Some(ray) = pointer_ray
-        {
-            actions.sample = Some(PointerSample::Ray {
-                ray,
-                active_slice: self.active_slice,
-                slice_coordinate,
+        let pointer_ray = response
+            .interact_pointer_pos()
+            .filter(|position| rect_contains_half_open(content, *position))
+            .map(|position| {
+                let normalized = [
+                    ((position.x - content.left()) / content.width()) * 2.0 - 1.0,
+                    1.0 - ((position.y - content.top()) / content.height()) * 2.0,
+                ];
+                self.scene.ray_for_pointer(normalized)
             });
+        let space = StrokeSpace::Volume3D;
+        if (response.hovered() || response.dragged_by(egui::PointerButton::Primary))
+            && !self.stroke_active
+            && !self.stroke_completion_pending
+            && let Some(ray) = pointer_ray
+        {
+            actions.preview_hovered = true;
+            let sample = PointerSample::Ray { ray };
+            let request = match self.bridge_anchor {
+                Some(anchor) if self.tool == Tool::Bridge && anchor.space == space => {
+                    BrushPreviewRequest::Bridge {
+                        generation: 0,
+                        spec: self.brush_spec(),
+                        space,
+                        anchor: anchor.voxel,
+                        plane_normal: anchor.plane_normal,
+                        sample,
+                    }
+                }
+                _ => BrushPreviewRequest::Brush {
+                    generation: 0,
+                    tool: self.tool,
+                    spec: self.brush_spec(),
+                    space,
+                    sample,
+                },
+            };
+            self.request_brush_preview(request);
         }
-        if response.drag_stopped_by(egui::PointerButton::Primary) {
-            if let Some(ray) = pointer_ray {
-                actions.sample = Some(PointerSample::Ray {
-                    ray,
-                    active_slice: self.active_slice,
-                    slice_coordinate,
-                });
+        if matches!(self.tool, Tool::Paint | Tool::Erase) {
+            if response.drag_started_by(egui::PointerButton::Primary)
+                && let Some(ray) = pointer_ray
+            {
+                self.request_action_preview(
+                    BrushPreviewRequest::Brush {
+                        generation: 0,
+                        tool: self.tool,
+                        spec: self.brush_spec(),
+                        space,
+                        sample: PointerSample::Ray { ray },
+                    },
+                    PreviewAction::Stroke { complete: false },
+                );
+            } else if response.dragged_by(egui::PointerButton::Primary)
+                && let Some(ray) = pointer_ray
+            {
+                self.request_action_preview(
+                    BrushPreviewRequest::Brush {
+                        generation: 0,
+                        tool: self.tool,
+                        spec: self.brush_spec(),
+                        space,
+                        sample: PointerSample::Ray { ray },
+                    },
+                    PreviewAction::Stroke { complete: false },
+                );
             }
-            actions.complete = true;
-        } else if response.clicked_by(egui::PointerButton::Primary)
-            && let Some(ray) = pointer_ray
-            && self.begin_stroke(
-                self.tool,
-                BrushDiameter::new(self.brush_diameter).unwrap_or_default(),
-                StrokeSpace::Volume3D,
-            )
-        {
-            let _ = self.send_command(EngineCommand::RaySample {
-                ray,
-                active_slice: self.active_slice,
-                slice_coordinate,
-            });
-            let _ = self.complete_active_stroke();
+            if response.drag_stopped_by(egui::PointerButton::Primary) {
+                if let Some(ray) = pointer_ray {
+                    self.request_action_preview(
+                        BrushPreviewRequest::Brush {
+                            generation: 0,
+                            tool: self.tool,
+                            spec: self.brush_spec(),
+                            space,
+                            sample: PointerSample::Ray { ray },
+                        },
+                        PreviewAction::Stroke { complete: true },
+                    );
+                } else {
+                    self.finish_stroke_pointer_release();
+                }
+            } else if response.clicked_by(egui::PointerButton::Primary)
+                && let Some(ray) = pointer_ray
+            {
+                self.request_action_preview(
+                    BrushPreviewRequest::Brush {
+                        generation: 0,
+                        tool: self.tool,
+                        spec: self.brush_spec(),
+                        space,
+                        sample: PointerSample::Ray { ray },
+                    },
+                    PreviewAction::Stroke { complete: true },
+                );
+            }
+        } else if self.tool == Tool::Bridge {
+            if response.drag_started_by(egui::PointerButton::Primary)
+                && let Some(ray) = pointer_ray
+            {
+                self.request_action_preview(
+                    BrushPreviewRequest::Brush {
+                        generation: 0,
+                        tool: Tool::Bridge,
+                        spec: self.brush_spec(),
+                        space,
+                        sample: PointerSample::Ray { ray },
+                    },
+                    PreviewAction::BridgeAnchor {
+                        plane_normal: ray.direction,
+                    },
+                );
+            }
+            if response.drag_stopped_by(egui::PointerButton::Primary) {
+                if let Some(ray) = pointer_ray {
+                    let release = DeferredBridgeRelease {
+                        sample: PointerSample::Ray { ray },
+                        spec: self.brush_spec(),
+                        space,
+                    };
+                    if self.bridge_anchor.is_some() {
+                        self.request_bridge_commit(release);
+                    } else if self.pending_preview.is_some_and(|pending| {
+                        matches!(pending.action, PreviewAction::BridgeAnchor { .. })
+                    }) {
+                        self.deferred_bridge_release = Some(release);
+                    }
+                } else {
+                    self.cancel_edit_interaction();
+                }
+            }
         }
     }
 
@@ -1319,11 +2016,10 @@ impl VoxelInkApp {
     }
 
     fn guard_or_execute(&mut self, action: GuardAction) {
-        let had_active_stroke = self.stroke_active || self.stroke_completion_pending;
-        if had_active_stroke && !self.complete_active_stroke() {
+        if self.has_edit_interaction() {
             return;
         }
-        if had_active_stroke || self.summary.as_ref().is_some_and(DocumentSummary::is_dirty) {
+        if self.summary.as_ref().is_some_and(DocumentSummary::is_dirty) {
             self.prompt = Some(Prompt::Unsaved(action));
         } else {
             self.execute_guard(action);
@@ -1331,6 +2027,7 @@ impl VoxelInkApp {
     }
 
     fn execute_guard(&mut self, action: GuardAction) {
+        self.cancel_edit_interaction();
         match action {
             GuardAction::OpenDialog => self.open_file_dialog(),
             GuardAction::CloseDocument => {
@@ -1345,7 +2042,7 @@ impl VoxelInkApp {
     }
 
     fn request_overwrite(&mut self, after: Option<GuardAction>) {
-        if !self.complete_active_stroke() {
+        if self.has_edit_interaction() {
             return;
         }
         let Some(summary) = &self.summary else {
@@ -1378,15 +2075,397 @@ impl VoxelInkApp {
         }
     }
 
-    fn begin_stroke(&mut self, tool: Tool, diameter: BrushDiameter, space: StrokeSpace) -> bool {
+    fn brush_spec(&self) -> BrushSpec {
+        let size = match self.brush_size_unit {
+            BrushSizeUnit::Voxels => {
+                BrushSize::voxels(self.brush_voxel_diameter).unwrap_or_default()
+            }
+            BrushSizeUnit::Millimeters => {
+                BrushSize::millimeters(self.brush_millimeters).unwrap_or_default()
+            }
+        };
+        BrushSpec {
+            shape: self.brush_shape,
+            depth: self.brush_depth,
+            size,
+        }
+    }
+
+    fn request_brush_preview(&mut self, request: BrushPreviewRequest) {
+        if self.pending_preview.is_some() || self.queued_action_preview.is_some() {
+            return;
+        }
+        let template = preview_with_generation(request, 0);
+        if self.last_preview_request == Some(template) {
+            return;
+        }
+        self.brush_preview_generation = self.brush_preview_generation.saturating_add(1);
+        self.discard_current_brush_preview();
+        let request = preview_with_generation(request, self.brush_preview_generation);
+        match self.engine.send_latest_preview(request) {
+            Ok(()) => self.last_preview_request = Some(template),
+            Err(error) => {
+                self.last_preview_request = None;
+                self.error_message = Some(error.to_string());
+            }
+        }
+    }
+
+    fn request_action_preview(&mut self, request: BrushPreviewRequest, action: PreviewAction) {
+        let mut queued = ActionPreview { request, action };
+        if self.pending_preview.is_some() {
+            if self
+                .pending_preview
+                .is_some_and(|current| current.action.finishing_stroke())
+                || self
+                    .queued_action_preview
+                    .is_some_and(|current| current.action.finishing_stroke())
+            {
+                queued.action.mark_stroke_complete();
+            }
+            self.queued_action_preview = Some(queued);
+            return;
+        }
+        self.dispatch_action_preview(queued);
+    }
+
+    fn dispatch_action_preview(&mut self, action_preview: ActionPreview) {
+        self.brush_preview_generation = self.brush_preview_generation.saturating_add(1);
+        if self.brush_preview_tool.is_some()
+            || self.brush_preview_target.is_some()
+            || !self.brush_preview_voxels.is_empty()
+        {
+            self.discard_current_brush_preview();
+        }
+        let request =
+            preview_with_generation(action_preview.request, self.brush_preview_generation);
+        match self.engine.send_latest_preview(request) {
+            Ok(()) => {
+                self.last_preview_request = Some(preview_with_generation(request, 0));
+                self.pending_preview = Some(PendingPreview {
+                    generation: self.brush_preview_generation,
+                    request,
+                    action: action_preview.action,
+                });
+            }
+            Err(error) => {
+                self.last_preview_request = None;
+                self.pending_preview = None;
+                self.queued_action_preview = None;
+                if self.stroke_active {
+                    let _ = self.complete_active_stroke();
+                }
+                self.error_message = Some(error.to_string());
+            }
+        }
+    }
+
+    fn accept_brush_preview(
+        &mut self,
+        epoch: u64,
+        revision: u64,
+        generation: u64,
+        tool: Tool,
+        target: Option<[u32; 3]>,
+        voxels: Vec<[u32; 3]>,
+    ) {
+        let Some(pending) = self
+            .pending_preview
+            .take()
+            .filter(|pending| pending.generation == generation)
+        else {
+            self.brush_preview_tool = Some(tool);
+            self.brush_preview_target = target;
+            self.brush_preview_voxels = voxels;
+            self.refresh_scene_brush_preview(epoch, revision);
+            return;
+        };
+        self.last_preview_request = None;
+        self.brush_preview_tool = None;
+        self.brush_preview_target = None;
+        self.brush_preview_voxels.clear();
+        let finishing_stroke = pending.action.finishing_stroke();
+        match (pending.action, pending.request) {
+            (
+                PreviewAction::Stroke { complete },
+                BrushPreviewRequest::Brush {
+                    tool,
+                    spec,
+                    space,
+                    sample,
+                    ..
+                },
+            ) => {
+                if target.is_some() {
+                    if !self.stroke_active && !self.begin_stroke(tool, spec, space) {
+                        self.queued_action_preview = None;
+                    } else if self.stroke_active {
+                        self.accumulate_stroke_overlay(tool, &voxels);
+                        if let Err(error) = self.engine.send_latest_sample(sample) {
+                            self.queued_action_preview = None;
+                            self.error_message = Some(error.to_string());
+                            let _ = self.complete_active_stroke();
+                        }
+                    }
+                }
+                if complete {
+                    let _ = self.complete_active_stroke();
+                }
+            }
+            (
+                PreviewAction::BridgeAnchor { plane_normal },
+                BrushPreviewRequest::Brush { space, .. },
+            ) => {
+                if let Some(voxel) = target {
+                    self.clear_stroke_overlay_data();
+                    self.bridge_anchor = Some(BridgeAnchor {
+                        voxel,
+                        space,
+                        plane_normal,
+                    });
+                    if let Some(release) = self.deferred_bridge_release.take()
+                        && release.space == space
+                    {
+                        self.request_bridge_commit(release);
+                    }
+                } else {
+                    self.deferred_bridge_release = None;
+                }
+            }
+            (
+                PreviewAction::BridgeCommit,
+                BrushPreviewRequest::Bridge {
+                    spec,
+                    space,
+                    anchor,
+                    plane_normal,
+                    sample,
+                    ..
+                },
+            ) => {
+                if target.is_some() {
+                    self.accumulate_stroke_overlay(Tool::Bridge, &voxels);
+                    self.stroke_overlay_waiting_for_mesh = !self.stroke_overlay_voxels.is_empty();
+                    self.stroke_overlay_revision = None;
+                    if !self.send_command(EngineCommand::CommitBridge {
+                        anchor,
+                        plane_normal,
+                        sample,
+                        spec,
+                        space,
+                    }) {
+                        self.clear_stroke_overlay();
+                    }
+                }
+                self.bridge_anchor = None;
+                self.deferred_bridge_release = None;
+            }
+            _ => {
+                self.queued_action_preview = None;
+            }
+        }
+        self.refresh_scene_brush_preview(epoch, revision);
+        if !finishing_stroke
+            && !self.stroke_completion_pending
+            && self.pending_preview.is_none()
+            && let Some(queued) = self.queued_action_preview.take()
+        {
+            self.dispatch_action_preview(queued);
+        } else if finishing_stroke {
+            self.queued_action_preview = None;
+        }
+    }
+
+    fn handle_brush_preview_failure(&mut self, generation: u64, message: String) {
+        let pending_matches = self
+            .pending_preview
+            .is_some_and(|pending| pending.generation == generation);
+        if !pending_matches && self.pending_preview.is_some() {
+            return;
+        }
+        self.brush_preview_generation = self.brush_preview_generation.saturating_add(1);
+        self.last_preview_request = None;
+        self.pending_preview = None;
+        self.queued_action_preview = None;
+        self.deferred_bridge_release = None;
+        self.bridge_anchor = None;
+        self.engine.cancel_preview();
+        self.discard_current_brush_preview();
+        if self.stroke_active || self.stroke_completion_pending {
+            let _ = self.complete_active_stroke();
+        }
+        self.error_message = Some(message);
+    }
+
+    fn accumulate_stroke_overlay(&mut self, tool: Tool, voxels: &[[u32; 3]]) {
+        if voxels.is_empty() {
+            return;
+        }
+        if self.stroke_overlay_tool != Some(tool) {
+            self.stroke_overlay_tool = Some(tool);
+            self.stroke_overlay_voxels.clear();
+            self.stroke_overlay_members.clear();
+        }
+        self.stroke_overlay_revision = None;
+        self.stroke_overlay_waiting_for_mesh = false;
+        for voxel in voxels.iter().copied() {
+            if self.stroke_overlay_members.insert(voxel) {
+                self.stroke_overlay_voxels.push(voxel);
+            }
+        }
+    }
+
+    fn retire_stroke_overlay_chunk(&mut self, chunk: crate::mesh::ChunkCoord) -> bool {
+        let previous_len = self.stroke_overlay_voxels.len();
+        self.stroke_overlay_voxels
+            .retain(|voxel| crate::mesh::ChunkCoord::from_voxel(*voxel) != chunk);
+        if self.stroke_overlay_voxels.len() == previous_len {
+            return false;
+        }
+        self.stroke_overlay_members = self.stroke_overlay_voxels.iter().copied().collect();
+        if self.stroke_overlay_voxels.is_empty() {
+            self.stroke_overlay_tool = None;
+            self.stroke_overlay_revision = None;
+        }
+        true
+    }
+
+    fn clear_stroke_overlay_data(&mut self) {
+        self.stroke_overlay_tool = None;
+        self.stroke_overlay_voxels.clear();
+        self.stroke_overlay_members.clear();
+        self.stroke_overlay_revision = None;
+        self.stroke_overlay_waiting_for_mesh = false;
+    }
+
+    fn clear_stroke_overlay(&mut self) {
+        self.clear_stroke_overlay_data();
+        self.refresh_scene_brush_preview(self.epoch, self.summary_revision());
+    }
+
+    fn discard_current_brush_preview(&mut self) {
+        self.brush_preview_tool = None;
+        self.brush_preview_target = None;
+        self.brush_preview_voxels.clear();
+        let revision = self.summary.as_ref().map_or(0, |summary| summary.revision);
+        self.refresh_scene_brush_preview(self.epoch, revision);
+        self.egui_ctx.request_repaint();
+    }
+
+    fn refresh_scene_brush_preview(&self, epoch: u64, revision: u64) {
+        let (tool, mut voxels) = if let Some(tool) = self.brush_preview_tool
+            && self.stroke_overlay_tool != Some(tool)
+        {
+            (tool, self.brush_preview_voxels.clone())
+        } else if let Some(tool) = self.stroke_overlay_tool {
+            (tool, self.stroke_overlay_voxels.clone())
+        } else if let Some(tool) = self.brush_preview_tool {
+            (tool, self.brush_preview_voxels.clone())
+        } else {
+            self.scene.clear_voxel_preview();
+            return;
+        };
+        if self.stroke_overlay_tool == self.brush_preview_tool {
+            voxels.extend(
+                self.brush_preview_voxels
+                    .iter()
+                    .copied()
+                    .filter(|voxel| !self.stroke_overlay_members.contains(voxel)),
+            );
+        }
+        if voxels.is_empty() {
+            self.scene.clear_voxel_preview();
+            return;
+        }
+        let kind = match tool {
+            Tool::Erase => VoxelPreviewKind::Erase,
+            Tool::Bridge => VoxelPreviewKind::Bridge,
+            Tool::Inspect | Tool::Paint => VoxelPreviewKind::Paint,
+        };
+        let _ = self.scene.set_voxel_preview(epoch, revision, voxels, kind);
+    }
+
+    fn request_bridge_commit(&mut self, release: DeferredBridgeRelease) {
+        let Some(anchor) = self.bridge_anchor else {
+            self.deferred_bridge_release = Some(release);
+            return;
+        };
+        let request = BrushPreviewRequest::Bridge {
+            generation: 0,
+            spec: release.spec,
+            space: release.space,
+            anchor: anchor.voxel,
+            plane_normal: anchor.plane_normal,
+            sample: release.sample,
+        };
+        self.request_action_preview(request, PreviewAction::BridgeCommit);
+    }
+
+    fn clear_brush_preview(&mut self) {
+        if self.last_preview_request.is_none()
+            && self.brush_preview_tool.is_none()
+            && self.brush_preview_voxels.is_empty()
+            && self.pending_preview.is_none()
+            && self.queued_action_preview.is_none()
+            && self.deferred_bridge_release.is_none()
+        {
+            return;
+        }
+        self.brush_preview_generation = self.brush_preview_generation.saturating_add(1);
+        self.engine.cancel_preview();
+        self.last_preview_request = None;
+        self.pending_preview = None;
+        self.queued_action_preview = None;
+        self.deferred_bridge_release = None;
+        self.discard_current_brush_preview();
+    }
+
+    fn cancel_edit_interaction(&mut self) {
+        self.brush_preview_generation = self.brush_preview_generation.saturating_add(1);
+        self.engine.cancel_preview();
+        self.last_preview_request = None;
+        self.pending_preview = None;
+        self.queued_action_preview = None;
+        self.deferred_bridge_release = None;
+        self.bridge_anchor = None;
+        let had_active_stroke = self.stroke_active || self.stroke_completion_pending;
+        if had_active_stroke && self.send_command(EngineCommand::CancelStroke) {
+            self.stroke_active = false;
+            self.stroke_completion_pending = false;
+        }
+        self.clear_stroke_overlay_data();
+        self.discard_current_brush_preview();
+    }
+
+    fn finish_stroke_pointer_release(&mut self) {
+        if let Some(queued) = self.queued_action_preview.as_mut() {
+            queued.action.mark_stroke_complete();
+        } else if let Some(pending) = self.pending_preview.as_mut() {
+            pending.action.mark_stroke_complete();
+        } else {
+            let _ = self.complete_active_stroke();
+        }
+    }
+
+    fn has_edit_interaction(&self) -> bool {
+        self.pending_preview.is_some()
+            || self.queued_action_preview.is_some()
+            || self.deferred_bridge_release.is_some()
+            || self.bridge_anchor.is_some()
+            || self.stroke_active
+            || self.stroke_completion_pending
+    }
+
+    fn summary_revision(&self) -> u64 {
+        self.summary.as_ref().map_or(0, |summary| summary.revision)
+    }
+
+    fn begin_stroke(&mut self, tool: Tool, spec: BrushSpec, space: StrokeSpace) -> bool {
         if self.stroke_active || self.stroke_completion_pending || !self.busy.is_empty() {
             return false;
         }
-        if self.send_command(EngineCommand::BeginStroke {
-            tool,
-            diameter,
-            space,
-        }) {
+        self.clear_stroke_overlay_data();
+        if self.send_command(EngineCommand::BeginStroke { tool, spec, space }) {
             self.stroke_active = tool != Tool::Inspect;
             true
         } else {
@@ -1397,6 +2476,10 @@ impl VoxelInkApp {
     fn complete_active_stroke(&mut self) -> bool {
         if !self.stroke_active && !self.stroke_completion_pending {
             return true;
+        }
+        if self.stroke_active && !self.stroke_overlay_voxels.is_empty() {
+            self.stroke_overlay_revision = None;
+            self.stroke_overlay_waiting_for_mesh = true;
         }
         match self.engine.send(EngineCommand::CompleteStroke) {
             Ok(()) => {
@@ -1488,7 +2571,7 @@ impl VoxelInkApp {
     }
 
     fn open_save_dialog(&mut self, purpose: DialogPurpose) {
-        if !self.complete_active_stroke() {
+        if self.has_edit_interaction() {
             return;
         }
         if self.dialog.is_some() || self.summary.is_none() {
@@ -1580,7 +2663,7 @@ impl VoxelInkApp {
             texture.set_partial(
                 [patch.x as usize, patch.y as usize],
                 egui::ColorImage::new([patch.width as usize, patch.height as usize], pixels),
-                TextureOptions::NEAREST,
+                SLICE_TEXTURE_OPTIONS,
             );
         } else {
             self.refresh_texture(ctx, patch.axis);
@@ -1623,12 +2706,12 @@ impl VoxelInkApp {
         );
         let image = egui::ColorImage::new([slice.width as usize, slice.height as usize], pixels);
         if let Some(texture) = self.textures.get_mut(&axis) {
-            texture.set(image, TextureOptions::NEAREST);
+            texture.set(image, SLICE_TEXTURE_OPTIONS);
         } else {
             let texture = ctx.load_texture(
                 format!("voxel-slice-{axis:?}"),
                 image,
-                TextureOptions::NEAREST,
+                SLICE_TEXTURE_OPTIONS,
             );
             self.textures.insert(axis, texture);
         }
@@ -1646,7 +2729,10 @@ impl eframe::App for VoxelInkApp {
                 return;
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            if self.prompt.is_none() {
+            if self.has_edit_interaction() {
+                self.cancel_edit_interaction();
+                self.preview_notice = Some("Current edit cancelled; close again to exit".into());
+            } else if self.prompt.is_none() {
                 self.guard_or_execute(GuardAction::Exit);
             }
         }
@@ -1656,6 +2742,7 @@ impl eframe::App for VoxelInkApp {
         }
         self.toolbar(ui);
         self.status_bar(ui);
+        self.repair_panel(ui);
         self.workspace(ui);
         self.handle_shortcuts(&ctx);
         self.show_prompts(&ctx);
@@ -1718,7 +2805,7 @@ fn configure_style(ctx: &egui::Context, forced_colors: bool, reduced_motion: boo
     }
 }
 
-fn solidify_notice(summary: Option<&DocumentSummary>, added_voxels: u64) -> String {
+fn cavities_filled_notice(summary: Option<&DocumentSummary>, added_voxels: u64) -> String {
     let count = format_count(added_voxels);
     let voxel_label = if added_voxels == 1 { "voxel" } else { "voxels" };
     let physical_volume = summary.and_then(|summary| {
@@ -1732,16 +2819,14 @@ fn solidify_notice(summary: Option<&DocumentSummary>, added_voxels: u64) -> Stri
         cubic_centimeters.is_finite().then_some(cubic_centimeters)
     });
     physical_volume.map_or_else(
-        || format!("Solid left ↔ right: +{count} {voxel_label} · Undo restores original"),
+        || format!("Filled {count} enclosed {voxel_label} · Undo restores them"),
         |volume| {
             let volume = if volume >= 0.1 {
                 format!("{volume:.1}")
             } else {
                 format!("{volume:.3}")
             };
-            format!(
-                "Solid left ↔ right: +{count} {voxel_label} ({volume} cm³) · Undo restores original"
-            )
+            format!("Filled {count} enclosed {voxel_label} ({volume} cm³) · Undo restores them")
         },
     )
 }
@@ -1766,6 +2851,62 @@ fn consume_shortcut(ctx: &egui::Context, modifiers: egui::Modifiers, key: egui::
     ctx.input_mut(|input| input.consume_shortcut(&egui::KeyboardShortcut::new(modifiers, key)))
 }
 
+fn preview_with_generation(request: BrushPreviewRequest, generation: u64) -> BrushPreviewRequest {
+    match request {
+        BrushPreviewRequest::Brush {
+            tool,
+            spec,
+            space,
+            sample,
+            ..
+        } => BrushPreviewRequest::Brush {
+            generation,
+            tool,
+            spec,
+            space,
+            sample,
+        },
+        BrushPreviewRequest::Bridge {
+            spec,
+            space,
+            anchor,
+            plane_normal,
+            sample,
+            ..
+        } => BrushPreviewRequest::Bridge {
+            generation,
+            spec,
+            space,
+            anchor,
+            plane_normal,
+            sample,
+        },
+    }
+}
+
+fn slice_physical_aspect(axis: SliceAxis, width: u32, height: u32, spacing: [f64; 3]) -> f32 {
+    let [horizontal_axis, vertical_axis] = match axis {
+        SliceAxis::Axial => [0, 1],
+        SliceAxis::Coronal => [0, 2],
+        SliceAxis::Sagittal => [1, 2],
+    };
+    let physical_width = f64::from(width) * spacing[horizontal_axis];
+    let physical_height = f64::from(height) * spacing[vertical_axis];
+    if physical_width.is_finite() && physical_height.is_finite() && physical_height > 0.0 {
+        (physical_width / physical_height) as f32
+    } else {
+        width as f32 / height.max(1) as f32
+    }
+}
+
+fn step_slice_coordinate(current: u32, last: u32, steps: i32) -> u32 {
+    if steps >= 0 {
+        current.saturating_add(steps as u32).min(last)
+    } else {
+        current.saturating_sub(steps.unsigned_abs())
+    }
+}
+
 fn fit_rect(available: egui::Rect, aspect: f32) -> egui::Rect {
     let size = if available.width() / available.height().max(1.0) > aspect {
         Vec2::new(available.height() * aspect, available.height())
@@ -1782,16 +2923,24 @@ fn slice_pointer_to_voxel(
     width: u32,
     height: u32,
     cursor: [u32; 3],
-) -> [u32; 3] {
-    let u =
-        (((position.x - rect.left()) / rect.width()).clamp(0.0, 0.999_999) * width as f32) as u32;
-    let v =
-        (((position.y - rect.top()) / rect.height()).clamp(0.0, 0.999_999) * height as f32) as u32;
-    match axis {
+) -> Option<[u32; 3]> {
+    if width == 0 || height == 0 || !rect_contains_half_open(rect, position) {
+        return None;
+    }
+    let u = ((position.x - rect.left()) / rect.width() * width as f32) as u32;
+    let v = ((position.y - rect.top()) / rect.height() * height as f32) as u32;
+    Some(match axis {
         SliceAxis::Axial => [u, v, cursor[2]],
         SliceAxis::Coronal => [u, cursor[1], v],
         SliceAxis::Sagittal => [cursor[0], u, v],
-    }
+    })
+}
+
+fn rect_contains_half_open(rect: egui::Rect, position: egui::Pos2) -> bool {
+    position.x >= rect.left()
+        && position.x < rect.right()
+        && position.y >= rect.top()
+        && position.y < rect.bottom()
 }
 
 fn paint_crosshair(
@@ -1818,6 +2967,64 @@ fn paint_crosshair(
         [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
         stroke,
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_brush_preview(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    axis: SliceAxis,
+    coordinate: u32,
+    width: u32,
+    height: u32,
+    voxels: &[[u32; 3]],
+    tool: Tool,
+    forced_colors: bool,
+) {
+    let (fill, outline) = if forced_colors {
+        (Color32::from_white_alpha(120), Color32::WHITE)
+    } else if tool == Tool::Erase {
+        (
+            Color32::from_rgba_unmultiplied(255, 91, 69, 130),
+            Color32::from_rgb(255, 154, 89),
+        )
+    } else {
+        (
+            Color32::from_rgba_unmultiplied(36, 200, 219, 125),
+            Color32::from_rgb(121, 238, 248),
+        )
+    };
+    let normal_axis = axis.normal_axis();
+    for &voxel in voxels {
+        if voxel[normal_axis] != coordinate {
+            continue;
+        }
+        let [u, v] = match axis {
+            SliceAxis::Axial => [voxel[0], voxel[1]],
+            SliceAxis::Coronal => [voxel[0], voxel[2]],
+            SliceAxis::Sagittal => [voxel[1], voxel[2]],
+        };
+        if u >= width || v >= height {
+            continue;
+        }
+        let voxel_rect = egui::Rect::from_min_max(
+            egui::pos2(
+                rect.left() + u as f32 / width as f32 * rect.width(),
+                rect.top() + v as f32 / height as f32 * rect.height(),
+            ),
+            egui::pos2(
+                rect.left() + (u + 1) as f32 / width as f32 * rect.width(),
+                rect.top() + (v + 1) as f32 / height as f32 * rect.height(),
+            ),
+        );
+        painter.rect_filled(voxel_rect, 0.0, fill);
+        painter.rect_stroke(
+            voxel_rect,
+            0.0,
+            egui::Stroke::new(1.0, outline),
+            egui::StrokeKind::Inside,
+        );
+    }
 }
 
 fn display_name(path: &Path) -> String {
@@ -1862,7 +3069,80 @@ mod tests {
                 10,
                 [3, 7, 2],
             ),
-            [15, 7, 5]
+            Some([15, 7, 5])
+        );
+    }
+
+    #[test]
+    fn slice_pointer_outside_image_does_not_clamp_to_border_voxel() {
+        let rect = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(100.0, 50.0));
+        assert_eq!(
+            slice_pointer_to_voxel(
+                SliceAxis::Axial,
+                egui::pos2(100.0, 25.0),
+                rect,
+                20,
+                10,
+                [3, 7, 2],
+            ),
+            None
+        );
+        assert_eq!(
+            slice_pointer_to_voxel(
+                SliceAxis::Axial,
+                egui::pos2(-0.1, 25.0),
+                rect,
+                20,
+                10,
+                [3, 7, 2],
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn raw_wheel_notch_moves_once_without_smoothed_frame_replay() {
+        let mut view = SliceViewState::default();
+        let event = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, 1.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        assert_eq!(view.wheel_steps(&[event]), 1);
+        assert_eq!(view.wheel_steps(&[]), 0);
+    }
+
+    #[test]
+    fn point_scroll_accumulates_to_one_controlled_step() {
+        let mut view = SliceViewState::default();
+        let point = |amount| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, amount),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        assert_eq!(view.wheel_steps(&[point(8.0)]), 0);
+        assert_eq!(view.wheel_steps(&[point(8.0)]), 0);
+        assert_eq!(view.wheel_steps(&[point(8.0)]), 1);
+        assert_eq!(view.wheel_steps(&[]), 0);
+        assert_eq!(view.wheel_steps(&[point(-8.0)]), 0);
+        assert_eq!(view.wheel_steps(&[point(-16.0)]), -1);
+    }
+
+    #[test]
+    fn slice_aspect_uses_physical_spacing() {
+        let aspect = slice_physical_aspect(SliceAxis::Coronal, 617, 231, [0.315, 0.315, 0.8]);
+        assert!((aspect - 1.051_7).abs() < 0.001);
+        assert_eq!(
+            SLICE_TEXTURE_OPTIONS.magnification,
+            egui::TextureFilter::Nearest
+        );
+        assert_eq!(
+            SLICE_TEXTURE_OPTIONS.minification,
+            egui::TextureFilter::Linear
         );
     }
 

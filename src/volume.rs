@@ -9,6 +9,8 @@ use crate::{
 
 pub const HISTORY_TRANSACTIONS: usize = 256;
 pub const HISTORY_BYTES: usize = 128 * 1024 * 1024;
+const EXTERIOR_STACK_BYTES: usize = 64 * 1024 * 1024;
+const CANCELLATION_CHECK_INTERVAL: usize = 64 * 1024;
 
 pub type Matrix4 = [[f64; 4]; 4];
 
@@ -101,8 +103,9 @@ pub struct SourceIdentity {
 pub enum Tool {
     #[default]
     Inspect,
-    Brush,
-    Eraser,
+    Paint,
+    Erase,
+    Bridge,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -170,16 +173,18 @@ impl Transaction {
         self.changes.voxel_count()
     }
 
-    fn indices(&self) -> Option<&[u32]> {
+    fn changed_voxels(&self) -> ChangedVoxels<'_> {
         match &self.changes {
-            TransactionChanges::Indices(indices) => Some(indices),
-            TransactionChanges::Spans(_) => None,
+            TransactionChanges::Indices(indices) => ChangedVoxels::Indices(indices),
+            TransactionChanges::Spans(spans) => ChangedVoxels::Spans(spans),
         }
     }
+}
 
-    const fn requires_full_mesh_reset(&self) -> bool {
-        matches!(&self.changes, TransactionChanges::Spans(_))
-    }
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ChangedVoxels<'a> {
+    Indices(&'a [u32]),
+    Spans(&'a [IndexSpan]),
 }
 
 #[derive(Clone, Debug)]
@@ -205,9 +210,9 @@ impl TransactionChanges {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct IndexSpan {
-    start: u32,
-    len: u32,
+pub(crate) struct IndexSpan {
+    pub(crate) start: u32,
+    pub(crate) len: u32,
 }
 
 #[derive(Debug)]
@@ -467,106 +472,63 @@ impl VolumeDocument {
         }
     }
 
-    /// Fill gaps between the first and last occupied voxel on each left-to-right
-    /// scanline. This solidifies open anatomy without relying on a watertight shell.
-    pub fn make_solid(&mut self, cancel: &CancellationToken) -> Result<u64> {
+    /// Fill every empty voxel that cannot reach a volume boundary through a
+    /// six-connected path. The volume is not changed until classification and
+    /// undo history construction have both completed successfully.
+    pub fn fill_enclosed_cavities(&mut self, cancel: &CancellationToken) -> Result<u64> {
         self.cancel_stroke();
         cancel.check()?;
 
-        let [nx, ny, nz] = self.geometry.dimensions.map(|axis| axis as usize);
-        let fill_axis = left_right_axis(&self.geometry);
-        let line_count = match fill_axis {
-            0 => ny.checked_mul(nz),
-            1 => nx.checked_mul(nz),
-            2 => nx.checked_mul(ny),
-            _ => unreachable!("a volume has exactly three axes"),
-        }
-        .ok_or(AppError::Allocation { bytes: usize::MAX })?;
-        let mut line_bounds = allocate_line_bounds(line_count)?;
-        let plane = nx
-            .checked_mul(ny)
-            .ok_or(AppError::Allocation { bytes: usize::MAX })?;
-
-        for z in 0..nz {
-            cancel.check()?;
-            for y in 0..ny {
-                let row = z * plane + y * nx;
-                for x in 0..nx {
-                    if self.occupancy[row + x] == 0 {
-                        continue;
-                    }
-                    let (line, coordinate) = match fill_axis {
-                        0 => (z * ny + y, x as u32),
-                        1 => (z * nx + x, y as u32),
-                        2 => (y * nx + x, z as u32),
-                        _ => unreachable!("a volume has exactly three axes"),
-                    };
-                    update_line_bounds(&mut line_bounds[line], coordinate);
-                }
-            }
-        }
+        let dimensions = self.geometry.dimensions.map(|axis| axis as usize);
+        let exterior = classify_exterior_empty(&self.occupancy, dimensions, cancel)?;
 
         let max_spans = HISTORY_BYTES / size_of::<IndexSpan>();
         let mut spans: Vec<IndexSpan> = Vec::new();
-        let initial_capacity = line_count.min(64 * 1024);
+        let initial_capacity = 64 * 1024;
         spans
             .try_reserve(initial_capacity)
             .map_err(|_| AppError::Allocation {
                 bytes: initial_capacity * size_of::<IndexSpan>(),
             })?;
-        let mut added = 0_u64;
-        for z in 0..nz {
-            cancel.check()?;
-            for y in 0..ny {
-                let row = z * plane + y * nx;
-                for x in 0..nx {
-                    let index = row + x;
-                    if self.occupancy[index] != 0 {
-                        continue;
-                    }
-                    let (line, coordinate) = match fill_axis {
-                        0 => (z * ny + y, x as u32),
-                        1 => (z * nx + x, y as u32),
-                        2 => (y * nx + x, z as u32),
-                        _ => unreachable!("a volume has exactly three axes"),
-                    };
-                    if !is_between(coordinate, line_bounds[line]) {
-                        continue;
-                    }
-                    added += 1;
-                    let index = index as u32;
-                    if let Some(last) = spans.last_mut()
-                        && last.start.checked_add(last.len) == Some(index)
-                    {
-                        last.len += 1;
-                        continue;
-                    }
-                    if spans.len() == max_spans {
-                        return Err(AppError::UndoHistoryLimit {
-                            bytes: HISTORY_BYTES + size_of::<IndexSpan>(),
-                            limit: HISTORY_BYTES,
-                        });
-                    }
-                    if spans.len() == spans.capacity() {
-                        let additional = (64 * 1024).min(max_spans - spans.len());
-                        spans
-                            .try_reserve(additional)
-                            .map_err(|_| AppError::Allocation {
-                                bytes: (spans.len() + additional) * size_of::<IndexSpan>(),
-                            })?;
-                    }
-                    spans.push(IndexSpan {
-                        start: index,
-                        len: 1,
-                    });
-                }
+        for (index, &value) in self.occupancy.iter().enumerate() {
+            if index.is_multiple_of(64 * 1024) {
+                cancel.check()?;
             }
+            if value != 0 || exterior.contains(index) {
+                continue;
+            }
+            let index = index as u32;
+            if let Some(last) = spans.last_mut()
+                && last.start.checked_add(last.len) == Some(index)
+            {
+                last.len += 1;
+                continue;
+            }
+            if spans.len() == max_spans {
+                return Err(AppError::UndoHistoryLimit {
+                    bytes: HISTORY_BYTES + size_of::<IndexSpan>(),
+                    limit: HISTORY_BYTES,
+                });
+            }
+            if spans.len() == spans.capacity() {
+                let additional = (64 * 1024).min(max_spans - spans.len());
+                spans
+                    .try_reserve(additional)
+                    .map_err(|_| AppError::Allocation {
+                        bytes: (spans.len() + additional) * size_of::<IndexSpan>(),
+                    })?;
+            }
+            spans.push(IndexSpan {
+                start: index,
+                len: 1,
+            });
         }
 
         cancel.check()?;
         if spans.is_empty() {
             return Ok(0);
         }
+        let added = spans.iter().map(|span| u64::from(span.len)).sum();
         for span in &spans {
             let start = span.start as usize;
             let end = start + span.len as usize;
@@ -611,27 +573,13 @@ impl VolumeDocument {
     }
 
     #[must_use]
-    pub(crate) fn latest_undo_indices(&self) -> Option<&[u32]> {
-        self.undo.last().and_then(Transaction::indices)
+    pub(crate) fn latest_undo_changes(&self) -> Option<ChangedVoxels<'_>> {
+        self.undo.last().map(Transaction::changed_voxels)
     }
 
     #[must_use]
-    pub(crate) fn latest_redo_indices(&self) -> Option<&[u32]> {
-        self.redo.last().and_then(Transaction::indices)
-    }
-
-    #[must_use]
-    pub(crate) fn latest_undo_requires_full_mesh_reset(&self) -> bool {
-        self.undo
-            .last()
-            .is_some_and(Transaction::requires_full_mesh_reset)
-    }
-
-    #[must_use]
-    pub(crate) fn latest_redo_requires_full_mesh_reset(&self) -> bool {
-        self.redo
-            .last()
-            .is_some_and(Transaction::requires_full_mesh_reset)
+    pub(crate) fn latest_redo_changes(&self) -> Option<ChangedVoxels<'_>> {
+        self.redo.last().map(Transaction::changed_voxels)
     }
 
     pub fn mark_saved(&mut self, identity: SourceIdentity, variant: SourceVariant, adopt: bool) {
@@ -678,23 +626,32 @@ impl VolumeDocument {
         pixels
             .try_reserve_exact(pixel_count)
             .map_err(|_| AppError::Allocation { bytes: pixel_count })?;
-        for row in 0..height {
-            for column in 0..width {
-                let voxel = match axis {
-                    SliceAxis::Axial => [column, row, coordinate],
-                    SliceAxis::Coronal => [column, coordinate, row],
-                    SliceAxis::Sagittal => [coordinate, column, row],
-                };
-                pixels.push(self.value(voxel).ok_or_else(|| {
-                    AppError::InvalidDimensions(
-                        "generated slice voxel is outside the volume".into(),
-                    )
-                })?);
+        let [nx, ny, nz] = dimensions.map(|value| value as usize);
+        let coordinate = coordinate as usize;
+        let plane = nx * ny;
+        match axis {
+            SliceAxis::Axial => {
+                let start = coordinate * plane;
+                pixels.extend_from_slice(&self.occupancy[start..start + plane]);
+            }
+            SliceAxis::Coronal => {
+                for z in 0..nz {
+                    let start = z * plane + coordinate * nx;
+                    pixels.extend_from_slice(&self.occupancy[start..start + nx]);
+                }
+            }
+            SliceAxis::Sagittal => {
+                for z in 0..nz {
+                    let plane_start = z * plane;
+                    for y in 0..ny {
+                        pixels.push(self.occupancy[plane_start + y * nx + coordinate]);
+                    }
+                }
             }
         }
         Ok(SliceImage {
             axis,
-            coordinate,
+            coordinate: coordinate as u32,
             width,
             height,
             pixels,
@@ -738,34 +695,294 @@ impl VolumeDocument {
     }
 }
 
-fn allocate_line_bounds(len: usize) -> Result<Vec<[u32; 2]>> {
-    let bytes = len
-        .checked_mul(size_of::<[u32; 2]>())
+#[derive(Debug)]
+struct VoxelBitSet {
+    words: Vec<u64>,
+}
+
+impl VoxelBitSet {
+    fn zeroed(len: usize) -> Result<Self> {
+        let word_count = len.div_ceil(u64::BITS as usize);
+        let bytes = word_count
+            .checked_mul(size_of::<u64>())
+            .ok_or(AppError::Allocation { bytes: usize::MAX })?;
+        let mut words = Vec::new();
+        words
+            .try_reserve_exact(word_count)
+            .map_err(|_| AppError::Allocation { bytes })?;
+        words.resize(word_count, 0);
+        Ok(Self { words })
+    }
+
+    fn contains(&self, index: usize) -> bool {
+        let word = index / u64::BITS as usize;
+        let bit = index % u64::BITS as usize;
+        self.words[word] & (1_u64 << bit) != 0
+    }
+
+    fn insert(&mut self, index: usize) {
+        let word = index / u64::BITS as usize;
+        let bit = index % u64::BITS as usize;
+        self.words[word] |= 1_u64 << bit;
+    }
+}
+
+fn classify_exterior_empty(
+    occupancy: &[u8],
+    dimensions: [usize; 3],
+    cancel: &CancellationToken,
+) -> Result<VoxelBitSet> {
+    let [nx, ny, nz] = dimensions;
+    let plane = nx
+        .checked_mul(ny)
         .ok_or(AppError::Allocation { bytes: usize::MAX })?;
-    let mut bounds = Vec::new();
-    bounds
-        .try_reserve_exact(len)
-        .map_err(|_| AppError::Allocation { bytes })?;
-    bounds.resize(len, [u32::MAX, 0]);
-    Ok(bounds)
+    let mut exterior = VoxelBitSet::zeroed(occupancy.len())?;
+    let mut stack = Vec::new();
+
+    for z in 0..nz {
+        cancel.check()?;
+        for y in 0..ny {
+            if y.is_multiple_of(CANCELLATION_CHECK_INTERVAL) {
+                cancel.check()?;
+            }
+            let row = z * plane + y * nx;
+            flood_exterior_seed(
+                row,
+                occupancy,
+                dimensions,
+                &mut exterior,
+                &mut stack,
+                cancel,
+            )?;
+            if nx > 1 {
+                flood_exterior_seed(
+                    row + nx - 1,
+                    occupancy,
+                    dimensions,
+                    &mut exterior,
+                    &mut stack,
+                    cancel,
+                )?;
+            }
+        }
+    }
+    for z in 0..nz {
+        cancel.check()?;
+        let plane_start = z * plane;
+        for x in 0..nx {
+            if x.is_multiple_of(CANCELLATION_CHECK_INTERVAL) {
+                cancel.check()?;
+            }
+            flood_exterior_seed(
+                plane_start + x,
+                occupancy,
+                dimensions,
+                &mut exterior,
+                &mut stack,
+                cancel,
+            )?;
+            if ny > 1 {
+                flood_exterior_seed(
+                    plane_start + (ny - 1) * nx + x,
+                    occupancy,
+                    dimensions,
+                    &mut exterior,
+                    &mut stack,
+                    cancel,
+                )?;
+            }
+        }
+    }
+    for y in 0..ny {
+        cancel.check()?;
+        let row = y * nx;
+        for x in 0..nx {
+            if x.is_multiple_of(CANCELLATION_CHECK_INTERVAL) {
+                cancel.check()?;
+            }
+            flood_exterior_seed(
+                row + x,
+                occupancy,
+                dimensions,
+                &mut exterior,
+                &mut stack,
+                cancel,
+            )?;
+            if nz > 1 {
+                flood_exterior_seed(
+                    (nz - 1) * plane + row + x,
+                    occupancy,
+                    dimensions,
+                    &mut exterior,
+                    &mut stack,
+                    cancel,
+                )?;
+            }
+        }
+    }
+
+    Ok(exterior)
 }
 
-fn update_line_bounds(bounds: &mut [u32; 2], coordinate: u32) {
-    bounds[0] = bounds[0].min(coordinate);
-    bounds[1] = bounds[1].max(coordinate);
+fn flood_exterior_seed(
+    seed: usize,
+    occupancy: &[u8],
+    dimensions: [usize; 3],
+    exterior: &mut VoxelBitSet,
+    stack: &mut Vec<u32>,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    if occupancy[seed] != 0 || exterior.contains(seed) {
+        return Ok(());
+    }
+    push_flood_seed(stack, seed)?;
+    let [nx, ny, _] = dimensions;
+    let plane = nx * ny;
+
+    let mut processed_spans = 0_usize;
+    while let Some(seed) = stack.pop() {
+        if processed_spans.is_multiple_of(1024) {
+            cancel.check()?;
+        }
+        processed_spans += 1;
+        let seed = seed as usize;
+        if occupancy[seed] != 0 || exterior.contains(seed) {
+            continue;
+        }
+        let z = seed / plane;
+        let within_plane = seed % plane;
+        let y = within_plane / nx;
+        let x = within_plane % nx;
+        let row = seed - x;
+
+        let mut first_x = x;
+        while first_x > 0 {
+            if first_x.is_multiple_of(CANCELLATION_CHECK_INTERVAL) {
+                cancel.check()?;
+            }
+            let candidate = row + first_x - 1;
+            if occupancy[candidate] != 0 || exterior.contains(candidate) {
+                break;
+            }
+            first_x -= 1;
+        }
+        let mut last_x = x;
+        while last_x + 1 < nx {
+            if last_x.is_multiple_of(CANCELLATION_CHECK_INTERVAL) {
+                cancel.check()?;
+            }
+            let candidate = row + last_x + 1;
+            if occupancy[candidate] != 0 || exterior.contains(candidate) {
+                break;
+            }
+            last_x += 1;
+        }
+        for index in row + first_x..=row + last_x {
+            if index.is_multiple_of(CANCELLATION_CHECK_INTERVAL) {
+                cancel.check()?;
+            }
+            exterior.insert(index);
+        }
+
+        if y > 0 {
+            enqueue_projected_segments(
+                row - nx,
+                first_x,
+                last_x,
+                occupancy,
+                exterior,
+                stack,
+                cancel,
+            )?;
+        }
+        if y + 1 < ny {
+            enqueue_projected_segments(
+                row + nx,
+                first_x,
+                last_x,
+                occupancy,
+                exterior,
+                stack,
+                cancel,
+            )?;
+        }
+        if z > 0 {
+            enqueue_projected_segments(
+                row - plane,
+                first_x,
+                last_x,
+                occupancy,
+                exterior,
+                stack,
+                cancel,
+            )?;
+        }
+        if z + 1 < dimensions[2] {
+            enqueue_projected_segments(
+                row + plane,
+                first_x,
+                last_x,
+                occupancy,
+                exterior,
+                stack,
+                cancel,
+            )?;
+        }
+    }
+
+    Ok(())
 }
 
-const fn is_between(coordinate: u32, bounds: [u32; 2]) -> bool {
-    bounds[0] < coordinate && coordinate < bounds[1]
+fn enqueue_projected_segments(
+    row: usize,
+    first_x: usize,
+    last_x: usize,
+    occupancy: &[u8],
+    exterior: &VoxelBitSet,
+    stack: &mut Vec<u32>,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let mut x = first_x;
+    while x <= last_x {
+        if x.is_multiple_of(CANCELLATION_CHECK_INTERVAL) {
+            cancel.check()?;
+        }
+        let index = row + x;
+        if occupancy[index] != 0 || exterior.contains(index) {
+            x += 1;
+            continue;
+        }
+        push_flood_seed(stack, index)?;
+        x += 1;
+        while x <= last_x {
+            let index = row + x;
+            if occupancy[index] != 0 || exterior.contains(index) {
+                break;
+            }
+            x += 1;
+        }
+    }
+    Ok(())
 }
 
-fn left_right_axis(geometry: &VolumeGeometry) -> usize {
-    (0..3)
-        .max_by(|&left, &right| {
-            (geometry.index_to_world[0][left].abs() / geometry.spacing[left])
-                .total_cmp(&(geometry.index_to_world[0][right].abs() / geometry.spacing[right]))
-        })
-        .unwrap_or(0)
+fn push_flood_seed(stack: &mut Vec<u32>, index: usize) -> Result<()> {
+    let maximum_seeds = EXTERIOR_STACK_BYTES / size_of::<u32>();
+    if stack.len() == maximum_seeds {
+        return Err(AppError::Allocation {
+            bytes: EXTERIOR_STACK_BYTES + size_of::<u32>(),
+        });
+    }
+    if stack.len() == stack.capacity() {
+        const RESERVE_BLOCK: usize = 64 * 1024;
+        let additional = RESERVE_BLOCK.min(maximum_seeds - stack.len());
+        stack
+            .try_reserve(additional)
+            .map_err(|_| AppError::Allocation {
+                bytes: (stack.len() + additional) * size_of::<u32>(),
+            })?;
+    }
+    stack.push(index as u32);
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -908,24 +1125,7 @@ mod tests {
     }
 
     #[test]
-    fn left_right_fill_axis_uses_affine_orientation_not_voxel_scale() {
-        let geometry = VolumeGeometry::new(
-            [3, 3, 3],
-            [
-                [0.0, -4.0, 0.0, 0.0],
-                [2.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 3.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ],
-            SpatialUnits::Millimeter,
-        )
-        .unwrap();
-
-        assert_eq!(left_right_axis(&geometry), 1);
-    }
-
-    #[test]
-    fn solidification_history_cost_tracks_runs_instead_of_voxels() {
+    fn cavity_fill_history_cost_tracks_runs_instead_of_voxels() {
         let changes = TransactionChanges::Spans(vec![IndexSpan {
             start: 7,
             len: 50_000_000,
@@ -934,5 +1134,78 @@ mod tests {
         assert_eq!(changes.voxel_count(), 50_000_000);
         assert_eq!(changes.bytes(), size_of::<IndexSpan>());
         assert!(changes.bytes() < HISTORY_BYTES);
+    }
+
+    #[test]
+    fn scanline_exterior_matches_naive_six_connected_floods() {
+        let dimensions = [5, 4, 3];
+        let voxel_count = dimensions.into_iter().product();
+        let mut random = 0x5eed_u64;
+
+        for _ in 0..64 {
+            let mut occupancy = Vec::with_capacity(voxel_count);
+            for _ in 0..voxel_count {
+                random = random
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                occupancy.push(u8::from(random >> 61 < 3));
+            }
+
+            let actual =
+                classify_exterior_empty(&occupancy, dimensions, &CancellationToken::default())
+                    .unwrap();
+            let expected = naive_exterior(&occupancy, dimensions);
+            for (index, &is_exterior) in expected.iter().enumerate() {
+                assert_eq!(
+                    actual.contains(index),
+                    is_exterior,
+                    "classification differed at index {index}"
+                );
+            }
+        }
+    }
+
+    fn naive_exterior(occupancy: &[u8], dimensions: [usize; 3]) -> Vec<bool> {
+        let [nx, ny, nz] = dimensions;
+        let plane = nx * ny;
+        let mut exterior = vec![false; occupancy.len()];
+        let mut queue = std::collections::VecDeque::new();
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    if x != 0 && x + 1 != nx && y != 0 && y + 1 != ny && z != 0 && z + 1 != nz {
+                        continue;
+                    }
+                    let index = z * plane + y * nx + x;
+                    if occupancy[index] == 0 && !exterior[index] {
+                        exterior[index] = true;
+                        queue.push_back(index);
+                    }
+                }
+            }
+        }
+        while let Some(index) = queue.pop_front() {
+            let z = index / plane;
+            let within_plane = index % plane;
+            let y = within_plane / nx;
+            let x = within_plane % nx;
+            for neighbor in [
+                x.checked_sub(1).map(|_| index - 1),
+                (x + 1 < nx).then_some(index + 1),
+                y.checked_sub(1).map(|_| index - nx),
+                (y + 1 < ny).then_some(index + nx),
+                z.checked_sub(1).map(|_| index - plane),
+                (z + 1 < nz).then_some(index + plane),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if occupancy[neighbor] == 0 && !exterior[neighbor] {
+                    exterior[neighbor] = true;
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+        exterior
     }
 }

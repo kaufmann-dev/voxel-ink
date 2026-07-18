@@ -7,7 +7,7 @@ use std::{
 use tempfile::tempdir;
 use voxel_ink::{
     EngineCommand, EngineEvent, EngineHandle, SliceAxis, Tool, VolumeDocument,
-    brush::BrushDiameter,
+    brush::{BrushDepth, BrushShape, BrushSize, BrushSpec},
     cancel::CancellationToken,
     engine::{PointerSample, StrokeSpace},
     io::{SaveMode, load_path},
@@ -86,8 +86,12 @@ fn generated_mask_meets_slice_feedback_and_event_loop_limits() {
 
     engine
         .send(EngineCommand::BeginStroke {
-            tool: Tool::Brush,
-            diameter: BrushDiameter::new(31).unwrap(),
+            tool: Tool::Paint,
+            spec: BrushSpec {
+                shape: BrushShape::Round,
+                depth: BrushDepth::Slice,
+                size: BrushSize::voxels(31).unwrap(),
+            },
             space: StrokeSpace::Slice(SliceAxis::Axial),
         })
         .unwrap();
@@ -195,12 +199,14 @@ fn local_craniofacial_nifti_loads_when_available() {
     )
     .unwrap();
     let started = Instant::now();
-    let added = document.make_solid(&CancellationToken::default()).unwrap();
+    let added = document
+        .fill_enclosed_cavities(&CancellationToken::default())
+        .unwrap();
     eprintln!(
-        "local craniofacial solid fill {:?}: {added} voxels added",
+        "local craniofacial enclosed-cavity fill {:?}: {added} voxels added",
         started.elapsed()
     );
-    assert_eq!(added, 18_725_586);
-    assert_eq!(document.occupied_count(), 24_541_095);
+    assert_eq!(added, 977);
+    assert_eq!(document.occupied_count(), 5_816_486);
     assert!(document.summary().can_undo);
 }

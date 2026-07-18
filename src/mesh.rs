@@ -673,6 +673,98 @@ pub fn invalidated_chunks_for_indices(
     )
 }
 
+/// Derives dirty mesh chunks directly from compact linear index spans.
+///
+/// Each `(start, length)` pair addresses x-major voxels. The implementation
+/// walks scanline segments rather than expanding every voxel index, while
+/// preserving the one-voxel halo invalidation used by per-index edits.
+#[must_use]
+pub fn invalidated_chunks_for_index_spans(
+    dimensions: [u32; 3],
+    spans: impl IntoIterator<Item = (u32, u32)>,
+) -> Vec<ChunkCoord> {
+    let width = u64::from(dimensions[0]);
+    let plane = width.saturating_mul(u64::from(dimensions[1]));
+    let volume = plane.saturating_mul(u64::from(dimensions[2]));
+    if width == 0 || plane == 0 || volume == 0 {
+        return Vec::new();
+    }
+
+    let mut invalidated = BTreeSet::new();
+    for (start, length) in spans {
+        let mut index = u64::from(start).min(volume);
+        let end = u64::from(start)
+            .saturating_add(u64::from(length))
+            .min(volume);
+        while index < end {
+            let z = index / plane;
+            let remainder = index % plane;
+            let y = remainder / width;
+            let x = remainder % width;
+            let row_end = end.min(index + (width - x));
+            let x_end = x + (row_end - index);
+            add_invalidated_chunks_for_row_range(
+                &mut invalidated,
+                dimensions,
+                u32::try_from(z).expect("clamped volume z coordinate fits u32"),
+                u32::try_from(y).expect("clamped volume y coordinate fits u32"),
+                u32::try_from(x).expect("clamped volume x coordinate fits u32"),
+                u32::try_from(x_end).expect("clamped volume x boundary fits u32"),
+            );
+            index = row_end;
+        }
+    }
+    invalidated.into_iter().collect()
+}
+
+fn add_invalidated_chunks_for_row_range(
+    invalidated: &mut BTreeSet<ChunkCoord>,
+    dimensions: [u32; 3],
+    z: u32,
+    y: u32,
+    x_start: u32,
+    x_end: u32,
+) {
+    if x_start >= x_end || x_end > dimensions[0] || y >= dimensions[1] || z >= dimensions[2] {
+        return;
+    }
+    let grid = chunk_grid(dimensions);
+    let owner_y = y / CHUNK_SIZE;
+    let owner_z = z / CHUNK_SIZE;
+    let first_x = x_start / CHUNK_SIZE;
+    let last_x = (x_end - 1) / CHUNK_SIZE;
+
+    for owner_x in first_x..=last_x {
+        invalidated.insert(ChunkCoord::new(owner_x, owner_y, owner_z));
+    }
+    if x_start.is_multiple_of(CHUNK_SIZE) && first_x > 0 {
+        invalidated.insert(ChunkCoord::new(first_x - 1, owner_y, owner_z));
+    }
+    if x_end.is_multiple_of(CHUNK_SIZE) && last_x + 1 < grid[0] {
+        invalidated.insert(ChunkCoord::new(last_x + 1, owner_y, owner_z));
+    }
+    if y.is_multiple_of(CHUNK_SIZE) && owner_y > 0 {
+        for owner_x in first_x..=last_x {
+            invalidated.insert(ChunkCoord::new(owner_x, owner_y - 1, owner_z));
+        }
+    }
+    if y % CHUNK_SIZE == CHUNK_SIZE - 1 && owner_y + 1 < grid[1] {
+        for owner_x in first_x..=last_x {
+            invalidated.insert(ChunkCoord::new(owner_x, owner_y + 1, owner_z));
+        }
+    }
+    if z.is_multiple_of(CHUNK_SIZE) && owner_z > 0 {
+        for owner_x in first_x..=last_x {
+            invalidated.insert(ChunkCoord::new(owner_x, owner_y, owner_z - 1));
+        }
+    }
+    if z % CHUNK_SIZE == CHUNK_SIZE - 1 && owner_z + 1 < grid[2] {
+        for owner_x in first_x..=last_x {
+            invalidated.insert(ChunkCoord::new(owner_x, owner_y, owner_z + 1));
+        }
+    }
+}
+
 #[must_use]
 pub fn invalidated_chunks_for_indices_bounded(
     dimensions: [u32; 3],
@@ -1075,6 +1167,34 @@ mod tests {
         assert!(invalidated.contains(&ChunkCoord::new(0, 1, 0)));
         assert!(invalidated.contains(&ChunkCoord::new(1, 1, 0)));
         assert!(invalidated.contains(&ChunkCoord::new(0, 0, 0)));
+    }
+
+    #[test]
+    fn compact_spans_match_expanded_index_invalidation() {
+        let dimensions = [67, 65, 34];
+        let volume = dimensions.into_iter().product::<u32>();
+        let spans = [
+            (30, 5),
+            (67 * 31 + 30, 8),
+            (67 * 65 * 31 + 67 * 31 + 30, 140),
+            (volume - 70, 100),
+        ];
+        let expanded = spans.into_iter().flat_map(|(start, length)| {
+            let end = start.saturating_add(length).min(volume);
+            start.min(volume)..end
+        });
+        assert_eq!(
+            invalidated_chunks_for_index_spans(dimensions, spans),
+            invalidated_chunks_for_indices(dimensions, expanded)
+        );
+    }
+
+    #[test]
+    fn compact_span_invalidation_does_not_expand_voxel_runs() {
+        let invalidated = invalidated_chunks_for_index_spans([1_000_000, 1, 1], [(0, 1_000_000)]);
+        assert_eq!(invalidated.len(), 31_250);
+        assert_eq!(invalidated.first(), Some(&ChunkCoord::new(0, 0, 0)));
+        assert_eq!(invalidated.last(), Some(&ChunkCoord::new(31_249, 0, 0)));
     }
 
     #[test]

@@ -38,14 +38,27 @@ fn toolbar_exposes_names_disabled_state_focus_order_and_tool_state() {
     }
     assert!(
         harness
-            .get_by_label("Make solid left ↔ right")
+            .get_by_label("Fill enclosed cavities")
             .accesskit_node()
             .is_disabled()
     );
 
-    assert_eq!(tool_toggled(&harness, "Inspect (I)"), Some(Toggled::True));
-    assert_eq!(tool_toggled(&harness, "Brush (B)"), Some(Toggled::False));
-    assert_eq!(tool_toggled(&harness, "Eraser (E)"), Some(Toggled::False));
+    assert_eq!(
+        tool_toggled(&harness, "Inspect / navigate (I)"),
+        Some(Toggled::True)
+    );
+    assert_eq!(
+        tool_toggled(&harness, "Paint solid (B)"),
+        Some(Toggled::False)
+    );
+    assert_eq!(
+        tool_toggled(&harness, "Erase solid (E)"),
+        Some(Toggled::False)
+    );
+    assert_eq!(
+        tool_toggled(&harness, "Bridge surfaces (L)"),
+        Some(Toggled::False)
+    );
 
     harness.get_by_label("Open…").focus();
     harness.step();
@@ -54,32 +67,48 @@ fn toolbar_exposes_names_disabled_state_focus_order_and_tool_state() {
     harness.step();
     assert_eq!(
         focused_label(&harness).as_deref(),
-        Some("Inspect (I)"),
+        Some("Inspect / navigate (I)"),
         "disabled toolbar actions must be skipped in focus order"
     );
     harness.key_press(egui::Key::Tab);
     harness.step();
-    assert_eq!(focused_label(&harness).as_deref(), Some("Brush (B)"));
+    assert_eq!(focused_label(&harness).as_deref(), Some("Paint solid (B)"));
 
     harness.key_press(egui::Key::B);
     harness.step();
-    assert_eq!(tool_toggled(&harness, "Brush (B)"), Some(Toggled::True));
+    assert_eq!(
+        tool_toggled(&harness, "Paint solid (B)"),
+        Some(Toggled::True)
+    );
     assert!(
-        !harness
-            .get_by_role_and_label(Role::Slider, "brush size in voxels")
+        harness
+            .get_by_role_and_label(Role::Slider, "Brush diameter in voxels")
             .accesskit_node()
-            .is_disabled()
+            .is_disabled(),
+        "brush settings should stay disabled until a volume is loaded"
     );
 
     harness.key_press(egui::Key::E);
     harness.step();
-    assert_eq!(tool_toggled(&harness, "Eraser (E)"), Some(Toggled::True));
+    assert_eq!(
+        tool_toggled(&harness, "Erase solid (E)"),
+        Some(Toggled::True)
+    );
+    harness.key_press(egui::Key::L);
+    harness.step();
+    assert_eq!(
+        tool_toggled(&harness, "Bridge surfaces (L)"),
+        Some(Toggled::True)
+    );
     harness.key_press(egui::Key::I);
     harness.step();
-    assert_eq!(tool_toggled(&harness, "Inspect (I)"), Some(Toggled::True));
+    assert_eq!(
+        tool_toggled(&harness, "Inspect / navigate (I)"),
+        Some(Toggled::True)
+    );
     assert!(
         harness
-            .get_by_role_and_label(Role::Slider, "brush size in voxels")
+            .get_by_role_and_label(Role::Slider, "Brush diameter in voxels")
             .accesskit_node()
             .is_disabled()
     );
@@ -120,9 +149,12 @@ fn loaded_document_has_synchronized_named_panes_and_keyboard_editing() {
     harness.step();
     harness.key_press(egui::Key::Space);
     harness.step();
-    wait_for_label(&mut harness, "1 occupied");
+    wait_for_label(&mut harness, "7 occupied");
     wait_for_label(&mut harness, "modified");
-    assert_eq!(tool_toggled(&harness, "Brush (B)"), Some(Toggled::True));
+    assert_eq!(
+        tool_toggled(&harness, "Paint solid (B)"),
+        Some(Toggled::True)
+    );
 }
 
 #[test]
@@ -172,25 +204,32 @@ fn every_view_can_use_the_full_workspace_and_escape_restores_the_grid() {
 }
 
 #[test]
-fn make_solid_is_a_single_clear_action_with_visible_feedback() {
+fn fill_enclosed_cavities_is_a_single_clear_action_with_visible_feedback() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("make-solid.binvox");
     let dimensions = [5, 5, 5];
     let mut occupancy = vec![0; 125];
-    for x in [1, 3] {
-        occupancy[(x + dimensions[0] * (2 + dimensions[1] * 2)) as usize] = 1;
+    for voxel in [
+        [1, 2, 2],
+        [3, 2, 2],
+        [2, 1, 2],
+        [2, 3, 2],
+        [2, 2, 1],
+        [2, 2, 3],
+    ] {
+        occupancy[(voxel[0] + dimensions[0] * (voxel[1] + dimensions[1] * voxel[2])) as usize] = 1;
     }
     write_binvox(&path, dimensions, &occupancy);
     let mut harness = app_harness(Some(path));
-    wait_for_label(&mut harness, "2 occupied");
+    wait_for_label(&mut harness, "6 occupied");
 
-    let action = harness.get_by_label("Make solid left ↔ right");
+    let action = harness.get_by_label("Fill enclosed cavities");
     assert!(!action.accesskit_node().is_disabled());
     action.click();
     harness.step();
 
-    wait_for_label(&mut harness, "3 occupied");
-    wait_for_label(&mut harness, "Solid left ↔ right: +1 voxel");
+    wait_for_label(&mut harness, "7 occupied");
+    wait_for_label(&mut harness, "Filled 1 enclosed voxel");
     wait_for_label(&mut harness, "modified");
     assert!(!harness.get_by_label("Undo").accesskit_node().is_disabled());
 }
@@ -207,7 +246,7 @@ fn dirty_close_prompt_is_non_destructive_until_discard_is_chosen() {
     harness.step();
     harness.key_press(egui::Key::Enter);
     harness.step();
-    wait_for_label(&mut harness, "1 occupied");
+    wait_for_label(&mut harness, "4 occupied");
     wait_for_label(&mut harness, "modified");
 
     harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::W);
@@ -225,7 +264,7 @@ fn dirty_close_prompt_is_non_destructive_until_discard_is_chosen() {
     harness.get_by_label("Cancel").click();
     harness.step();
     wait_for_label_absence(&mut harness, "Save changes?");
-    assert!(harness.query_by_label_contains("1 occupied").is_some());
+    assert!(harness.query_by_label_contains("4 occupied").is_some());
 
     harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::W);
     harness.step();

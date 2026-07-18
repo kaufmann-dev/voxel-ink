@@ -5,7 +5,7 @@ compile_error!("VoxelInk is intentionally supported only on Linux");
 
 use std::{path::PathBuf, sync::Arc};
 
-use voxel_ink::VoxelInkApp;
+use voxel_ink::{VoxelInkApp, renderer::MSAA_SAMPLES};
 
 const LOGO_BYTES: &[u8] = include_bytes!("../assets/voxel-ink.png");
 
@@ -34,6 +34,7 @@ fn main() -> eframe::Result {
             .with_min_inner_size([900.0, 620.0])
             .with_icon(icon),
         renderer: eframe::Renderer::Wgpu,
+        multisampling: MSAA_SAMPLES as u16,
         depth_buffer: 24,
         centered: true,
         ..Default::default()
@@ -96,6 +97,8 @@ fn select_linux_adapter(
 
 #[cfg(test)]
 mod tests {
+    use voxel_ink::renderer::MSAA_SAMPLES;
+
     #[test]
     fn backend_priority_is_vulkan_then_gles() {
         fn priority(backend: wgpu::Backend) -> u8 {
@@ -106,5 +109,10 @@ mod tests {
             }
         }
         assert!(priority(wgpu::Backend::Vulkan) < priority(wgpu::Backend::Gl));
+    }
+
+    #[test]
+    fn native_and_volume_rendering_share_four_sample_msaa() {
+        assert_eq!(MSAA_SAMPLES, 4);
     }
 }
