@@ -119,20 +119,30 @@ fn repair_panel_guidance_and_controls_stay_inside_the_panel() {
 }
 
 #[test]
-fn loaded_repair_cards_keep_symmetric_margins_when_the_scrollbar_appears() {
+fn loaded_repair_cards_keep_their_gutter_when_the_scrollbar_appears() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("scrolling-repair-panel.binvox");
     write_binvox(&path, [5, 5, 5], &[0; 125]);
     let mut harness = app_harness_with_size(Some(path), [900.0, 620.0]);
     wait_for_label(&mut harness, "5 × 5 × 5");
+
+    let panel = harness
+        .get_by_role_and_label(Role::Pane, "Repair volume controls")
+        .rect();
+    let inspect_card = harness.get_by_label("Seal openings workflow").rect();
+    let inspect_left_margin = inspect_card.left() - panel.left();
+    let inspect_right_margin = panel.right() - inspect_card.right();
+    assert!(
+        (inspect_left_margin - inspect_right_margin).abs() < 1.0,
+        "the non-scrolling card should have symmetric margins: {inspect_left_margin} vs {inspect_right_margin}"
+    );
+
     harness.key_press(egui::Key::B);
     for _ in 0..4 {
         harness.step();
     }
 
-    let panel = harness
-        .get_by_role_and_label(Role::Pane, "Repair volume controls")
-        .rect();
+    let scroll_bar_width = egui::style::ScrollStyle::solid().allocated_width();
     for label in ["Seal openings workflow", "Fill interior workflow"] {
         let card = harness.get_by_label(label).rect();
         let left_margin = card.left() - panel.left();
@@ -142,8 +152,8 @@ fn loaded_repair_cards_keep_symmetric_margins_when_the_scrollbar_appears() {
             "{label:?} lost its panel margin after scrolling: panel {panel:?}, card {card:?}"
         );
         assert!(
-            (left_margin - right_margin).abs() < 1.0,
-            "{label:?} has asymmetric margins after scrolling: {left_margin} vs {right_margin}"
+            right_margin >= left_margin + scroll_bar_width - 1.0,
+            "{label:?} does not reserve its scrollbar outside the content gutter: {left_margin} vs {right_margin}"
         );
     }
 }

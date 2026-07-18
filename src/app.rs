@@ -1005,6 +1005,7 @@ impl VoxelInkApp {
                     .inner_margin(egui::Margin::ZERO),
             )
             .show(root, |ui| {
+                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
                 egui::ScrollArea::vertical()
                     .id_salt("voxel-ink-repair-scroll")
                     .auto_shrink([false, false])
