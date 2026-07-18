@@ -132,8 +132,10 @@ describe("VoxelInk native shell", () => {
   it("keeps brush feedback responsive while the 3D mesh catches up", async () => {
     const axialCanvas = browser.$("[aria-label='Axial slice']");
     const brushButton = browser.$("button=Brush");
+    const ready = browser.$("span=3D preview ready");
     await axialCanvas.waitForDisplayed({ timeout: 30_000 });
     await brushButton.waitForEnabled({ timeout: 30_000 });
+    await ready.waitForDisplayed({ timeout: 120_000 });
 
     const result = await browser.executeAsync<EditFeedbackResult, []>((done) => {
       const brush = [...document.querySelectorAll<HTMLButtonElement>("button")]
