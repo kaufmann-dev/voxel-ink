@@ -3373,7 +3373,10 @@ mod tests {
                     edit_generation: generation,
                     chunk,
                 },
-                vec![CompactQuad::new([0, 0, 0], 1, 1, crate::mesh::FaceAxis::X, true).unwrap()],
+                vec![
+                    CompactQuad::new([0, 0, 0], 1, 1, crate::mesh::FaceAxis::X, true, [0; 4])
+                        .unwrap(),
+                ],
                 MeshUpdatePriority::Live,
             );
         }
@@ -3642,7 +3645,8 @@ mod tests {
         let mut state = state_with_empty_document([64, 1, 1]);
         let grow = ChunkCoord::new(0, 0, 0);
         let shrink = ChunkCoord::new(1, 0, 0);
-        let quad = CompactQuad::new([0, 0, 0], 1, 1, crate::mesh::FaceAxis::X, true).unwrap();
+        let quad =
+            CompactQuad::new([0, 0, 0], 1, 1, crate::mesh::FaceAxis::X, true, [0; 4]).unwrap();
         let bytes = size_of::<CompactQuad>();
         state.mesh_budget = MeshMemoryBudget::new(3 * bytes);
         state.mesh_budget.try_replace(grow, bytes).unwrap();

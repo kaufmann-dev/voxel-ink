@@ -43,22 +43,10 @@ fn toolbar_exposes_names_disabled_state_focus_order_and_tool_state() {
             .is_disabled()
     );
 
-    assert_eq!(
-        tool_toggled(&harness, "Inspect / navigate (I)"),
-        Some(Toggled::True)
-    );
-    assert_eq!(
-        tool_toggled(&harness, "Paint solid (B)"),
-        Some(Toggled::False)
-    );
-    assert_eq!(
-        tool_toggled(&harness, "Erase solid (E)"),
-        Some(Toggled::False)
-    );
-    assert_eq!(
-        tool_toggled(&harness, "Bridge surfaces (L)"),
-        Some(Toggled::False)
-    );
+    assert_eq!(tool_toggled(&harness, "Inspect (I)"), Some(Toggled::True));
+    assert_eq!(tool_toggled(&harness, "Paint (B)"), Some(Toggled::False));
+    assert_eq!(tool_toggled(&harness, "Erase (E)"), Some(Toggled::False));
+    assert_eq!(tool_toggled(&harness, "Bridge (L)"), Some(Toggled::False));
 
     harness.get_by_label("Open…").focus();
     harness.step();
@@ -67,19 +55,16 @@ fn toolbar_exposes_names_disabled_state_focus_order_and_tool_state() {
     harness.step();
     assert_eq!(
         focused_label(&harness).as_deref(),
-        Some("Inspect / navigate (I)"),
+        Some("Inspect (I)"),
         "disabled toolbar actions must be skipped in focus order"
     );
     harness.key_press(egui::Key::Tab);
     harness.step();
-    assert_eq!(focused_label(&harness).as_deref(), Some("Paint solid (B)"));
+    assert_eq!(focused_label(&harness).as_deref(), Some("Paint (B)"));
 
     harness.key_press(egui::Key::B);
     harness.step();
-    assert_eq!(
-        tool_toggled(&harness, "Paint solid (B)"),
-        Some(Toggled::True)
-    );
+    assert_eq!(tool_toggled(&harness, "Paint (B)"), Some(Toggled::True));
     assert!(
         harness
             .get_by_role_and_label(Role::Slider, "Brush diameter in voxels")
@@ -90,27 +75,18 @@ fn toolbar_exposes_names_disabled_state_focus_order_and_tool_state() {
 
     harness.key_press(egui::Key::E);
     harness.step();
-    assert_eq!(
-        tool_toggled(&harness, "Erase solid (E)"),
-        Some(Toggled::True)
-    );
+    assert_eq!(tool_toggled(&harness, "Erase (E)"), Some(Toggled::True));
     harness.key_press(egui::Key::L);
     harness.step();
-    assert_eq!(
-        tool_toggled(&harness, "Bridge surfaces (L)"),
-        Some(Toggled::True)
-    );
+    assert_eq!(tool_toggled(&harness, "Bridge (L)"), Some(Toggled::True));
     harness.key_press(egui::Key::I);
     harness.step();
-    assert_eq!(
-        tool_toggled(&harness, "Inspect / navigate (I)"),
-        Some(Toggled::True)
-    );
+    assert_eq!(tool_toggled(&harness, "Inspect (I)"), Some(Toggled::True));
     assert!(
         harness
-            .get_by_role_and_label(Role::Slider, "Brush diameter in voxels")
-            .accesskit_node()
-            .is_disabled()
+            .query_by_role_and_label(Role::Slider, "Brush diameter in voxels")
+            .is_none(),
+        "Inspect should hide repair-only brush controls"
     );
 }
 
@@ -123,14 +99,21 @@ fn repair_panel_guidance_and_controls_stay_inside_the_panel() {
     let content_right = panel.right() - 12.0;
 
     for label in [
-        "After every opening is sealed, fill all empty regions that can no longer reach a volume boundary.",
+        "Choose the repair workflow that fits the volume.",
+        "Paint missing voxels or bridge gaps.",
+        "Fill empty regions that cannot reach a volume boundary.",
         "Fill enclosed cavities",
-        "No point selection is needed. Cancel is available while scanning.",
     ] {
         let rect = harness.get_by_label(label).rect();
         assert!(
             rect.right() <= content_right,
             "{label:?} extends beyond the repair panel {panel:?}: {rect:?}"
+        );
+    }
+    for removed_label in ["01", "02", "No point selection is needed."] {
+        assert!(
+            harness.query_by_label_contains(removed_label).is_none(),
+            "obsolete workflow sequencing text {removed_label:?} should not be shown"
         );
     }
 }
@@ -172,10 +155,7 @@ fn loaded_document_has_synchronized_named_panes_and_keyboard_editing() {
     harness.step();
     wait_for_label(&mut harness, "7 occupied");
     wait_for_label(&mut harness, "modified");
-    assert_eq!(
-        tool_toggled(&harness, "Paint solid (B)"),
-        Some(Toggled::True)
-    );
+    assert_eq!(tool_toggled(&harness, "Paint (B)"), Some(Toggled::True));
 }
 
 #[test]
@@ -331,6 +311,9 @@ fn four_view_splitters_resize_the_grid_and_survive_full_screen_restore() {
     );
 
     let saved_column_x = resized_column.center().x;
+    let saved_panel = harness
+        .get_by_role_and_label(Role::Pane, "Repair volume controls")
+        .rect();
     harness.get_by_label("Full screen Axial").click_accesskit();
     harness.step();
     harness.step();
@@ -353,7 +336,13 @@ fn four_view_splitters_resize_the_grid_and_survive_full_screen_restore() {
         .rect()
         .center()
         .x;
-    assert!((restored_column_x - saved_column_x).abs() < 1.0);
+    let restored_panel = harness
+        .get_by_role_and_label(Role::Pane, "Repair volume controls")
+        .rect();
+    assert!(
+        (restored_column_x - saved_column_x).abs() < 1.0,
+        "column splitter moved across full-screen restore: {saved_column_x} -> {restored_column_x}; panel {saved_panel:?} -> {restored_panel:?}"
+    );
 }
 
 #[test]

@@ -292,6 +292,9 @@ impl CompactQuad {
     const V_LENGTH_SHIFT: u32 = 5;
     const AXIS_SHIFT: u32 = 10;
     const POSITIVE_SHIFT: u32 = 12;
+    const OCCLUSION_SHIFT: u32 = 13;
+    const OCCLUSION_MASK: u32 = 0x3;
+    const FLIPPED_DIAGONAL_SHIFT: u32 = 21;
 
     #[must_use]
     pub fn new(
@@ -300,14 +303,24 @@ impl CompactQuad {
         v_length: u32,
         normal_axis: FaceAxis,
         positive: bool,
+        corner_occlusion: [u8; 4],
     ) -> Option<Self> {
-        if !(1..=CHUNK_SIZE).contains(&u_length) || !(1..=CHUNK_SIZE).contains(&v_length) {
+        if !(1..=CHUNK_SIZE).contains(&u_length)
+            || !(1..=CHUNK_SIZE).contains(&v_length)
+            || corner_occlusion.into_iter().any(|level| level > 3)
+        {
             return None;
         }
-        let packed = (u_length - 1)
+        let mut packed = (u_length - 1)
             | ((v_length - 1) << Self::V_LENGTH_SHIFT)
             | (normal_axis.code() << Self::AXIS_SHIFT)
             | (u32::from(positive) << Self::POSITIVE_SHIFT);
+        for (corner, level) in corner_occlusion.into_iter().enumerate() {
+            packed |= u32::from(level) << (Self::OCCLUSION_SHIFT + corner as u32 * 2);
+        }
+        let diagonal_02 = u16::from(corner_occlusion[0]) + u16::from(corner_occlusion[2]);
+        let diagonal_13 = u16::from(corner_occlusion[1]) + u16::from(corner_occlusion[3]);
+        packed |= u32::from(diagonal_02 > diagonal_13) << Self::FLIPPED_DIAGONAL_SHIFT;
         Some(Self { origin, packed })
     }
 
@@ -335,6 +348,22 @@ impl CompactQuad {
     }
 
     #[must_use]
+    pub const fn corner_occlusion(self, corner: usize) -> Option<u8> {
+        if corner >= 4 {
+            return None;
+        }
+        Some(
+            ((self.packed >> (Self::OCCLUSION_SHIFT + corner as u32 * 2)) & Self::OCCLUSION_MASK)
+                as u8,
+        )
+    }
+
+    #[must_use]
+    pub const fn flipped_diagonal(self) -> bool {
+        (self.packed & (1 << Self::FLIPPED_DIAGONAL_SHIFT)) != 0
+    }
+
+    #[must_use]
     pub const fn area(self) -> u32 {
         self.u_length() * self.v_length()
     }
@@ -348,13 +377,7 @@ impl CompactQuad {
 
     #[must_use]
     pub fn expanded_vertex(self, vertex_index: u32) -> Option<[f64; 3]> {
-        let corner = match (self.positive(), vertex_index) {
-            (true | false, 0 | 3) => 0,
-            (true, 1) | (false, 5) => 1,
-            (true | false, 2 | 4) => 2,
-            (true, 5) | (false, 1) => 3,
-            _ => return None,
-        };
+        let corner = face_vertex_corner(self.positive(), self.flipped_diagonal(), vertex_index)?;
         let [u_axis, v_axis] = self.normal_axis().tangent_axes();
         let mut vertex = self.origin.map(|coordinate| f64::from(coordinate) - 0.5);
         if corner == 1 || corner == 2 {
@@ -364,6 +387,24 @@ impl CompactQuad {
             vertex[v_axis] += f64::from(self.v_length());
         }
         Some(vertex)
+    }
+}
+
+const fn face_vertex_corner(
+    positive: bool,
+    flipped_diagonal: bool,
+    vertex_index: u32,
+) -> Option<u32> {
+    let corners = match (positive, flipped_diagonal) {
+        (true, false) => [0, 1, 2, 0, 2, 3],
+        (false, false) => [0, 3, 2, 0, 2, 1],
+        (true, true) => [0, 1, 3, 1, 2, 3],
+        (false, true) => [0, 3, 1, 1, 3, 2],
+    };
+    if vertex_index < 6 {
+        Some(corners[vertex_index as usize])
+    } else {
+        None
     }
 }
 
@@ -583,12 +624,15 @@ fn emit_greedy_quads(
             origin[layout.normal_axis_index] += chunk_u32(layout.plane)?;
             origin[layout.u_axis] += chunk_u32(u)?;
             origin[layout.v_axis] += chunk_u32(v)?;
+            let corner_occlusion =
+                quad_corner_occlusion(input, layout, u, v, width, height, face > 0);
             let quad = CompactQuad::new(
                 origin,
                 chunk_u32(width)?,
                 chunk_u32(height)?,
                 layout.normal_axis,
                 face > 0,
+                corner_occlusion,
             )
             .ok_or_else(|| {
                 AppError::InvalidDimensions("greedy quad exceeded chunk bounds".into())
@@ -607,6 +651,53 @@ fn emit_greedy_quads(
         v += 1;
     }
     Ok(())
+}
+
+fn quad_corner_occlusion(
+    input: &ChunkInput,
+    layout: PlaneLayout,
+    u: usize,
+    v: usize,
+    width: usize,
+    height: usize,
+    positive: bool,
+) -> [u8; 4] {
+    let mut levels = [0; 4];
+    for (corner, [maximum_u, maximum_v]) in
+        [[false, false], [true, false], [true, true], [false, true]]
+            .into_iter()
+            .enumerate()
+    {
+        let mut outside = [0_i32; 3];
+        outside[layout.normal_axis_index] = layout.plane as i32 - i32::from(!positive);
+        outside[layout.u_axis] = (u + usize::from(maximum_u) * (width - 1)) as i32;
+        outside[layout.v_axis] = (v + usize::from(maximum_v) * (height - 1)) as i32;
+        let u_direction = if maximum_u { 1 } else { -1 };
+        let v_direction = if maximum_v { 1 } else { -1 };
+        let mut side_u = outside;
+        side_u[layout.u_axis] += u_direction;
+        let mut side_v = outside;
+        side_v[layout.v_axis] += v_direction;
+        let mut diagonal = side_u;
+        diagonal[layout.v_axis] += v_direction;
+        levels[corner] = corner_occlusion(input, side_u, side_v, diagonal);
+    }
+    levels
+}
+
+fn corner_occlusion(
+    input: &ChunkInput,
+    side_u: [i32; 3],
+    side_v: [i32; 3],
+    diagonal: [i32; 3],
+) -> u8 {
+    let occupied_u = input.occupied(side_u);
+    let occupied_v = input.occupied(side_v);
+    if occupied_u && occupied_v {
+        3
+    } else {
+        u8::from(occupied_u) + u8::from(occupied_v) + u8::from(input.occupied(diagonal))
+    }
 }
 
 fn chunk_u32(value: usize) -> Result<u32> {
@@ -736,33 +827,42 @@ fn add_invalidated_chunks_for_row_range(
     let first_x = x_start / CHUNK_SIZE;
     let last_x = (x_end - 1) / CHUNK_SIZE;
 
-    for owner_x in first_x..=last_x {
-        invalidated.insert(ChunkCoord::new(owner_x, owner_y, owner_z));
-    }
-    if x_start.is_multiple_of(CHUNK_SIZE) && first_x > 0 {
-        invalidated.insert(ChunkCoord::new(first_x - 1, owner_y, owner_z));
-    }
-    if x_end.is_multiple_of(CHUNK_SIZE) && last_x + 1 < grid[0] {
-        invalidated.insert(ChunkCoord::new(last_x + 1, owner_y, owner_z));
-    }
-    if y.is_multiple_of(CHUNK_SIZE) && owner_y > 0 {
-        for owner_x in first_x..=last_x {
-            invalidated.insert(ChunkCoord::new(owner_x, owner_y - 1, owner_z));
-        }
-    }
-    if y % CHUNK_SIZE == CHUNK_SIZE - 1 && owner_y + 1 < grid[1] {
-        for owner_x in first_x..=last_x {
-            invalidated.insert(ChunkCoord::new(owner_x, owner_y + 1, owner_z));
-        }
-    }
-    if z.is_multiple_of(CHUNK_SIZE) && owner_z > 0 {
-        for owner_x in first_x..=last_x {
-            invalidated.insert(ChunkCoord::new(owner_x, owner_y, owner_z - 1));
-        }
-    }
-    if z % CHUNK_SIZE == CHUNK_SIZE - 1 && owner_z + 1 < grid[2] {
-        for owner_x in first_x..=last_x {
-            invalidated.insert(ChunkCoord::new(owner_x, owner_y, owner_z + 1));
+    let first_consumer_x = if x_start.is_multiple_of(CHUNK_SIZE) && first_x > 0 {
+        first_x - 1
+    } else {
+        first_x
+    };
+    let last_consumer_x = if x_end.is_multiple_of(CHUNK_SIZE) && last_x + 1 < grid[0] {
+        last_x + 1
+    } else {
+        last_x
+    };
+    let first_consumer_y = if y.is_multiple_of(CHUNK_SIZE) && owner_y > 0 {
+        owner_y - 1
+    } else {
+        owner_y
+    };
+    let last_consumer_y = if y % CHUNK_SIZE == CHUNK_SIZE - 1 && owner_y + 1 < grid[1] {
+        owner_y + 1
+    } else {
+        owner_y
+    };
+    let first_consumer_z = if z.is_multiple_of(CHUNK_SIZE) && owner_z > 0 {
+        owner_z - 1
+    } else {
+        owner_z
+    };
+    let last_consumer_z = if z % CHUNK_SIZE == CHUNK_SIZE - 1 && owner_z + 1 < grid[2] {
+        owner_z + 1
+    } else {
+        owner_z
+    };
+
+    for consumer_z in first_consumer_z..=last_consumer_z {
+        for consumer_y in first_consumer_y..=last_consumer_y {
+            for consumer_x in first_consumer_x..=last_consumer_x {
+                invalidated.insert(ChunkCoord::new(consumer_x, consumer_y, consumer_z));
+            }
         }
     }
 }
@@ -813,21 +913,14 @@ fn add_invalidated_chunks(
     {
         return;
     }
-    let grid = chunk_grid(dimensions);
-    let owner = ChunkCoord::from_voxel(voxel).as_array();
-    invalidated.insert(ChunkCoord::new(owner[0], owner[1], owner[2]));
-    for axis in 0..3 {
-        if voxel[axis].is_multiple_of(CHUNK_SIZE) && owner[axis] > 0 {
-            let mut neighbor = owner;
-            neighbor[axis] -= 1;
-            invalidated.insert(ChunkCoord::new(neighbor[0], neighbor[1], neighbor[2]));
-        }
-        if voxel[axis] % CHUNK_SIZE == CHUNK_SIZE - 1 && owner[axis] + 1 < grid[axis] {
-            let mut neighbor = owner;
-            neighbor[axis] += 1;
-            invalidated.insert(ChunkCoord::new(neighbor[0], neighbor[1], neighbor[2]));
-        }
-    }
+    add_invalidated_chunks_for_row_range(
+        invalidated,
+        dimensions,
+        voxel[2],
+        voxel[1],
+        voxel[0],
+        voxel[0] + 1,
+    );
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -1129,11 +1222,9 @@ mod tests {
         );
         assert_eq!(mesh.quads.len(), 6);
         assert_eq!(mesh.exposed_voxel_faces, 6 * 32 * 32);
-        assert!(
-            mesh.quads
-                .iter()
-                .all(|quad| quad.u_length() == 32 && quad.v_length() == 32)
-        );
+        assert!(mesh.quads.iter().all(|quad| quad.u_length() == 32
+            && quad.v_length() == 32
+            && (0..4).all(|corner| quad.corner_occlusion(corner) == Some(0))));
     }
 
     #[test]
@@ -1160,8 +1251,8 @@ mod tests {
     #[test]
     fn compact_quad_expansion_has_outward_winding_and_half_voxel_offset() {
         assert_eq!(size_of::<CompactQuad>(), 16);
-        let positive = CompactQuad::new([4, 7, 9], 3, 2, FaceAxis::Y, true).unwrap();
-        let negative = CompactQuad::new([4, 7, 9], 3, 2, FaceAxis::Y, false).unwrap();
+        let positive = CompactQuad::new([4, 7, 9], 3, 2, FaceAxis::Y, true, [0; 4]).unwrap();
+        let negative = CompactQuad::new([4, 7, 9], 3, 2, FaceAxis::Y, false, [0; 4]).unwrap();
         assert_eq!(positive.expanded_vertex(0), Some([3.5, 6.5, 8.5]));
         assert_eq!(positive.expanded_vertex(1), Some([3.5, 6.5, 11.5]));
         assert_eq!(positive.expanded_vertex(2), Some([5.5, 6.5, 11.5]));
@@ -1187,19 +1278,63 @@ mod tests {
     }
 
     #[test]
-    fn boundary_edit_invalidates_each_face_neighbor() {
+    fn compact_quad_packs_corner_occlusion_and_selects_the_lower_error_diagonal() {
+        let quad = CompactQuad::new([4, 7, 9], 3, 2, FaceAxis::Y, true, [3, 0, 1, 2]).unwrap();
+        assert_eq!(
+            std::array::from_fn(|corner| quad.corner_occlusion(corner).unwrap()),
+            [3, 0, 1, 2]
+        );
+        assert!(quad.flipped_diagonal());
+        assert_eq!(quad.expanded_vertex(2), Some([5.5, 6.5, 8.5]));
+        assert!(CompactQuad::new([0; 3], 1, 1, FaceAxis::Z, true, [0, 1, 2, 4]).is_none());
+    }
+
+    #[test]
+    fn corner_occlusion_counts_outward_side_and_diagonal_voxels() {
+        let level = |samples: [bool; 3]| {
+            let dimensions = [3, 3, 3];
+            let mut occupancy = vec![0; 27];
+            for (occupied, coordinate) in
+                samples
+                    .into_iter()
+                    .zip([[2_u32, 1, 1], [1, 2, 1], [2, 2, 1]])
+            {
+                if occupied {
+                    occupancy[(coordinate[0]
+                        + dimensions[0] * (coordinate[1] + dimensions[1] * coordinate[2]))
+                        as usize] = 1;
+                }
+            }
+            let input = input(dimensions, &occupancy, ChunkCoord::new(0, 0, 0));
+            corner_occlusion(&input, [2, 1, 1], [1, 2, 1], [2, 2, 1])
+        };
+        assert_eq!(level([false, false, false]), 0);
+        assert_eq!(level([false, false, true]), 1);
+        assert_eq!(level([true, false, true]), 2);
+        assert_eq!(level([true, true, false]), 3);
+    }
+
+    #[test]
+    fn boundary_edit_invalidates_every_chunk_consuming_its_halo() {
         let invalidated = invalidated_chunks_for_voxel([96, 96, 96], [32, 63, 31]);
-        assert_eq!(invalidated.len(), 4);
-        assert!(invalidated.contains(&ChunkCoord::new(1, 1, 0)));
-        assert!(invalidated.contains(&ChunkCoord::new(0, 1, 0)));
-        assert!(invalidated.contains(&ChunkCoord::new(1, 2, 0)));
-        assert!(invalidated.contains(&ChunkCoord::new(1, 1, 1)));
+        assert_eq!(invalidated.len(), 8);
+        for x in [0, 1] {
+            for y in [1, 2] {
+                for z in [0, 1] {
+                    assert!(invalidated.contains(&ChunkCoord::new(x, y, z)));
+                }
+            }
+        }
 
         let partial_edge = invalidated_chunks_for_voxel([33, 33, 33], [32, 32, 32]);
-        assert_eq!(partial_edge.len(), 4);
-        assert!(partial_edge.contains(&ChunkCoord::new(0, 1, 1)));
-        assert!(partial_edge.contains(&ChunkCoord::new(1, 0, 1)));
-        assert!(partial_edge.contains(&ChunkCoord::new(1, 1, 0)));
+        assert_eq!(partial_edge.len(), 8);
+        for x in [0, 1] {
+            for y in [0, 1] {
+                for z in [0, 1] {
+                    assert!(partial_edge.contains(&ChunkCoord::new(x, y, z)));
+                }
+            }
+        }
     }
 
     #[test]
@@ -1207,10 +1342,11 @@ mod tests {
         let dimensions = [64, 64, 2];
         let index = 31 + 64 * (32 + 64);
         let invalidated = invalidated_chunks_for_indices(dimensions, [index]);
-        assert_eq!(invalidated.len(), 3);
+        assert_eq!(invalidated.len(), 4);
         assert!(invalidated.contains(&ChunkCoord::new(0, 1, 0)));
         assert!(invalidated.contains(&ChunkCoord::new(1, 1, 0)));
         assert!(invalidated.contains(&ChunkCoord::new(0, 0, 0)));
+        assert!(invalidated.contains(&ChunkCoord::new(1, 0, 0)));
     }
 
     #[test]

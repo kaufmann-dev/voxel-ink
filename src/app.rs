@@ -21,21 +21,30 @@ use crate::{
 };
 
 const LOGO_BYTES: &[u8] = include_bytes!("../assets/voxel-ink.png");
-const BACKGROUND: Color32 = Color32::from_rgb(11, 17, 20);
-const SURFACE: Color32 = Color32::from_rgb(16, 25, 29);
-const RAISED: Color32 = Color32::from_rgb(22, 35, 41);
-const LINE: Color32 = Color32::from_rgb(49, 69, 78);
-const TEXT: Color32 = Color32::from_rgb(236, 243, 245);
-const MUTED: Color32 = Color32::from_rgb(170, 185, 191);
+const BACKGROUND: Color32 = Color32::BLACK;
+const SURFACE: Color32 = Color32::from_gray(8);
+const RAISED: Color32 = Color32::from_gray(24);
+const LINE: Color32 = Color32::from_gray(64);
+const TEXT: Color32 = Color32::from_gray(245);
+const MUTED: Color32 = Color32::from_gray(166);
 const TEAL: Color32 = Color32::from_rgb(36, 200, 219);
 const YELLOW: Color32 = Color32::from_rgb(255, 193, 49);
+const PAINT_GREEN: Color32 = Color32::from_rgb(0x42, 0xd6, 0x7c);
+const ERASE_RED: Color32 = Color32::from_rgb(0xff, 0x5b, 0x45);
+const BRIDGE_AMBER: Color32 = Color32::from_rgb(0xf4, 0xa6, 0x2a);
+const CARD_RADIUS: u8 = 6;
+const CONTROL_RADIUS: u8 = 4;
 const MAX_ENGINE_EVENTS_PER_FRAME: usize = 256;
 const SLICE_POINT_SCROLL_THRESHOLD: f32 = 24.0;
-const REPAIR_PANEL_DEFAULT_WIDTH: f32 = 288.0;
-const REPAIR_PANEL_MIN_WIDTH: f32 = 240.0;
+const REPAIR_PANEL_DEFAULT_WIDTH: f32 = 320.0;
+const REPAIR_PANEL_MIN_WIDTH: f32 = 280.0;
 const REPAIR_PANEL_MAX_WINDOW_FRACTION: f32 = 0.45;
-const REPAIR_PANEL_ABSOLUTE_MAX_WIDTH: f32 = 420.0;
+const REPAIR_PANEL_ABSOLUTE_MAX_WIDTH: f32 = 440.0;
 const WORKSPACE_GAP: f32 = 8.0;
+const CONTROL_MIN_HEIGHT: f32 = 30.0;
+const PANE_HEADER_CONTROL_INSET: f32 = 5.0;
+const PANE_HEADER_HEIGHT: f32 = CONTROL_MIN_HEIGHT + 2.0 * PANE_HEADER_CONTROL_INSET;
+const PANE_CONTENT_INSET: f32 = 6.0;
 const WORKSPACE_MIN_PANE_WIDTH: f32 = 280.0;
 const WORKSPACE_MIN_PANE_HEIGHT: f32 = 160.0;
 const WORKSPACE_KEYBOARD_RESIZE_STEP: f32 = 16.0;
@@ -240,6 +249,18 @@ impl SliceViewState {
 
     fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    fn zoom_at(&mut self, zoom_delta: f32, pointer: egui::Pos2, fitted_center: egui::Pos2) {
+        if !zoom_delta.is_finite() || zoom_delta <= 0.0 {
+            return;
+        }
+        let previous_zoom = self.zoom;
+        self.zoom = (self.zoom * zoom_delta).clamp(0.25, 32.0);
+        let scale = self.zoom / previous_zoom;
+        let old_center = fitted_center + self.pan;
+        let new_center = pointer - (pointer - old_center) * scale;
+        self.pan = new_center - fitted_center;
     }
 }
 
@@ -866,17 +887,20 @@ impl VoxelInkApp {
             .frame(
                 egui::Frame::new()
                     .fill(surface)
-                    .inner_margin(egui::Margin::same(8)),
+                    .stroke(egui::Stroke::new(1.0, self.line_color()))
+                    .inner_margin(egui::Margin::symmetric(10, 7)),
             )
             .show(root, |ui| {
-                ui.horizontal_wrapped(|ui| {
+                ui.horizontal(|ui| {
                     ui.add(
                         egui::Image::new(&self.logo)
-                            .fit_to_exact_size(Vec2::splat(34.0))
+                            .fit_to_exact_size(Vec2::splat(28.0))
                             .alt_text("VoxelInk teal and yellow logo"),
                     );
-                    ui.heading("VoxelInk");
+                    ui.label(egui::RichText::new("VoxelInk").size(18.0).strong());
+                    ui.add_space(4.0);
                     ui.separator();
+                    ui.add_space(2.0);
                     let edit_commands_ready = !self.has_edit_interaction();
                     if ui
                         .add_enabled(
@@ -911,7 +935,9 @@ impl VoxelInkApp {
                     {
                         self.guard_or_execute(GuardAction::CloseDocument);
                     }
+                    ui.add_space(2.0);
                     ui.separator();
+                    ui.add_space(2.0);
                     let can_undo = self
                         .summary
                         .as_ref()
@@ -937,20 +963,25 @@ impl VoxelInkApp {
                         let _ = self.send_command(EngineCommand::Redo);
                     }
                     if let Some(summary) = &self.summary {
+                        ui.add_space(8.0);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let dirty = if summary.is_dirty() {
-                                " • modified"
-                            } else {
-                                ""
-                            };
-                            ui.label(
+                            let text = if summary.is_dirty() {
                                 egui::RichText::new(format!(
-                                    "{}{}",
-                                    display_name(&summary.source_path),
-                                    dirty
+                                    "{}  • modified",
+                                    display_name(&summary.source_path)
                                 ))
-                                .color(MUTED),
-                            );
+                                .color(YELLOW)
+                            } else {
+                                egui::RichText::new(display_name(&summary.source_path)).color(MUTED)
+                            };
+                            egui::Frame::new()
+                                .fill(self.background_color())
+                                .stroke(egui::Stroke::new(1.0, self.line_color()))
+                                .corner_radius(CONTROL_RADIUS)
+                                .inner_margin(egui::Margin::symmetric(9, 5))
+                                .show(ui, |ui| {
+                                    ui.add(egui::Label::new(text).truncate());
+                                });
                         });
                     }
                 });
@@ -969,6 +1000,7 @@ impl VoxelInkApp {
             .frame(
                 egui::Frame::new()
                     .fill(surface)
+                    .stroke(egui::Stroke::NONE)
                     .inner_margin(egui::Margin::same(12)),
             )
             .show(root, |ui| {
@@ -976,198 +1008,304 @@ impl VoxelInkApp {
                     .id_salt("voxel-ink-repair-scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
                         let has_document = self.summary.is_some();
                         let ready = has_document
                             && self.busy.is_empty()
                             && !self.has_edit_interaction();
                         ui.heading("Repair volume");
-                        ui.add_space(4.0);
-                        ui.strong("1 · Seal every opening");
                         ui.add(
                             egui::Label::new(
                                 egui::RichText::new(
-                                    "Paint missing voxels or bridge two surfaces until the skull interior is closed.",
+                                    "Choose the repair workflow that fits the volume.",
                                 )
                                 .color(MUTED),
                             )
                             .wrap(),
                         );
-                        ui.add_space(8.0);
-                        let previous_tool = self.tool;
-                        ui.add_enabled_ui(self.busy.is_empty(), |ui| {
-                            ui.selectable_value(
-                                &mut self.tool,
-                                Tool::Inspect,
-                                "Inspect / navigate (I)",
-                            )
-                            .on_hover_text("Move through slices and rotate or pan the 3D view");
-                            ui.selectable_value(&mut self.tool, Tool::Paint, "Paint solid (B)")
-                                .on_hover_text(
-                                    "Fill the highlighted voxels with the primary mouse button",
-                                );
-                            ui.selectable_value(&mut self.tool, Tool::Erase, "Erase solid (E)")
-                                .on_hover_text(
-                                    "Remove the highlighted voxels with the primary mouse button",
-                                );
-                            ui.selectable_value(
-                                &mut self.tool,
-                                Tool::Bridge,
-                                "Bridge surfaces (L)",
-                            )
-                            .on_hover_text(
-                                "Drag between two points to add a solid connection in one Undo step",
+                        ui.add_space(12.0);
+
+                        let card_width = ui.available_width();
+                        let card = egui::Frame::new()
+                            .fill(self.background_color())
+                            .stroke(egui::Stroke::new(1.0, self.line_color()))
+                            .corner_radius(CARD_RADIUS)
+                            .inner_margin(egui::Margin::same(12));
+                        card.show(ui, |ui| {
+                            ui.set_width(
+                                (card_width - card.total_margin().sum().x).max(1.0),
                             );
+                            ui.strong("Seal openings");
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new("Paint missing voxels or bridge gaps.")
+                                        .color(MUTED),
+                                )
+                                .wrap(),
+                            );
+                            ui.add_space(10.0);
+
+                            let previous_tool = self.tool;
+                            ui.add_enabled_ui(self.busy.is_empty(), |ui| {
+                                ui.columns(2, |columns| {
+                                    if selection_button(
+                                        &mut columns[0],
+                                        "Inspect (I)",
+                                        self.tool == Tool::Inspect,
+                                        TEAL,
+                                        self.forced_colors,
+                                    )
+                                    .on_hover_text(
+                                        "Move through slices and rotate or pan the 3D view",
+                                    )
+                                    .clicked()
+                                    {
+                                        self.tool = Tool::Inspect;
+                                    }
+                                    if selection_button(
+                                        &mut columns[1],
+                                        "Paint (B)",
+                                        self.tool == Tool::Paint,
+                                        PAINT_GREEN,
+                                        self.forced_colors,
+                                    )
+                                    .on_hover_text("Fill the highlighted voxels")
+                                    .clicked()
+                                    {
+                                        self.tool = Tool::Paint;
+                                    }
+                                });
+                                ui.add_space(6.0);
+                                ui.columns(2, |columns| {
+                                    if selection_button(
+                                        &mut columns[0],
+                                        "Erase (E)",
+                                        self.tool == Tool::Erase,
+                                        ERASE_RED,
+                                        self.forced_colors,
+                                    )
+                                    .on_hover_text("Remove the highlighted voxels")
+                                    .clicked()
+                                    {
+                                        self.tool = Tool::Erase;
+                                    }
+                                    if selection_button(
+                                        &mut columns[1],
+                                        "Bridge (L)",
+                                        self.tool == Tool::Bridge,
+                                        BRIDGE_AMBER,
+                                        self.forced_colors,
+                                    )
+                                    .on_hover_text(
+                                        "Drag between two points to add one solid connection",
+                                    )
+                                    .clicked()
+                                    {
+                                        self.tool = Tool::Bridge;
+                                    }
+                                });
+                            });
+                            if self.tool != previous_tool {
+                                self.cancel_edit_interaction();
+                            }
+
+                            if self.tool != Tool::Inspect {
+                                ui.add_space(12.0);
+                                ui.separator();
+                                ui.add_space(8.0);
+                                ui.add_enabled_ui(ready, |ui| {
+                                    ui.label(egui::RichText::new("Shape").small().strong());
+                                    ui.columns(2, |columns| {
+                                        if selection_button(
+                                            &mut columns[0],
+                                            "Round",
+                                            self.brush_shape == BrushShape::Round,
+                                            TEAL,
+                                            self.forced_colors,
+                                        )
+                                        .clicked()
+                                        {
+                                            self.brush_shape = BrushShape::Round;
+                                        }
+                                        if selection_button(
+                                            &mut columns[1],
+                                            "Square",
+                                            self.brush_shape == BrushShape::Square,
+                                            TEAL,
+                                            self.forced_colors,
+                                        )
+                                        .clicked()
+                                        {
+                                            self.brush_shape = BrushShape::Square;
+                                        }
+                                    });
+                                    ui.add_space(8.0);
+                                    ui.label(egui::RichText::new("Depth").small().strong());
+                                    ui.columns(2, |columns| {
+                                        if selection_button(
+                                            &mut columns[0],
+                                            "One slice",
+                                            self.brush_depth == BrushDepth::Slice,
+                                            TEAL,
+                                            self.forced_colors,
+                                        )
+                                        .clicked()
+                                        {
+                                            self.brush_depth = BrushDepth::Slice;
+                                        }
+                                        if selection_button(
+                                            &mut columns[1],
+                                            "3D volume",
+                                            self.brush_depth == BrushDepth::Volume,
+                                            TEAL,
+                                            self.forced_colors,
+                                        )
+                                        .clicked()
+                                        {
+                                            self.brush_depth = BrushDepth::Volume;
+                                        }
+                                    });
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Depth applies to slice views; 3D always uses a volume brush.",
+                                        )
+                                        .small()
+                                        .color(MUTED),
+                                    );
+                                    ui.add_space(8.0);
+
+                                    let has_physical_units = self
+                                        .summary
+                                        .as_ref()
+                                        .is_some_and(|summary| summary.units != SpatialUnits::Unknown);
+                                    if !has_physical_units {
+                                        self.brush_size_unit = BrushSizeUnit::Voxels;
+                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("Size").small().strong());
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.add_enabled_ui(has_physical_units, |ui| {
+                                                    if compact_selection_button(
+                                                        ui,
+                                                        "mm",
+                                                        self.brush_size_unit
+                                                            == BrushSizeUnit::Millimeters,
+                                                        self.forced_colors,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        self.brush_size_unit =
+                                                            BrushSizeUnit::Millimeters;
+                                                    }
+                                                });
+                                                if compact_selection_button(
+                                                    ui,
+                                                    "voxels",
+                                                    self.brush_size_unit == BrushSizeUnit::Voxels,
+                                                    self.forced_colors,
+                                                )
+                                                .clicked()
+                                                {
+                                                    self.brush_size_unit = BrushSizeUnit::Voxels;
+                                                }
+                                            },
+                                        );
+                                    });
+                                    ui.spacing_mut().slider_width =
+                                        (ui.available_width() - 62.0).max(80.0);
+                                    match self.brush_size_unit {
+                                        BrushSizeUnit::Voxels => {
+                                            let label = ui.add(
+                                                egui::Label::new("Brush diameter in voxels").wrap(),
+                                            );
+                                            let changed = ui
+                                                .add(
+                                                    egui::Slider::new(
+                                                        &mut self.brush_voxel_diameter,
+                                                        BrushSize::MIN_VOXELS
+                                                            ..=BrushSize::MAX_VOXELS,
+                                                    )
+                                                    .step_by(2.0)
+                                                    .suffix(" vox"),
+                                                )
+                                                .labelled_by(label.id)
+                                                .changed();
+                                            if changed
+                                                && self.brush_voxel_diameter.is_multiple_of(2)
+                                            {
+                                                self.brush_voxel_diameter = self
+                                                    .brush_voxel_diameter
+                                                    .saturating_add(1)
+                                                    .min(BrushSize::MAX_VOXELS);
+                                            }
+                                        }
+                                        BrushSizeUnit::Millimeters => {
+                                            let label = ui.add(
+                                                egui::Label::new(
+                                                    "Brush diameter in millimetres",
+                                                )
+                                                .wrap(),
+                                            );
+                                            ui.add(
+                                                egui::Slider::new(
+                                                    &mut self.brush_millimeters,
+                                                    BrushSize::MIN_MILLIMETERS
+                                                        ..=BrushSize::MAX_MILLIMETERS,
+                                                )
+                                                .step_by(0.5)
+                                                .suffix(" mm"),
+                                            )
+                                            .labelled_by(label.id);
+                                        }
+                                    }
+                                });
+                            }
                         });
-                        if self.tool != previous_tool {
-                            self.cancel_edit_interaction();
-                        }
 
                         ui.add_space(10.0);
-                        ui.add_enabled_ui(ready && self.tool != Tool::Inspect, |ui| {
-                            ui.strong("Brush footprint");
-                            ui.horizontal_wrapped(|ui| {
-                                ui.selectable_value(
-                                    &mut self.brush_shape,
-                                    BrushShape::Round,
-                                    "Round",
-                                );
-                                ui.selectable_value(
-                                    &mut self.brush_shape,
-                                    BrushShape::Square,
-                                    "Square",
-                                );
-                            });
-                            ui.horizontal_wrapped(|ui| {
-                                ui.selectable_value(
-                                    &mut self.brush_depth,
-                                    BrushDepth::Slice,
-                                    "One slice",
-                                );
-                                ui.selectable_value(
-                                    &mut self.brush_depth,
-                                    BrushDepth::Volume,
-                                    "3D volume",
-                                );
-                            });
+                        let card_width = ui.available_width();
+                        card.show(ui, |ui| {
+                            ui.set_width(
+                                (card_width - card.total_margin().sum().x).max(1.0),
+                            );
+                            ui.strong("Fill interior");
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(
-                                        "Depth applies in slice views; 3D editing uses a 3D brush.",
+                                        "Fill empty regions that cannot reach a volume boundary.",
                                     )
-                                    .small()
                                     .color(MUTED),
                                 )
                                 .wrap(),
                             );
-                            ui.add_space(5.0);
-
-                            let has_physical_units = self.summary.as_ref().is_some_and(|summary| {
-                                summary.units != SpatialUnits::Unknown
-                            });
-                            ui.horizontal_wrapped(|ui| {
-                                ui.selectable_value(
-                                    &mut self.brush_size_unit,
-                                    BrushSizeUnit::Voxels,
-                                    "Voxels",
-                                );
-                                ui.add_enabled_ui(has_physical_units, |ui| {
-                                    ui.selectable_value(
-                                        &mut self.brush_size_unit,
-                                        BrushSizeUnit::Millimeters,
-                                        "Millimetres",
-                                    );
-                                });
-                            });
-                            if !has_physical_units {
-                                self.brush_size_unit = BrushSizeUnit::Voxels;
-                            }
-                            let available_slider_width = ui.available_width();
-                            ui.spacing_mut().slider_width =
-                                (available_slider_width - 72.0).max(80.0);
-                            match self.brush_size_unit {
-                                BrushSizeUnit::Voxels => {
-                                    let label = ui.add(
-                                        egui::Label::new("Brush diameter in voxels").wrap(),
-                                    );
-                                    let changed = ui
-                                        .add(
-                                            egui::Slider::new(
-                                                &mut self.brush_voxel_diameter,
-                                                BrushSize::MIN_VOXELS..=BrushSize::MAX_VOXELS,
-                                            )
-                                            .step_by(2.0),
-                                        )
-                                        .labelled_by(label.id)
-                                        .changed();
-                                    if changed && self.brush_voxel_diameter.is_multiple_of(2) {
-                                        self.brush_voxel_diameter = self
-                                            .brush_voxel_diameter
-                                            .saturating_add(1)
-                                            .min(BrushSize::MAX_VOXELS);
-                                    }
-                                }
-                                BrushSizeUnit::Millimeters => {
-                                    let label = ui.add(
-                                        egui::Label::new("Brush diameter in millimetres").wrap(),
-                                    );
-                                    ui.add(
-                                        egui::Slider::new(
-                                            &mut self.brush_millimeters,
-                                            BrushSize::MIN_MILLIMETERS
-                                                ..=BrushSize::MAX_MILLIMETERS,
-                                        )
-                                        .step_by(0.5)
-                                        .suffix(" mm"),
-                                    )
-                                    .labelled_by(label.id);
+                            ui.add_space(10.0);
+                            let action = egui::Button::new(
+                                egui::RichText::new("Fill enclosed cavities").strong(),
+                            )
+                            .min_size(egui::vec2(ui.available_width(), 38.0))
+                            .corner_radius(CONTROL_RADIUS);
+                            let action = if ready && !self.forced_colors {
+                                action
+                                    .fill(TEAL)
+                                    .stroke(egui::Stroke::new(1.0, TEAL))
+                            } else {
+                                action
+                            };
+                            if ui
+                                .add_enabled(ready, action)
+                                .on_hover_text(
+                                    "Fill every empty 3D region that cannot reach a volume boundary. The result is one Undo step.",
+                                )
+                                .clicked()
+                            {
+                                self.preview_notice = None;
+                                self.clear_brush_preview();
+                                if let Err(error) = self.engine.start_fill_enclosed_cavities() {
+                                    self.error_message = Some(error.to_string());
                                 }
                             }
                         });
-
-                        ui.add_space(14.0);
-                        ui.separator();
-                        ui.add_space(10.0);
-                        ui.strong("2 · Fill the closed interior");
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(
-                                    "After every opening is sealed, fill all empty regions that can no longer reach a volume boundary.",
-                                )
-                                .color(MUTED),
-                            )
-                            .wrap(),
-                        );
-                        ui.add_space(8.0);
-                        if ui
-                            .add_enabled(
-                                ready,
-                                egui::Button::new(
-                                    egui::RichText::new("Fill enclosed cavities").strong(),
-                                )
-                                .min_size(egui::vec2(ui.available_width(), 34.0)),
-                            )
-                            .on_hover_text(
-                                "Fill every empty 3D region that cannot reach any outside volume face. The result is one Undo step.",
-                            )
-                            .clicked()
-                        {
-                            self.preview_notice = None;
-                            self.clear_brush_preview();
-                            if let Err(error) = self.engine.start_fill_enclosed_cavities() {
-                                self.error_message = Some(error.to_string());
-                            }
-                        }
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(
-                                    "No point selection is needed. Cancel is available while scanning.",
-                                )
-                                .small()
-                                .color(MUTED),
-                            )
-                            .wrap(),
-                        );
                     });
             });
         panel.response.widget_info(|| {
@@ -1181,21 +1319,36 @@ impl VoxelInkApp {
             .frame(
                 egui::Frame::new()
                     .fill(surface)
-                    .inner_margin(egui::Margin::symmetric(8, 5)),
+                    .stroke(egui::Stroke::new(1.0, self.line_color()))
+                    .inner_margin(egui::Margin::symmetric(8, 6)),
             )
             .show(root, |ui| {
-                ui.horizontal_wrapped(|ui| {
+                ui.horizontal(|ui| {
                     if let Some(summary) = &self.summary {
-                        ui.label(format!(
-                            "{} × {} × {}   {} occupied   cursor {}, {}, {}",
-                            summary.dimensions[0],
-                            summary.dimensions[1],
-                            summary.dimensions[2],
-                            summary.occupied_count,
-                            summary.cursor[0],
-                            summary.cursor[1],
-                            summary.cursor[2]
-                        ));
+                        status_chip(
+                            ui,
+                            "Size",
+                            format!(
+                                "{} × {} × {}",
+                                summary.dimensions[0], summary.dimensions[1], summary.dimensions[2]
+                            ),
+                            self.forced_colors,
+                        );
+                        status_chip(
+                            ui,
+                            "Solid",
+                            format!("{} occupied", format_count(summary.occupied_count)),
+                            self.forced_colors,
+                        );
+                        status_chip(
+                            ui,
+                            "Cursor",
+                            format!(
+                                "cursor {}, {}, {}",
+                                summary.cursor[0], summary.cursor[1], summary.cursor[2]
+                            ),
+                            self.forced_colors,
+                        );
                         if summary.normalized_non_binary {
                             ui.colored_label(YELLOW, "non-binary source normalized; save required");
                         }
@@ -1206,10 +1359,7 @@ impl VoxelInkApp {
                         ui.colored_label(YELLOW, notice);
                     }
                     if self.mesh_preview_failed {
-                        ui.colored_label(
-                            YELLOW,
-                            "3D preview paused at its memory limit; slice editing is unaffected",
-                        );
+                        ui.colored_label(YELLOW, "3D preview paused at its memory limit");
                         if ui
                             .add_enabled(
                                 !self.has_edit_interaction(),
@@ -1237,7 +1387,12 @@ impl VoxelInkApp {
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new(&self.adapter_name).color(MUTED).small());
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&self.adapter_name).color(MUTED).small(),
+                            )
+                            .truncate(),
+                        );
                     });
                 });
             });
@@ -1461,13 +1616,14 @@ impl VoxelInkApp {
     fn slice_pane(&mut self, ui: &mut egui::Ui, axis: SliceAxis, actions: &mut FrameStrokeActions) {
         let pane_rect = ui.max_rect();
         ui.painter()
-            .rect_filled(pane_rect, 0.0, self.surface_color());
-        ui.painter().rect_stroke(
-            pane_rect,
-            0.0,
-            egui::Stroke::new(1.0, self.line_color()),
-            egui::StrokeKind::Inside,
+            .rect_filled(pane_rect, CARD_RADIUS, self.background_color());
+        let header_rect = egui::Rect::from_min_max(
+            pane_rect.min,
+            egui::pos2(pane_rect.right(), pane_rect.top() + PANE_HEADER_HEIGHT),
         );
+        let header_controls = header_rect.shrink(PANE_HEADER_CONTROL_INSET);
+        ui.painter()
+            .rect_filled(header_rect, CARD_RADIUS, self.background_color());
         let title = match axis {
             SliceAxis::Axial => "Axial",
             SliceAxis::Coronal => "Coronal",
@@ -1485,43 +1641,60 @@ impl VoxelInkApp {
             summary.dimensions[axis.normal_axis()].saturating_sub(1)
         });
         ui.painter().text(
-            pane_rect.min + egui::vec2(9.0, 8.0),
-            egui::Align2::LEFT_TOP,
-            format!("{title}  {coordinate} / {last_coordinate}"),
+            egui::pos2(pane_rect.left() + 9.0, header_rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            title,
             egui::FontId::proportional(14.0),
             TEXT,
+        );
+        ui.painter().text(
+            egui::pos2(pane_rect.left() + 72.0, header_rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            format!("{coordinate} / {last_coordinate}"),
+            egui::FontId::proportional(12.0),
+            MUTED,
         );
         let pane = WorkspacePane::Slice(axis);
         let maximized = self.maximized_pane == Some(pane);
         let maximize_label = if maximized {
-            "Restore four views".to_owned()
+            "Restore".to_owned()
         } else {
-            format!("Full screen {title}")
+            "Expand".to_owned()
         };
-        let button_width = if maximized { 132.0 } else { 148.0 };
+        let button_width = 68.0;
         let button_rect = egui::Rect::from_min_size(
             egui::pos2(
-                pane_rect.right() - button_width - 5.0,
-                pane_rect.top() + 4.0,
+                header_controls.right() - button_width,
+                header_controls.top(),
             ),
-            egui::vec2(button_width, 22.0),
+            egui::vec2(button_width, header_controls.height()),
         );
-        if ui
+        let maximize_response = ui
             .put(button_rect, egui::Button::new(maximize_label))
             .on_hover_text(if maximized {
                 "Return to the four-view layout (Esc)"
             } else {
                 "Use the full workspace for this view"
-            })
-            .clicked()
-        {
+            });
+        maximize_response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                true,
+                if maximized {
+                    "Restore four views".to_owned()
+                } else {
+                    format!("Full screen {title}")
+                },
+            )
+        });
+        if maximize_response.clicked() {
             self.active_slice = axis;
             self.maximized_pane = if maximized { None } else { Some(pane) };
             ui.ctx().request_repaint();
         }
         let fit_button_rect = egui::Rect::from_min_size(
-            egui::pos2(button_rect.left() - 47.0, pane_rect.top() + 4.0),
-            egui::vec2(42.0, 22.0),
+            egui::pos2(button_rect.left() - 47.0, header_controls.top()),
+            egui::vec2(42.0, header_controls.height()),
         );
         if ui
             .put(fit_button_rect, egui::Button::new("Fit"))
@@ -1532,8 +1705,8 @@ impl VoxelInkApp {
             view.reset();
         }
         let coordinate_rect = egui::Rect::from_min_size(
-            egui::pos2(fit_button_rect.left() - 75.0, pane_rect.top() + 4.0),
-            egui::vec2(70.0, 22.0),
+            egui::pos2(fit_button_rect.left() - 75.0, header_controls.top()),
+            egui::vec2(70.0, header_controls.height()),
         );
         let mut requested_coordinate = coordinate;
         if ui
@@ -1555,8 +1728,11 @@ impl VoxelInkApp {
             let _ = self.send_command(EngineCommand::SetCursor(cursor));
         }
         let content = egui::Rect::from_min_max(
-            pane_rect.min + egui::vec2(6.0, 30.0),
-            pane_rect.max - egui::vec2(6.0, 6.0),
+            egui::pos2(
+                pane_rect.left() + PANE_CONTENT_INSET,
+                header_rect.bottom() + PANE_CONTENT_INSET,
+            ),
+            pane_rect.max - egui::vec2(PANE_CONTENT_INSET, PANE_CONTENT_INSET),
         );
         let Some(slice) = self.slices.get(&axis) else {
             ui.painter().text(
@@ -1583,7 +1759,8 @@ impl VoxelInkApp {
             fitted_rect.center() + view.pan,
             fitted_rect.size() * view.zoom,
         );
-        ui.painter().image(
+        let content_painter = ui.painter().with_clip_rect(content);
+        content_painter.image(
             texture_id,
             image_rect,
             egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
@@ -1591,7 +1768,7 @@ impl VoxelInkApp {
         );
         if let Some(kind) = self.brush_preview_kind {
             paint_brush_preview(
-                &ui.painter().with_clip_rect(content),
+                &content_painter,
                 image_rect,
                 axis,
                 coordinate,
@@ -1604,7 +1781,7 @@ impl VoxelInkApp {
         }
         if let Some(anchor) = self.bridge_anchor {
             paint_brush_preview(
-                &ui.painter().with_clip_rect(content),
+                &content_painter,
                 image_rect,
                 axis,
                 coordinate,
@@ -1615,12 +1792,15 @@ impl VoxelInkApp {
                 self.forced_colors,
             );
         }
-        ui.painter().text(
-            content.left_bottom() + egui::vec2(8.0, -8.0),
-            egui::Align2::LEFT_BOTTOM,
-            "Wheel: 1 slice   Ctrl + wheel: zoom   Middle / right drag: move",
-            egui::FontId::proportional(12.0),
-            MUTED,
+        paint_interaction_hint(
+            ui.painter(),
+            content,
+            if content.width() < 400.0 {
+                "Wheel slice · Ctrl+wheel zoom · Drag move"
+            } else {
+                "Wheel: slice · Ctrl+wheel: zoom · Middle/right drag: move"
+            },
+            self.forced_colors,
         );
         let interaction_rect = image_rect.intersect(content);
         let response = ui.interact(
@@ -1639,7 +1819,7 @@ impl VoxelInkApp {
             self.pane_keyboard_focus = true;
             ui.painter().rect_stroke(
                 image_rect,
-                0.0,
+                CONTROL_RADIUS,
                 egui::Stroke::new(
                     2.0,
                     if self.forced_colors {
@@ -1667,16 +1847,11 @@ impl VoxelInkApp {
         {
             let control = ui.input(|input| input.modifiers.ctrl);
             if control {
-                let zoom_delta = ui.input(|input| input.smooth_scroll_delta.y);
-                if zoom_delta.abs() > f32::EPSILON {
-                    let previous_zoom = view.zoom;
-                    view.zoom = (view.zoom * (zoom_delta * 0.002).exp()).clamp(0.25, 32.0);
-                    if let Some(pointer) = response.hover_pos() {
-                        let old_center = fitted_rect.center() + view.pan;
-                        let scale = view.zoom / previous_zoom;
-                        let new_center = pointer - (pointer - old_center) * scale;
-                        view.pan = new_center - fitted_rect.center();
-                    }
+                let zoom_delta = ui.input(|input| input.zoom_delta());
+                if (zoom_delta - 1.0).abs() > f32::EPSILON
+                    && let Some(pointer) = response.hover_pos()
+                {
+                    view.zoom_at(zoom_delta, pointer, fitted_rect.center());
                 }
                 view.point_scroll_remainder = 0.0;
             } else {
@@ -1701,7 +1876,7 @@ impl VoxelInkApp {
         self.slice_views.insert(axis, view);
         if let Some(summary) = &self.summary {
             paint_crosshair(
-                ui.painter(),
+                &content_painter,
                 image_rect,
                 axis,
                 summary.cursor,
@@ -1723,7 +1898,8 @@ impl VoxelInkApp {
                     })
                 })
         };
-        let pointer_voxel = response.interact_pointer_pos().and_then(pointer_to_voxel);
+        let hovered_voxel = persistent_hover_position(&response).and_then(pointer_to_voxel);
+        let interaction_voxel = response.interact_pointer_pos().and_then(pointer_to_voxel);
         let (primary_press_position, primary_release_position) =
             ui.input(|input| primary_pointer_event_positions(&input.events));
         let pressed_voxel = primary_press_position.and_then(pointer_to_voxel);
@@ -1738,7 +1914,7 @@ impl VoxelInkApp {
             && response.hovered()
             && self.stroke.is_none()
             && self.bridge_commit.is_none()
-            && let Some(voxel) = pointer_voxel
+            && let Some(voxel) = hovered_voxel
         {
             actions.preview_hovered = true;
             let sample = PointerSample::Slice { axis, voxel };
@@ -1774,7 +1950,7 @@ impl VoxelInkApp {
                 );
             } else if response.dragged_by(egui::PointerButton::Primary)
                 && let Some(edit_id) = self.open_stroke_id(space)
-                && let Some(voxel) = pointer_voxel
+                && let Some(voxel) = interaction_voxel
                 && let Err(error) =
                     self.send_stroke_sample(edit_id, PointerSample::Slice { axis, voxel })
             {
@@ -1834,7 +2010,7 @@ impl VoxelInkApp {
                 }
             }
         } else if response.clicked()
-            && let Some(voxel) = pointer_voxel
+            && let Some(voxel) = interaction_voxel
         {
             let _ = self.send_command(EngineCommand::SetCursor(voxel));
         }
@@ -1843,68 +2019,80 @@ impl VoxelInkApp {
     fn volume_pane(&mut self, ui: &mut egui::Ui, actions: &mut FrameStrokeActions) {
         let pane_rect = ui.max_rect();
         ui.painter()
-            .rect_filled(pane_rect, 0.0, self.surface_color());
-        ui.painter().rect_stroke(
-            pane_rect,
-            0.0,
-            egui::Stroke::new(1.0, self.line_color()),
-            egui::StrokeKind::Inside,
+            .rect_filled(pane_rect, CARD_RADIUS, self.background_color());
+        let header_rect = egui::Rect::from_min_max(
+            pane_rect.min,
+            egui::pos2(pane_rect.right(), pane_rect.top() + PANE_HEADER_HEIGHT),
         );
+        let header_controls = header_rect.shrink(PANE_HEADER_CONTROL_INSET);
+        ui.painter()
+            .rect_filled(header_rect, CARD_RADIUS, self.background_color());
         ui.painter().text(
-            pane_rect.min + egui::vec2(9.0, 8.0),
-            egui::Align2::LEFT_TOP,
+            egui::pos2(pane_rect.left() + 9.0, header_rect.center().y),
+            egui::Align2::LEFT_CENTER,
             "3D View",
             egui::FontId::proportional(14.0),
             TEXT,
         );
         let pane = WorkspacePane::Volume3D;
         let maximized = self.maximized_pane == Some(pane);
-        let maximize_label = if maximized {
-            "Restore four views"
-        } else {
-            "Full screen 3D"
-        };
-        let maximize_width = if maximized { 132.0 } else { 126.0 };
+        let maximize_label = if maximized { "Restore" } else { "Expand" };
+        let maximize_width = 68.0;
         let maximize_rect = egui::Rect::from_min_size(
             egui::pos2(
-                pane_rect.right() - maximize_width - 5.0,
-                pane_rect.top() + 4.0,
+                header_controls.right() - maximize_width,
+                header_controls.top(),
             ),
-            egui::vec2(maximize_width, 22.0),
+            egui::vec2(maximize_width, header_controls.height()),
         );
-        if ui
+        let maximize_response = ui
             .put(maximize_rect, egui::Button::new(maximize_label))
             .on_hover_text(if maximized {
                 "Return to the four-view layout (Esc)"
             } else {
                 "Use the full workspace for the 3D view"
-            })
-            .clicked()
-        {
+            });
+        maximize_response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                true,
+                if maximized {
+                    "Restore four views"
+                } else {
+                    "Full screen 3D"
+                },
+            )
+        });
+        if maximize_response.clicked() {
             self.maximized_pane = if maximized { None } else { Some(pane) };
             ui.ctx().request_repaint();
         }
-        let reset_width = 82.0;
+        let reset_width = 58.0;
         let reset_rect = egui::Rect::from_min_size(
             egui::pos2(
                 maximize_rect.left() - reset_width - 5.0,
-                pane_rect.top() + 4.0,
+                header_controls.top(),
             ),
-            egui::vec2(reset_width, 22.0),
+            egui::vec2(reset_width, header_controls.height()),
         );
-        if ui
-            .put(reset_rect, egui::Button::new("Reset view"))
-            .on_hover_text("Center the volume and restore the default rotation and zoom")
-            .clicked()
-        {
+        let reset_response = ui
+            .put(reset_rect, egui::Button::new("Reset"))
+            .on_hover_text("Center the volume and restore the default rotation and zoom");
+        reset_response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Reset view")
+        });
+        if reset_response.clicked() {
             self.scene.reset_view();
         }
         let content = egui::Rect::from_min_max(
-            pane_rect.min + egui::vec2(6.0, 30.0),
-            pane_rect.max - egui::vec2(6.0, 6.0),
+            egui::pos2(
+                pane_rect.left() + PANE_CONTENT_INSET,
+                header_rect.bottom() + PANE_CONTENT_INSET,
+            ),
+            pane_rect.max - egui::vec2(PANE_CONTENT_INSET, PANE_CONTENT_INSET),
         );
         ui.painter()
-            .rect_filled(content, 0.0, self.background_color());
+            .rect_filled(content, CONTROL_RADIUS, self.background_color());
         self.scene
             .set_aspect(content.width() / content.height().max(1.0));
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
@@ -1932,18 +2120,26 @@ impl VoxelInkApp {
                 "Left drag: edit   Middle drag: rotate   Right drag: move   Wheel: zoom"
             }
         };
-        ui.painter().text(
-            content.left_bottom() + egui::vec2(8.0, -8.0),
-            egui::Align2::LEFT_BOTTOM,
-            controls,
-            egui::FontId::proportional(12.0),
-            MUTED,
+        let compact_controls = match self.tool {
+            Tool::Inspect => "Rotate · Move · Zoom",
+            Tool::Bridge => "Bridge · Rotate · Move · Zoom",
+            Tool::Paint | Tool::Erase => "Edit · Rotate · Move · Zoom",
+        };
+        paint_interaction_hint(
+            ui.painter(),
+            content,
+            if content.width() < 400.0 {
+                compact_controls
+            } else {
+                controls
+            },
+            self.forced_colors,
         );
         if response.has_focus() {
             self.pane_keyboard_focus = true;
             ui.painter().rect_stroke(
                 content,
-                0.0,
+                CONTROL_RADIUS,
                 egui::Stroke::new(
                     2.0,
                     if self.forced_colors {
@@ -1983,7 +2179,8 @@ impl VoxelInkApp {
                 self.scene.ray_for_pointer(normalized)
             })
         };
-        let pointer_ray = response.interact_pointer_pos().and_then(pointer_to_ray);
+        let hovered_ray = persistent_hover_position(&response).and_then(pointer_to_ray);
+        let interaction_ray = response.interact_pointer_pos().and_then(pointer_to_ray);
         let (primary_press_position, primary_release_position) =
             ui.input(|input| primary_pointer_event_positions(&input.events));
         let pressed_ray = primary_press_position.and_then(pointer_to_ray);
@@ -1994,7 +2191,7 @@ impl VoxelInkApp {
         if (response.hovered() || response.dragged_by(egui::PointerButton::Primary))
             && self.stroke.is_none()
             && self.bridge_commit.is_none()
-            && let Some(ray) = pointer_ray
+            && let Some(ray) = hovered_ray
         {
             actions.preview_hovered = true;
             let sample = PointerSample::Ray { ray };
@@ -2029,7 +2226,7 @@ impl VoxelInkApp {
                 );
             } else if response.dragged_by(egui::PointerButton::Primary)
                 && let Some(edit_id) = self.open_stroke_id(space)
-                && let Some(ray) = pointer_ray
+                && let Some(ray) = interaction_ray
                 && let Err(error) = self.send_stroke_sample(edit_id, PointerSample::Ray { ray })
             {
                 self.error_message = Some(error.to_string());
@@ -2292,12 +2489,12 @@ impl VoxelInkApp {
             return;
         }
         self.brush_preview_generation = self.brush_preview_generation.saturating_add(1);
-        self.discard_current_brush_preview();
         let request = preview_with_generation(request, self.brush_preview_generation);
         match self.engine.send_latest_preview(request) {
             Ok(()) => self.last_preview_request = Some(template),
             Err(error) => {
                 self.last_preview_request = None;
+                self.discard_current_brush_preview();
                 self.error_message = Some(error.to_string());
             }
         }
@@ -2927,16 +3124,118 @@ impl eframe::App for VoxelInkApp {
     }
 }
 
+fn selection_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    selected: bool,
+    accent: Color32,
+    forced_colors: bool,
+) -> egui::Response {
+    let (fill, stroke, text) = if forced_colors {
+        if selected {
+            (Color32::WHITE, Color32::WHITE, Color32::BLACK)
+        } else {
+            (Color32::BLACK, Color32::WHITE, Color32::WHITE)
+        }
+    } else if selected {
+        (
+            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 52),
+            accent,
+            TEXT,
+        )
+    } else {
+        (RAISED, LINE, MUTED)
+    };
+    let width = ui.available_width();
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).color(text))
+            .selected(selected)
+            .fill(fill)
+            .stroke(egui::Stroke::new(if selected { 1.5 } else { 1.0 }, stroke))
+            .corner_radius(if forced_colors { 0 } else { CONTROL_RADIUS })
+            .min_size(egui::vec2(width, 34.0)),
+    )
+}
+
+fn compact_selection_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    selected: bool,
+    forced_colors: bool,
+) -> egui::Response {
+    let (fill, stroke, text) = if forced_colors {
+        if selected {
+            (Color32::WHITE, Color32::WHITE, Color32::BLACK)
+        } else {
+            (Color32::BLACK, Color32::WHITE, Color32::WHITE)
+        }
+    } else if selected {
+        (
+            Color32::from_rgba_unmultiplied(TEAL.r(), TEAL.g(), TEAL.b(), 52),
+            TEAL,
+            TEXT,
+        )
+    } else {
+        (RAISED, LINE, MUTED)
+    };
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).small().color(text))
+            .selected(selected)
+            .fill(fill)
+            .stroke(egui::Stroke::new(1.0, stroke))
+            .corner_radius(if forced_colors { 0 } else { CONTROL_RADIUS })
+            .min_size(egui::vec2(if label == "mm" { 42.0 } else { 58.0 }, 26.0)),
+    )
+}
+
+fn status_chip(ui: &mut egui::Ui, label: &str, value: String, forced_colors: bool) {
+    egui::Frame::new()
+        .fill(if forced_colors {
+            Color32::BLACK
+        } else {
+            BACKGROUND
+        })
+        .stroke(egui::Stroke::new(
+            1.0,
+            if forced_colors { Color32::WHITE } else { LINE },
+        ))
+        .corner_radius(if forced_colors { 0 } else { CONTROL_RADIUS })
+        .inner_margin(egui::Margin::symmetric(7, 3))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(label).small().color(if forced_colors {
+                    Color32::WHITE
+                } else {
+                    MUTED
+                }));
+                ui.label(egui::RichText::new(value).small().strong());
+            });
+        });
+}
+
 fn configure_style(ctx: &egui::Context, forced_colors: bool, reduced_motion: bool) {
     ctx.set_theme(egui::Theme::Dark);
     let mut visuals = egui::Visuals::dark();
-    visuals.window_corner_radius = egui::CornerRadius::ZERO;
-    visuals.menu_corner_radius = egui::CornerRadius::ZERO;
-    visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::ZERO;
-    visuals.widgets.inactive.corner_radius = egui::CornerRadius::ZERO;
-    visuals.widgets.hovered.corner_radius = egui::CornerRadius::ZERO;
-    visuals.widgets.active.corner_radius = egui::CornerRadius::ZERO;
-    visuals.widgets.open.corner_radius = egui::CornerRadius::ZERO;
+    let control_radius = if forced_colors {
+        egui::CornerRadius::ZERO
+    } else {
+        egui::CornerRadius::same(CONTROL_RADIUS)
+    };
+    visuals.window_corner_radius = if forced_colors {
+        egui::CornerRadius::ZERO
+    } else {
+        egui::CornerRadius::same(8)
+    };
+    visuals.menu_corner_radius = if forced_colors {
+        egui::CornerRadius::ZERO
+    } else {
+        egui::CornerRadius::same(CARD_RADIUS)
+    };
+    visuals.widgets.noninteractive.corner_radius = control_radius;
+    visuals.widgets.inactive.corner_radius = control_radius;
+    visuals.widgets.hovered.corner_radius = control_radius;
+    visuals.widgets.active.corner_radius = control_radius;
+    visuals.widgets.open.corner_radius = control_radius;
     visuals.panel_fill = if forced_colors {
         Color32::BLACK
     } else {
@@ -2968,19 +3267,27 @@ fn configure_style(ctx: &egui::Context, forced_colors: bool, reduced_motion: boo
         RAISED
     };
     visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, TEXT);
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, LINE);
     visuals.widgets.hovered.bg_fill = if forced_colors {
         Color32::WHITE
     } else {
-        Color32::from_rgb(28, 45, 52)
+        Color32::from_gray(36)
     };
     visuals.widgets.hovered.fg_stroke =
         egui::Stroke::new(1.5, if forced_colors { Color32::BLACK } else { TEXT });
+    visuals.widgets.hovered.bg_stroke =
+        egui::Stroke::new(1.0, if forced_colors { Color32::WHITE } else { TEAL });
     visuals.widgets.active.bg_fill = if forced_colors { Color32::WHITE } else { TEAL };
     visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, MUTED);
     ctx.set_visuals(visuals);
-    if reduced_motion {
-        ctx.style_mut_of(egui::Theme::Dark, |style| style.animation_time = 0.0);
-    }
+    ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.spacing.item_spacing = egui::vec2(8.0, 7.0);
+        style.spacing.button_padding = egui::vec2(10.0, 6.0);
+        style.spacing.interact_size.y = CONTROL_MIN_HEIGHT;
+        if reduced_motion {
+            style.animation_time = 0.0;
+        }
+    });
 }
 
 fn cavities_filled_notice(summary: Option<&DocumentSummary>, added_voxels: u64) -> String {
@@ -3209,6 +3516,10 @@ fn rect_contains_half_open(rect: egui::Rect, position: egui::Pos2) -> bool {
         && position.y < rect.bottom()
 }
 
+fn persistent_hover_position(response: &egui::Response) -> Option<egui::Pos2> {
+    response.hover_pos()
+}
+
 fn paint_crosshair(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -3288,6 +3599,41 @@ fn paint_brush_preview(
     }
 }
 
+fn paint_interaction_hint(
+    painter: &egui::Painter,
+    content: egui::Rect,
+    text: &str,
+    forced_colors: bool,
+) {
+    let text_color = if forced_colors { Color32::WHITE } else { MUTED };
+    let galley = painter.layout_no_wrap(
+        text.to_owned(),
+        egui::FontId::proportional(12.0),
+        text_color,
+    );
+    let size = galley.size() + egui::vec2(12.0, 6.0);
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(content.left() + 6.0, content.bottom() - size.y - 6.0),
+        size,
+    );
+    painter.rect_filled(
+        rect,
+        if forced_colors { 0 } else { CONTROL_RADIUS },
+        if forced_colors {
+            Color32::BLACK
+        } else {
+            Color32::from_rgba_unmultiplied(SURFACE.r(), SURFACE.g(), SURFACE.b(), 232)
+        },
+    );
+    painter.rect_stroke(
+        rect,
+        if forced_colors { 0 } else { CONTROL_RADIUS },
+        egui::Stroke::new(1.0, if forced_colors { Color32::WHITE } else { LINE }),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(rect.min + egui::vec2(6.0, 3.0), galley, text_color);
+}
+
 fn display_name(path: &Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -3317,6 +3663,32 @@ fn suggested_save_name(summary: &DocumentSummary, purpose: DialogPurpose) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stationary_pointer_remains_available_for_hover_picking() {
+        let context = egui::Context::default();
+        let pointer = egui::pos2(40.0, 30.0);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 80.0));
+        let mut hovered = None;
+        for events in [vec![egui::Event::PointerMoved(pointer)], Vec::new()] {
+            let _ = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let response = ui.interact(
+                        screen,
+                        ui.id().with("stationary-hover-target"),
+                        egui::Sense::click_and_drag(),
+                    );
+                    hovered = persistent_hover_position(&response);
+                },
+            );
+        }
+        assert_eq!(hovered, Some(pointer));
+    }
 
     #[test]
     fn slice_pointer_mapping_keeps_synchronized_normal_coordinate() {
@@ -3397,6 +3769,48 @@ mod tests {
 
         assert_eq!(view.wheel_steps(&[event]), 1);
         assert_eq!(view.wheel_steps(&[]), 0);
+    }
+
+    #[test]
+    fn control_wheel_is_reported_as_zoom_instead_of_smooth_scroll() {
+        let context = egui::Context::default();
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        let mut observed = (egui::Vec2::ZERO, 1.0);
+        let _ = context.run_ui(
+            egui::RawInput {
+                modifiers,
+                events: vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, 1.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers,
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                observed = ui.input(|input| (input.smooth_scroll_delta, input.zoom_delta()));
+            },
+        );
+
+        assert_eq!(observed.0, egui::Vec2::ZERO);
+        assert!(observed.1 > 1.0);
+    }
+
+    #[test]
+    fn slice_zoom_keeps_the_voxel_under_the_pointer_stationary() {
+        let fitted_center = egui::pos2(50.0, 40.0);
+        let pointer = egui::pos2(75.0, 55.0);
+        let mut view = SliceViewState::default();
+        let before = (pointer - (fitted_center + view.pan)) / view.zoom;
+
+        view.zoom_at(2.0, pointer, fitted_center);
+
+        let after = (pointer - (fitted_center + view.pan)) / view.zoom;
+        assert!((view.zoom - 2.0).abs() < f32::EPSILON);
+        assert!((after - before).length() < f32::EPSILON);
     }
 
     #[test]

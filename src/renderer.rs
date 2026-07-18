@@ -34,6 +34,7 @@ struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) view_normal: vec3<f32>,
     @location(1) view_position: vec3<f32>,
+    @location(2) corner_occlusion: f32,
 };
 
 @vertex
@@ -46,14 +47,23 @@ fn vertex_main(
     let v_length = f32(((packed >> 5u) & 31u) + 1u);
     let axis = (packed >> 10u) & 3u;
     let positive = ((packed >> 12u) & 1u) != 0u;
+    let flipped_diagonal = ((packed >> 21u) & 1u) != 0u;
 
     var corner = 0u;
-    if (vertex_index == 2u || vertex_index == 4u) {
-        corner = 2u;
-    } else if ((positive && vertex_index == 1u) || (!positive && vertex_index == 5u)) {
-        corner = 1u;
-    } else if ((positive && vertex_index == 5u) || (!positive && vertex_index == 1u)) {
-        corner = 3u;
+    if (!flipped_diagonal) {
+        if (vertex_index == 2u || vertex_index == 4u) {
+            corner = 2u;
+        } else if ((positive && vertex_index == 1u) || (!positive && vertex_index == 5u)) {
+            corner = 1u;
+        } else if ((positive && vertex_index == 5u) || (!positive && vertex_index == 1u)) {
+            corner = 3u;
+        }
+    } else if (positive) {
+        let corners = array<u32, 6>(0u, 1u, 3u, 1u, 2u, 3u);
+        corner = corners[vertex_index];
+    } else {
+        let corners = array<u32, 6>(0u, 3u, 1u, 1u, 3u, 2u);
+        corner = corners[vertex_index];
     }
 
     var index_position = vec3<f32>(origin) - vec3<f32>(0.5);
@@ -90,6 +100,7 @@ fn vertex_main(
         (uniforms.index_normal_to_view * vec4<f32>(index_normal, 0.0)).xyz,
     );
     output.view_position = view_position.xyz;
+    output.corner_occlusion = f32((packed >> (13u + corner * 2u)) & 3u);
     return output;
 }
 
@@ -123,7 +134,8 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         1.0,
     );
     let depth_factor = mix(1.0, 0.62, normalized_scene_depth);
-    let lighting = base_lighting * depth_factor * surface_factor;
+    let voxel_ao_factor = mix(1.0, 0.76, clamp(input.corner_occlusion / 3.0, 0.0, 1.0));
+    let lighting = base_lighting * depth_factor * surface_factor * voxel_ao_factor;
     return vec4<f32>(uniforms.material_color.rgb * lighting, 1.0);
 }
 "#;
@@ -652,10 +664,8 @@ impl SceneBridge {
             }
             let generation = self.next_highlight_generation_locked();
             remove_queued_highlight_updates(&mut state.updates);
-            queue_latest_highlight_update(&mut state.updates, SceneUpdate::ClearHighlight);
             (state.dimensions, generation)
         };
-        self.request_repaint();
         let scene = self.clone();
         rayon::spawn(move || {
             let faces = build_highlight_faces_cancellable(
@@ -790,7 +800,9 @@ impl SceneBridge {
             return;
         }
         match result {
-            Ok(faces) if faces.is_empty() => {}
+            Ok(faces) if faces.is_empty() => {
+                queue_latest_highlight_update(&mut state.updates, SceneUpdate::ClearHighlight);
+            }
             Ok(faces) => {
                 queue_latest_highlight_update(
                     &mut state.updates,
@@ -802,6 +814,7 @@ impl SceneBridge {
                 );
             }
             Err(HighlightBuildError::Failed(failure)) => {
+                queue_latest_highlight_update(&mut state.updates, SceneUpdate::ClearHighlight);
                 *self
                     .highlight_failure
                     .lock()
@@ -824,7 +837,31 @@ fn remove_queued_highlight_updates(updates: &mut VecDeque<SceneUpdate>) {
 }
 
 fn queue_latest_highlight_update(updates: &mut VecDeque<SceneUpdate>, update: SceneUpdate) {
-    updates.push_back(update);
+    let barrier_end = updates
+        .iter()
+        .rposition(|queued| {
+            matches!(
+                queued,
+                SceneUpdate::Reset { .. } | SceneUpdate::Invalidate { .. }
+            )
+        })
+        .map_or(0, |index| index + 1);
+    let insertion_index = updates
+        .iter()
+        .enumerate()
+        .skip(barrier_end)
+        .find_map(|(index, queued)| {
+            matches!(
+                queued,
+                SceneUpdate::Chunk {
+                    priority: MeshUpdatePriority::Background,
+                    ..
+                }
+            )
+            .then_some(index)
+        })
+        .unwrap_or(updates.len());
+    updates.insert(insertion_index, update);
 }
 
 fn queue_chunk_update(
@@ -1256,14 +1293,25 @@ fn normal_matrix(model_view: Mat4) -> Mat4 {
 
 fn scene_camera(state: &SceneState) -> (Mat4, Mat4, Mat4, f32, f32) {
     let affine = affine_mat4(state.affine);
-    let mut corners = Vec::with_capacity(8);
-    for z in [-0.5, state.dimensions[2] as f32 - 0.5] {
-        for y in [-0.5, state.dimensions[1] as f32 - 0.5] {
-            for x in [-0.5, state.dimensions[0] as f32 - 0.5] {
-                corners.push(affine.transform_point3(Vec3::new(x, y, z)));
-            }
-        }
-    }
+    let corners: [Vec3; 8] = std::array::from_fn(|corner| {
+        affine.transform_point3(Vec3::new(
+            if corner & 1 == 0 {
+                -0.5
+            } else {
+                state.dimensions[0] as f32 - 0.5
+            },
+            if corner & 2 == 0 {
+                -0.5
+            } else {
+                state.dimensions[1] as f32 - 0.5
+            },
+            if corner & 4 == 0 {
+                -0.5
+            } else {
+                state.dimensions[2] as f32 - 0.5
+            },
+        ))
+    });
     let center = corners.iter().copied().sum::<Vec3>() / corners.len() as f32;
     let radius = corners
         .iter()
@@ -1277,9 +1325,15 @@ fn scene_camera(state: &SceneState) -> (Mat4, Mat4, Mat4, f32, f32) {
     );
     let eye = center + direction * radius * 2.6 / state.zoom;
     let view = Mat4::look_at_rh(eye, center, Vec3::Z);
-    let center_view_depth = -view.transform_point3(center).z;
-    let near_surface_depth = center_view_depth - radius;
-    let inverse_scene_depth_span = 1.0 / (2.0 * radius);
+    let (near_surface_depth, far_surface_depth) =
+        corners
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(near, far), corner| {
+                let depth = -view.transform_point3(*corner).z;
+                (near.min(depth), far.max(depth))
+            });
+    let inverse_scene_depth_span =
+        1.0 / (far_surface_depth - near_surface_depth).max(radius * 1.0e-6);
     let projection = Mat4::from_translation(Vec3::new(state.pan_ndc.x, state.pan_ndc.y, 0.0))
         * Mat4::perspective_rh(
             45_f32.to_radians(),
@@ -1405,7 +1459,7 @@ mod tests {
     }
 
     #[test]
-    fn equal_normal_fragments_darken_with_depth_and_internal_facing() {
+    fn equal_normal_fragments_darken_with_depth_internal_facing_and_voxel_occlusion() {
         let depth_factor = |depth: f32, near: f32, inverse_span: f32| {
             let normalized = ((depth - near) * inverse_span).clamp(0.0, 1.0);
             1.0 + (0.62 - 1.0) * normalized
@@ -1420,8 +1474,15 @@ mod tests {
         assert!(nearest > middle && middle > farthest);
         assert!((farthest - 0.62).abs() < f32::EPSILON);
         assert!(0.68 * nearest < nearest);
+        let ao_factor = |level: f32| 1.0 + (0.76 - 1.0) * (level / 3.0).clamp(0.0, 1.0);
+        assert!((ao_factor(0.0) - 1.0).abs() < f32::EPSILON);
+        assert!(ao_factor(0.0) > ao_factor(1.0));
+        assert!(ao_factor(1.0) > ao_factor(2.0));
+        assert!(ao_factor(2.0) > ao_factor(3.0));
+        assert!((ao_factor(3.0) - 0.76).abs() < f32::EPSILON);
         assert!(SHADER.contains("mix(1.0, 0.62, normalized_scene_depth)"));
         assert!(SHADER.contains("select(1.0, 0.68, geometric_back_facing)"));
+        assert!(SHADER.contains("mix(1.0, 0.76"));
     }
 
     #[test]
@@ -1462,14 +1523,10 @@ mod tests {
         wait_for_highlight_kind(&bridge, VoxelHighlightKind::Erase);
 
         let state = bridge.state.lock().unwrap();
-        assert_eq!(state.updates.len(), 3);
+        assert_eq!(state.updates.len(), 2);
         assert!(matches!(
             state.updates.front(),
             Some(SceneUpdate::Reset { .. })
-        ));
-        assert!(matches!(
-            state.updates.get(1),
-            Some(SceneUpdate::ClearHighlight)
         ));
         let Some(SceneUpdate::Highlight {
             epoch,
@@ -1686,35 +1743,63 @@ mod tests {
     }
 
     #[test]
-    fn background_chunk_update_stays_ahead_of_later_highlight() {
+    fn highlight_follows_live_chunks_and_precedes_background_backlog() {
         let bridge = SceneBridge::default();
-        bridge.reset(3, 6, [8; 3], SceneState::default().affine);
+        bridge.reset(3, 6, [64, 8, 8], SceneState::default().affine);
+        let tag = |chunk, priority| MeshJobTag {
+            document_epoch: 3,
+            revision: 6,
+            chunk_generation: 2,
+            edit_generation: u64::from(priority == MeshUpdatePriority::Live),
+            chunk,
+        };
         bridge.insert_chunk(
-            MeshJobTag {
-                document_epoch: 3,
-                revision: 6,
-                chunk_generation: 2,
-                edit_generation: 0,
-                chunk: ChunkCoord::new(0, 0, 0),
-            },
+            tag(ChunkCoord::new(0, 0, 0), MeshUpdatePriority::Background),
             Vec::new(),
             MeshUpdatePriority::Background,
+        );
+        bridge.insert_chunk(
+            tag(ChunkCoord::new(1, 0, 0), MeshUpdatePriority::Live),
+            Vec::new(),
+            MeshUpdatePriority::Live,
         );
         assert!(bridge.set_voxel_highlight(3, 6, vec![([2, 2, 2], VoxelHighlightKind::Paint)],));
         wait_for_highlight_kind(&bridge, VoxelHighlightKind::Paint);
 
         let state = bridge.state.lock().unwrap();
-        let chunk_index = state
+        let live_index = state
             .updates
             .iter()
-            .position(|update| matches!(update, SceneUpdate::Chunk { .. }))
+            .position(|update| {
+                matches!(
+                    update,
+                    SceneUpdate::Chunk {
+                        priority: MeshUpdatePriority::Live,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let background_index = state
+            .updates
+            .iter()
+            .position(|update| {
+                matches!(
+                    update,
+                    SceneUpdate::Chunk {
+                        priority: MeshUpdatePriority::Background,
+                        ..
+                    }
+                )
+            })
             .unwrap();
         let highlight_index = state
             .updates
             .iter()
             .position(|update| matches!(update, SceneUpdate::Highlight { .. }))
             .unwrap();
-        assert!(chunk_index < highlight_index);
+        assert!(live_index < highlight_index);
+        assert!(highlight_index < background_index);
     }
 
     #[test]
@@ -1892,6 +1977,63 @@ mod tests {
     }
 
     #[test]
+    fn camera_depth_span_matches_the_projected_volume_box_at_cardinal_and_oblique_angles() {
+        let mut state = SceneState {
+            dimensions: [617, 560, 231],
+            affine: [
+                [0.315, 0.0, 0.0, 0.0],
+                [0.0, 0.315, 0.0, 0.0],
+                [0.0, 0.0, 0.8, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            pitch: 0.0,
+            ..Default::default()
+        };
+        for (yaw, expected_span) in [
+            (0.0, state.dimensions[0] as f32 * 0.315),
+            (
+                std::f32::consts::FRAC_PI_2,
+                state.dimensions[1] as f32 * 0.315,
+            ),
+        ] {
+            state.yaw = yaw;
+            let (_, _, _, _, inverse_span) = scene_camera(&state);
+            assert!((inverse_span.recip() - expected_span).abs() < 1.0e-3);
+        }
+
+        state.yaw = 0.65;
+        state.pitch = -0.45;
+        let (view, _, affine, near, inverse_span) = scene_camera(&state);
+        let corners: [Vec3; 8] = std::array::from_fn(|corner| {
+            affine.transform_point3(Vec3::new(
+                if corner & 1 == 0 {
+                    -0.5
+                } else {
+                    state.dimensions[0] as f32 - 0.5
+                },
+                if corner & 2 == 0 {
+                    -0.5
+                } else {
+                    state.dimensions[1] as f32 - 0.5
+                },
+                if corner & 4 == 0 {
+                    -0.5
+                } else {
+                    state.dimensions[2] as f32 - 0.5
+                },
+            ))
+        });
+        let normalized = corners.map(|corner| {
+            let depth = -view.transform_point3(corner).z;
+            (depth - near) * inverse_span
+        });
+        let minimum = normalized.into_iter().fold(f32::INFINITY, f32::min);
+        let maximum = normalized.into_iter().fold(f32::NEG_INFINITY, f32::max);
+        assert!(minimum.abs() < 1.0e-5);
+        assert!((maximum - 1.0).abs() < 1.0e-5);
+    }
+
+    #[test]
     fn rightward_orbit_drag_moves_the_volume_right_on_screen() {
         let viewport = egui::vec2(800.0, 600.0);
         let bridge = SceneBridge::default();
@@ -2047,7 +2189,7 @@ mod tests {
                     chunk,
                 },
                 quads: vec![
-                    CompactQuad::new([0, 0, 0], 1, 1, crate::mesh::FaceAxis::X, true)
+                    CompactQuad::new([0, 0, 0], 1, 1, crate::mesh::FaceAxis::X, true, [0; 4])
                         .expect("unit face is representable"),
                 ],
                 priority: MeshUpdatePriority::Background,
@@ -2115,7 +2257,7 @@ mod tests {
                     chunk,
                 },
                 quads: vec![
-                    CompactQuad::new([0, 0, 0], 1, 1, crate::mesh::FaceAxis::X, true)
+                    CompactQuad::new([0, 0, 0], 1, 1, crate::mesh::FaceAxis::X, true, [0; 4])
                         .expect("unit face is representable"),
                 ],
                 priority: MeshUpdatePriority::Background,
