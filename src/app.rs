@@ -1002,14 +1002,14 @@ impl VoxelInkApp {
                 egui::Frame::new()
                     .fill(surface)
                     .stroke(egui::Stroke::NONE)
-                    .inner_margin(egui::Margin::ZERO),
+                    .inner_margin(egui::Margin::same(12)),
             )
             .show(root, |ui| {
                 ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
                 egui::ScrollArea::vertical()
                     .id_salt("voxel-ink-repair-scroll")
                     .auto_shrink([false, false])
-                    .content_margin(egui::Margin::same(12))
+                    .content_margin(egui::Margin::ZERO)
                     .show(ui, |ui| {
                         let has_document = self.summary.is_some();
                         let ready = has_document
@@ -1111,12 +1111,11 @@ impl VoxelInkApp {
                                 self.cancel_edit_interaction();
                             }
 
-                            if self.tool != Tool::Inspect {
-                                let brush_accent = tool_accent(self.tool);
-                                ui.add_space(12.0);
-                                ui.separator();
-                                ui.add_space(8.0);
-                                ui.add_enabled_ui(ready, |ui| {
+                            let brush_accent = tool_accent(self.tool);
+                            ui.add_space(12.0);
+                            ui.separator();
+                            ui.add_space(8.0);
+                            ui.add_enabled_ui(ready && self.tool != Tool::Inspect, |ui| {
                                     if !self.forced_colors {
                                         let visuals = ui.visuals_mut();
                                         visuals.selection.bg_fill = brush_accent;
@@ -1272,8 +1271,7 @@ impl VoxelInkApp {
                                             .labelled_by(label.id);
                                         }
                                     }
-                                });
-                            }
+                            });
                         });
                         seal_card.response.widget_info(|| {
                             egui::WidgetInfo::labeled(
@@ -1845,7 +1843,7 @@ impl VoxelInkApp {
         });
         if response.has_focus() {
             self.pane_keyboard_focus = true;
-            ui.painter().rect_stroke(
+            content_painter.rect_stroke(
                 image_rect,
                 CONTROL_RADIUS,
                 egui::Stroke::new(

@@ -84,9 +84,10 @@ fn toolbar_exposes_names_disabled_state_focus_order_and_tool_state() {
     assert_eq!(tool_toggled(&harness, "Inspect (I)"), Some(Toggled::True));
     assert!(
         harness
-            .query_by_role_and_label(Role::Slider, "Brush diameter in voxels")
-            .is_none(),
-        "Inspect should hide repair-only brush controls"
+            .get_by_role_and_label(Role::Slider, "Brush diameter in voxels")
+            .accesskit_node()
+            .is_disabled(),
+        "Inspect should keep the stable brush layout visible but disabled"
     );
 }
 
@@ -132,9 +133,11 @@ fn loaded_repair_cards_keep_their_gutter_when_the_scrollbar_appears() {
     let inspect_card = harness.get_by_label("Seal openings workflow").rect();
     let inspect_left_margin = inspect_card.left() - panel.left();
     let inspect_right_margin = panel.right() - inspect_card.right();
+    let scroll_bar_width = egui::style::ScrollStyle::solid().allocated_width();
     assert!(
-        (inspect_left_margin - inspect_right_margin).abs() < 1.0,
-        "the non-scrolling card should have symmetric margins: {inspect_left_margin} vs {inspect_right_margin}"
+        inspect_left_margin >= 11.0
+            && inspect_right_margin >= inspect_left_margin + scroll_bar_width - 1.0,
+        "Inspect lost its content gutter or scrollbar rail: {inspect_left_margin} vs {inspect_right_margin}"
     );
 
     harness.key_press(egui::Key::B);
@@ -142,7 +145,11 @@ fn loaded_repair_cards_keep_their_gutter_when_the_scrollbar_appears() {
         harness.step();
     }
 
-    let scroll_bar_width = egui::style::ScrollStyle::solid().allocated_width();
+    let paint_card = harness.get_by_label("Seal openings workflow").rect();
+    assert!(
+        (paint_card.height() - inspect_card.height()).abs() < 1.0,
+        "switching tools changed the repair card height: {inspect_card:?} -> {paint_card:?}"
+    );
     for label in ["Seal openings workflow", "Fill interior workflow"] {
         let card = harness.get_by_label(label).rect();
         let left_margin = card.left() - panel.left();
@@ -156,6 +163,96 @@ fn loaded_repair_cards_keep_their_gutter_when_the_scrollbar_appears() {
             "{label:?} does not reserve its scrollbar outside the content gutter: {left_margin} vs {right_margin}"
         );
     }
+}
+
+#[test]
+fn expanded_workspace_keeps_repair_cards_inside_the_parent_gutter() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("expanded-repair-panel.binvox");
+    write_binvox(&path, [5, 5, 5], &[0; 125]);
+    let mut harness = app_harness_with_size(Some(path), [900.0, 700.0]);
+    wait_for_label(&mut harness, "5 × 5 × 5");
+    harness.key_press(egui::Key::B);
+    harness.step();
+    harness.get_by_label("Full screen 3D").click_accesskit();
+    for _ in 0..4 {
+        harness.step();
+    }
+
+    let panel = harness
+        .get_by_role_and_label(Role::Pane, "Repair volume controls")
+        .rect();
+    for label in ["Seal openings workflow", "Fill interior workflow"] {
+        let card = harness.get_by_label(label).rect();
+        assert!(
+            card.left() - panel.left() >= 11.0 && panel.right() - card.right() >= 11.0,
+            "{label:?} escaped the repair panel gutter in the expanded workspace: panel {panel:?}, card {card:?}"
+        );
+    }
+}
+
+#[test]
+fn zoomed_focused_slice_outline_is_clipped_to_its_editor() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("focused-slice-outline.binvox");
+    write_binvox(&path, [4, 3, 2], &[0; 24]);
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "4 × 3 × 2");
+
+    let editor = harness
+        .get_by_role_and_label(Role::Image, "Axial slice editor")
+        .rect();
+    harness
+        .get_by_role_and_label(Role::Image, "Axial slice editor")
+        .click();
+    harness.step();
+    harness.hover_at(editor.center());
+    harness.input_mut().modifiers = egui::Modifiers::CTRL;
+    harness.input_mut().events.push(egui::Event::Zoom(2.5));
+    harness.step();
+    harness.input_mut().modifiers = egui::Modifiers::NONE;
+    harness.step();
+
+    fn collect_focus_outlines(
+        shape: &egui::epaint::Shape,
+        clip_rect: egui::Rect,
+        outlines: &mut Vec<(egui::Rect, egui::Rect)>,
+    ) {
+        match shape {
+            egui::epaint::Shape::Rect(rect)
+                if rect.stroke.width == 2.0
+                    && rect.stroke.color == egui::Color32::from_rgb(255, 193, 49) =>
+            {
+                outlines.push((rect.rect, clip_rect));
+            }
+            egui::epaint::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_focus_outlines(shape, clip_rect, outlines);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut outlines = Vec::new();
+    for clipped in &harness.output().shapes {
+        collect_focus_outlines(&clipped.shape, clipped.clip_rect, &mut outlines);
+    }
+    let (outline, clip_rect) = outlines
+        .into_iter()
+        .find(|(outline, _)| outline.width() > editor.width() || outline.height() > editor.height())
+        .expect("the focused zoomed slice should paint an oversized focus outline");
+    let editor = harness
+        .get_by_role_and_label(Role::Image, "Axial slice editor")
+        .rect();
+    assert!(
+        !clip_rect.contains_rect(outline),
+        "the regression needs an outline that actually crosses its clip: {outline:?} inside {clip_rect:?}"
+    );
+    assert!(
+        (clip_rect.min - editor.min).length() < 1.0 && (clip_rect.max - editor.max).length() < 1.0,
+        "the focused slice outline clip {clip_rect:?} does not match its editor {editor:?}"
+    );
 }
 
 #[test]
