@@ -36,6 +36,7 @@ const CARD_RADIUS: u8 = 6;
 const CONTROL_RADIUS: u8 = 4;
 const MAX_ENGINE_EVENTS_PER_FRAME: usize = 256;
 const SLICE_POINT_SCROLL_THRESHOLD: f32 = 24.0;
+const MAX_FLY_WHEEL_DELTA_PER_FRAME: f32 = 240.0;
 const REPAIR_PANEL_DEFAULT_WIDTH: f32 = 320.0;
 const REPAIR_PANEL_MIN_WIDTH: f32 = 280.0;
 const REPAIR_PANEL_MAX_WINDOW_FRACTION: f32 = 0.45;
@@ -1215,11 +1216,12 @@ impl VoxelInkApp {
                                 self.cancel_edit_interaction();
                             }
 
-                            let brush_accent = tool_accent(self.tool);
-                            ui.add_space(12.0);
-                            ui.separator();
-                            ui.add_space(8.0);
-                            ui.add_enabled_ui(ready && self.tool != Tool::Inspect, |ui| {
+                            if self.tool != Tool::Inspect {
+                                let brush_accent = tool_accent(self.tool);
+                                ui.add_space(12.0);
+                                ui.separator();
+                                ui.add_space(8.0);
+                                ui.add_enabled_ui(ready, |ui| {
                                     if !self.forced_colors {
                                         let visuals = ui.visuals_mut();
                                         visuals.selection.bg_fill = brush_accent;
@@ -1422,7 +1424,8 @@ impl VoxelInkApp {
                                             );
                                         }
                                     }
-                            });
+                                });
+                            }
                         });
                         seal_card.response.widget_info(|| {
                             egui::WidgetInfo::labeled(
@@ -2575,7 +2578,7 @@ impl VoxelInkApp {
             VolumeViewMode::Fly if self.fly_captured => {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::None);
                 ui.ctx().request_repaint();
-                if !captured_this_frame {
+                if !self.fly_primary_suppressed {
                     let (motion, movement, delta_seconds, speed_wheel) = ui.input(|input| {
                         let motion = input
                             .pointer
@@ -2978,6 +2981,12 @@ impl VoxelInkApp {
             return;
         }
         self.brush_preview_generation = self.brush_preview_generation.saturating_add(1);
+        if self.brush_preview_kind.is_some()
+            || self.brush_preview_target.is_some()
+            || !self.brush_preview_voxels.is_empty()
+        {
+            self.discard_current_brush_preview();
+        }
         let request = preview_with_generation(request, self.brush_preview_generation);
         match self.engine.send_latest_preview(request) {
             Ok(()) => self.last_preview_request = Some(template),
@@ -3027,6 +3036,9 @@ impl VoxelInkApp {
         target: Option<[u32; 3]>,
         voxels: Vec<[u32; 3]>,
     ) {
+        if generation != self.brush_preview_generation {
+            return;
+        }
         let Some(pending) = self
             .pending_preview
             .take()
@@ -3909,13 +3921,23 @@ fn fly_speed_wheel_delta(events: &[egui::Event]) -> f32 {
             } else {
                 delta.x
             };
-            Some(match unit {
-                egui::MouseWheelUnit::Point => dominant,
-                egui::MouseWheelUnit::Line => dominant * 40.0,
-                egui::MouseWheelUnit::Page => dominant * 240.0,
-            })
+            Some(
+                match unit {
+                    egui::MouseWheelUnit::Point => dominant,
+                    egui::MouseWheelUnit::Line => dominant * 40.0,
+                    egui::MouseWheelUnit::Page => dominant * 240.0,
+                }
+                .clamp(
+                    -MAX_FLY_WHEEL_DELTA_PER_FRAME,
+                    MAX_FLY_WHEEL_DELTA_PER_FRAME,
+                ),
+            )
         })
-        .sum()
+        .sum::<f32>()
+        .clamp(
+            -MAX_FLY_WHEEL_DELTA_PER_FRAME,
+            MAX_FLY_WHEEL_DELTA_PER_FRAME,
+        )
 }
 
 fn preview_with_generation(request: BrushPreviewRequest, generation: u64) -> BrushPreviewRequest {
@@ -4253,6 +4275,63 @@ fn suggested_save_name(summary: &DocumentSummary, purpose: DialogPurpose) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::brush::Ray;
+
+    #[test]
+    fn replacing_hover_preview_clears_stale_voxels_until_latest_result_arrives() {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size([1_200.0, 800.0])
+            .build_eframe(|creation_context| VoxelInkApp::new(creation_context, None));
+        let old_request = BrushPreviewRequest::Brush {
+            generation: 0,
+            tool: Tool::Erase,
+            spec: BrushSpec::default(),
+            space: StrokeSpace::Volume3D,
+            sample: PointerSample::Ray {
+                ray: Ray {
+                    origin: [0.0, 0.0, 0.0],
+                    direction: [1.0, 0.0, 0.0],
+                },
+            },
+        };
+        let replacement = BrushPreviewRequest::Brush {
+            generation: 0,
+            tool: Tool::Erase,
+            spec: BrushSpec::default(),
+            space: StrokeSpace::Volume3D,
+            sample: PointerSample::Ray {
+                ray: Ray {
+                    origin: [1.0, 0.0, 0.0],
+                    direction: [1.0, 0.0, 0.0],
+                },
+            },
+        };
+        let app = harness.state_mut();
+        app.brush_preview_generation = 7;
+        app.last_preview_request = Some(old_request);
+        app.brush_preview_kind = Some(VoxelHighlightKind::Erase);
+        app.brush_preview_target = Some([2, 3, 4]);
+        app.brush_preview_voxels = vec![[2, 3, 4], [2, 3, 5]];
+
+        app.request_brush_preview(replacement);
+
+        assert_eq!(app.brush_preview_generation, 8);
+        assert_eq!(app.last_preview_request, Some(replacement));
+        assert_eq!(app.brush_preview_kind, None);
+        assert_eq!(app.brush_preview_target, None);
+        assert!(app.brush_preview_voxels.is_empty());
+
+        app.accept_brush_preview(0, 0, 7, Tool::Erase, Some([8, 8, 8]), vec![[8, 8, 8]]);
+        assert!(
+            app.brush_preview_voxels.is_empty(),
+            "the superseded result must not restore its stale highlight"
+        );
+
+        app.accept_brush_preview(0, 0, 8, Tool::Erase, Some([5, 3, 4]), vec![[5, 3, 4]]);
+        assert_eq!(app.brush_preview_kind, Some(VoxelHighlightKind::Erase));
+        assert_eq!(app.brush_preview_target, Some([5, 3, 4]));
+        assert_eq!(app.brush_preview_voxels, vec![[5, 3, 4]]);
+    }
 
     #[test]
     fn stationary_pointer_remains_available_for_hover_picking() {
@@ -4378,6 +4457,31 @@ mod tests {
 
         assert_eq!(fly_speed_wheel_delta(&[line, point]), 68.0);
         assert_eq!(fly_speed_wheel_delta(&[]), 0.0);
+    }
+
+    #[test]
+    fn fly_speed_caps_platform_wheel_spikes_per_frame() {
+        let spike = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, f32::MAX),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let page = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Page,
+            delta: egui::vec2(0.0, 1.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        assert_eq!(
+            fly_speed_wheel_delta(&[spike]),
+            MAX_FLY_WHEEL_DELTA_PER_FRAME
+        );
+        assert_eq!(
+            fly_speed_wheel_delta(&[page.clone(), page]),
+            MAX_FLY_WHEEL_DELTA_PER_FRAME
+        );
     }
 
     #[test]

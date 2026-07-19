@@ -76,18 +76,29 @@ fn toolbar_exposes_names_disabled_state_focus_order_and_tool_state() {
     harness.key_press(egui::Key::E);
     harness.step();
     assert_eq!(tool_toggled(&harness, "Erase (E)"), Some(Toggled::True));
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Slider, "Brush diameter in voxels")
+            .is_some(),
+        "Erase should expose brush settings"
+    );
     harness.key_press(egui::Key::L);
     harness.step();
     assert_eq!(tool_toggled(&harness, "Bridge (L)"), Some(Toggled::True));
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Slider, "Brush diameter in voxels")
+            .is_some(),
+        "Bridge should expose brush settings"
+    );
     harness.key_press(egui::Key::I);
     harness.step();
     assert_eq!(tool_toggled(&harness, "Inspect (I)"), Some(Toggled::True));
     assert!(
         harness
-            .get_by_role_and_label(Role::Slider, "Brush diameter in voxels")
-            .accesskit_node()
-            .is_disabled(),
-        "Inspect should keep the stable brush layout visible but disabled"
+            .query_by_role_and_label(Role::Slider, "Brush diameter in voxels")
+            .is_none(),
+        "Inspect should hide brush-only settings"
     );
 }
 
@@ -149,8 +160,8 @@ fn loaded_repair_cards_keep_their_gutter_when_the_scrollbar_appears() {
 
     let paint_card = harness.get_by_label("Seal openings workflow").rect();
     assert!(
-        (paint_card.height() - inspect_card.height()).abs() < 1.0,
-        "switching tools changed the repair card height: {inspect_card:?} -> {paint_card:?}"
+        paint_card.height() > inspect_card.height() + 100.0,
+        "Paint should reveal its brush settings below the compact Inspect card: {inspect_card:?} -> {paint_card:?}"
     );
     for label in [
         "Seal openings workflow",
@@ -555,6 +566,85 @@ fn fly_selector_is_accessible_without_resizing_and_expand_stays_independent() {
     assert_eq!(
         harness.get_by_label("Fly view").accesskit_node().toggled(),
         Some(Toggled::True)
+    );
+}
+
+#[test]
+fn fly_speed_slider_keeps_its_minimum_when_the_viewport_captures() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("fly-speed-capture.binvox");
+    write_binvox(&path, [9, 9, 9], &[1; 729]);
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "729 occupied");
+
+    harness.get_by_label("Fly view").click_accesskit();
+    harness.step();
+    harness.step();
+
+    let selected_speed = drag_slider_to_minimum(&mut harness, "Flight speed");
+
+    let viewport_center = harness
+        .get_by_label("Interactive 3D volume editor")
+        .rect()
+        .center();
+    queue_primary_button(&mut harness, viewport_center, true);
+    harness.step();
+    queue_primary_button(&mut harness, viewport_center, false);
+    harness.input_mut().events.push(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, f32::MAX),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.step();
+    harness.step();
+
+    let captured_speed = harness
+        .get_by_role_and_label(Role::Slider, "Flight speed")
+        .accesskit_node()
+        .numeric_value()
+        .unwrap();
+    assert_eq!(
+        captured_speed, selected_speed,
+        "a pointer-lock wheel spike during the capture release changed the selected speed"
+    );
+
+    harness.input_mut().events.push(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, 120.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.step();
+    harness.step();
+    let adjusted_speed = harness
+        .get_by_role_and_label(Role::Slider, "Flight speed")
+        .accesskit_node()
+        .numeric_value()
+        .unwrap();
+    assert!(
+        adjusted_speed > selected_speed,
+        "the wheel should adjust speed after the capture click is fully released"
+    );
+}
+
+#[test]
+fn brush_diameter_sliders_keep_their_minimum_when_fly_captures() {
+    let directory = tempdir().unwrap();
+    let binvox_path = directory.path().join("brush-capture.binvox");
+    write_binvox(&binvox_path, [5, 5, 5], &[1; 125]);
+    assert_brush_minimum_survives_fly_capture(
+        binvox_path,
+        "125 occupied",
+        "Brush diameter in voxels",
+    );
+
+    let nifti_path = directory.path().join("brush-capture.nii");
+    write_nifti_u8(&nifti_path, [5, 5, 5], &[1; 125]);
+    assert_brush_minimum_survives_fly_capture(
+        nifti_path,
+        "125 occupied",
+        "Brush diameter in millimetres",
     );
 }
 
@@ -1459,6 +1549,79 @@ fn queue_primary_button(
         pressed,
         modifiers: egui::Modifiers::NONE,
     });
+}
+
+fn drag_slider_to_minimum(harness: &mut Harness<'_, VoxelInkApp>, accessible_label: &str) -> f64 {
+    harness
+        .get_by_role_and_label(Role::Slider, accessible_label)
+        .scroll_to_me();
+    for _ in 0..4 {
+        harness.step();
+    }
+    let slider = harness
+        .get_by_role_and_label(Role::Slider, accessible_label)
+        .rect();
+    let minimum_position = egui::pos2(slider.left() + 1.0, slider.center().y);
+    harness.hover_at(slider.center());
+    harness.step();
+    harness.drag_at(slider.center());
+    harness.step();
+    harness.hover_at(minimum_position);
+    harness.step();
+    harness.drop_at(minimum_position);
+    harness.step();
+
+    let node = harness
+        .get_by_role_and_label(Role::Slider, accessible_label)
+        .accesskit_node();
+    let minimum = node.min_numeric_value().unwrap();
+    let selected = node.numeric_value().unwrap();
+    assert!(
+        (selected - minimum).abs() <= f64::EPSILON,
+        "the regression must first select the minimum {accessible_label}: {selected} != {minimum}"
+    );
+    selected
+}
+
+fn assert_brush_minimum_survives_fly_capture(
+    path: PathBuf,
+    occupied_label: &str,
+    slider_label: &str,
+) {
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, occupied_label);
+    harness.key_press(egui::Key::B);
+    harness.step();
+    harness.get_by_label("Fly view").click_accesskit();
+    harness.step();
+    harness.step();
+
+    let selected_diameter = drag_slider_to_minimum(&mut harness, slider_label);
+    let viewport_center = harness
+        .get_by_label("Interactive 3D volume editor")
+        .rect()
+        .center();
+    queue_primary_button(&mut harness, viewport_center, true);
+    harness.step();
+    queue_primary_button(&mut harness, viewport_center, false);
+    harness.input_mut().events.push(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, f32::MAX),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.step();
+    harness.step();
+
+    let captured_diameter = harness
+        .get_by_role_and_label(Role::Slider, slider_label)
+        .accesskit_node()
+        .numeric_value()
+        .unwrap();
+    assert_eq!(
+        captured_diameter, selected_diameter,
+        "capturing Fly changed {slider_label}"
+    );
 }
 
 fn assert_rect_near(actual: egui::Rect, expected: egui::Rect) {
