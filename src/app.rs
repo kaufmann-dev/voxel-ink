@@ -27,6 +27,8 @@ const RAISED: Color32 = Color32::from_gray(24);
 const LINE: Color32 = Color32::from_gray(64);
 const TEXT: Color32 = Color32::from_gray(245);
 const MUTED: Color32 = Color32::from_gray(166);
+const SCROLL_HANDLE_IDLE: Color32 = Color32::from_gray(104);
+const SCROLL_HANDLE_HOVERED: Color32 = Color32::from_gray(166);
 const TEAL: Color32 = Color32::from_rgb(36, 200, 219);
 const YELLOW: Color32 = Color32::from_rgb(255, 193, 49);
 const PAINT_GREEN: Color32 = Color32::from_rgb(0x42, 0xd6, 0x7c);
@@ -1110,12 +1112,17 @@ impl VoxelInkApp {
                     .inner_margin(egui::Margin::same(12)),
             )
             .show(root, |ui| {
-                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                let content_style = ui.style().clone();
+                let scroll_bar_style = repair_scroll_bar_style(ui.style(), self.forced_colors);
+                ui.set_style(scroll_bar_style);
                 egui::ScrollArea::vertical()
                     .id_salt("voxel-ink-repair-scroll")
                     .auto_shrink([false, false])
                     .content_margin(egui::Margin::ZERO)
                     .show(ui, |ui| {
+                        // The parent keeps the scrollbar-specific widget colors; controls
+                        // inside the scrolling content retain the application theme.
+                        ui.set_style(content_style);
                         let has_document = self.summary.is_some();
                         let ready = has_document
                             && self.busy.is_empty()
@@ -3826,6 +3833,22 @@ fn configure_style(ctx: &egui::Context, forced_colors: bool, reduced_motion: boo
     });
 }
 
+fn repair_scroll_bar_style(base: &egui::Style, forced_colors: bool) -> egui::Style {
+    let mut style = base.clone();
+    style.spacing.scroll = egui::style::ScrollStyle::solid();
+    style.visuals.widgets.inactive.bg_fill = if forced_colors {
+        Color32::WHITE
+    } else {
+        SCROLL_HANDLE_IDLE
+    };
+    style.visuals.widgets.hovered.bg_fill = if forced_colors {
+        Color32::WHITE
+    } else {
+        SCROLL_HANDLE_HOVERED
+    };
+    style
+}
+
 fn cavities_filled_notice(summary: Option<&DocumentSummary>, added_voxels: u64) -> String {
     let count = format_count(added_voxels);
     let voxel_label = if added_voxels == 1 { "voxel" } else { "voxels" };
@@ -4276,6 +4299,33 @@ fn suggested_save_name(summary: &DocumentSummary, purpose: DialogPurpose) -> Str
 mod tests {
     use super::*;
     use crate::brush::Ray;
+
+    #[test]
+    fn repair_scroll_bar_has_distinct_idle_hover_and_active_states() {
+        let mut base = egui::Style::default();
+        base.visuals.extreme_bg_color = RAISED;
+        base.visuals.widgets.inactive.bg_fill = RAISED;
+        base.visuals.widgets.hovered.bg_fill = Color32::from_gray(36);
+        base.visuals.widgets.active.bg_fill = TEAL;
+
+        let styled = repair_scroll_bar_style(&base, false);
+
+        assert!(!styled.spacing.scroll.floating);
+        assert_eq!(styled.visuals.extreme_bg_color, RAISED);
+        assert_eq!(styled.visuals.widgets.inactive.bg_fill, SCROLL_HANDLE_IDLE);
+        assert_eq!(
+            styled.visuals.widgets.hovered.bg_fill,
+            SCROLL_HANDLE_HOVERED
+        );
+        assert_eq!(styled.visuals.widgets.active.bg_fill, TEAL);
+        assert_ne!(styled.visuals.widgets.inactive.bg_fill, RAISED);
+        assert_ne!(styled.visuals.widgets.hovered.bg_fill, SCROLL_HANDLE_IDLE);
+        assert_eq!(base.visuals.widgets.inactive.bg_fill, RAISED);
+
+        let forced = repair_scroll_bar_style(&base, true);
+        assert_eq!(forced.visuals.widgets.inactive.bg_fill, Color32::WHITE);
+        assert_eq!(forced.visuals.widgets.hovered.bg_fill, Color32::WHITE);
+    }
 
     #[test]
     fn replacing_hover_preview_clears_stale_voxels_until_latest_result_arrives() {
