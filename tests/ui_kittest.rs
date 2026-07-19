@@ -525,10 +525,15 @@ fn fly_selector_is_accessible_without_resizing_and_expand_stays_independent() {
     let fly_speed = harness.get_by_role_and_label(Role::Slider, "Flight speed");
     assert!(!fly_speed.accesskit_node().is_disabled());
     let speed = fly_speed.accesskit_node().numeric_value().unwrap();
+    let minimum = fly_speed.accesskit_node().min_numeric_value().unwrap();
     let maximum = fly_speed.accesskit_node().max_numeric_value().unwrap();
     assert!(
-        speed <= maximum * 0.051,
-        "the initial Fly speed should be much slower than the available maximum: {speed} / {maximum}"
+        speed >= maximum * 0.074 && speed <= maximum * 0.076,
+        "the initial Fly speed should be 7.5% of the available maximum: {speed} / {maximum}"
+    );
+    assert!(
+        minimum >= maximum * 0.000_99 && minimum <= maximum * 0.001_01,
+        "the minimum Fly speed should be 0.1% of the available maximum: {minimum} / {maximum}"
     );
 
     harness

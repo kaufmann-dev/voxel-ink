@@ -354,6 +354,52 @@ fn surface_picking_uses_the_complete_affine_and_returns_the_first_surface() {
 }
 
 #[test]
+fn surface_picking_from_occupied_origin_uses_the_forward_exit_surface() {
+    let dimensions = [7, 3, 3];
+    let geometry = VolumeGeometry::new(
+        dimensions,
+        [
+            [0.0, -2.0, 0.25, 10.0],
+            [3.0, 0.0, 0.5, -5.0],
+            [0.0, 0.0, 4.0, 2.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        SpatialUnits::Millimeter,
+    )
+    .unwrap();
+    let mut occupancy = vec![0; 63];
+    for x in 1..=4 {
+        occupancy[linear_index(dimensions, [x, 1, 1]).unwrap() as usize] = 1;
+    }
+
+    let forward = world_ray_from_index(&geometry, [2.0, 1.0, 1.0], [1.0, 0.0, 0.0]);
+    let forward_hit = ray_surface_hit(&occupancy, &geometry, forward).unwrap();
+    assert_eq!(forward_hit.voxel, [4, 1, 1]);
+    assert_eq!(forward_hit.exterior, Some([5, 1, 1]));
+    assert_eq!(forward_hit.face_normal, [1, 0, 0]);
+    assert_eq!(
+        surface_edit_target(dimensions, &occupancy, &geometry, forward, Tool::Paint),
+        Some([5, 1, 1])
+    );
+    assert_eq!(
+        surface_edit_target(dimensions, &occupancy, &geometry, forward, Tool::Erase),
+        Some([4, 1, 1])
+    );
+
+    let reverse = world_ray_from_index(&geometry, [2.0, 1.0, 1.0], [-1.0, 0.0, 0.0]);
+    let reverse_hit = ray_surface_hit(&occupancy, &geometry, reverse).unwrap();
+    assert_eq!(reverse_hit.voxel, [1, 1, 1]);
+    assert_eq!(reverse_hit.exterior, Some([0, 1, 1]));
+    assert_eq!(reverse_hit.face_normal, [-1, 0, 0]);
+
+    occupancy.fill(1);
+    let boundary_hit = ray_surface_hit(&occupancy, &geometry, forward).unwrap();
+    assert_eq!(boundary_hit.voxel, [6, 1, 1]);
+    assert_eq!(boundary_hit.exterior, None);
+    assert_eq!(boundary_hit.face_normal, [1, 0, 0]);
+}
+
+#[test]
 fn surface_picking_never_falls_back_to_an_active_slice_or_empty_space() {
     let dimensions = [5; 3];
     let geometry = identity_geometry(dimensions);

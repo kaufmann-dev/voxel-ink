@@ -7,7 +7,7 @@
 
 ## Symptom
 
-Dragging flight speed to its minimum could jump it to the maximum when the viewport captured the cursor. Inspect showed disabled Shape, Depth, and Size controls that belong only to Paint, Erase, and Bridge. In Fly mode, a selected-tool voxel highlight could appear displaced or much larger than the center-reticle target. Brush diameter was also audited for the capture-time jump.
+Dragging flight speed to its minimum could jump it to the maximum when the viewport captured the cursor. Inspect showed disabled Shape, Depth, and Size controls that belong only to Paint, Erase, and Bridge. While the Fly camera moved, a previously accepted selected-tool highlight could remain briefly at its old world-space target. Brush diameter was also audited for the capture-time jump.
 
 ## Confirmed root cause
 
@@ -15,7 +15,7 @@ Fly began accepting raw wheel events on the pointer-button release frame even th
 
 The Inspect regression used `add_enabled_ui`, which renders children in a disabled state, where the intended behavior was to omit brush-only controls entirely.
 
-Hover previews are computed asynchronously. When the Fly camera moved, the previously accepted world-space brush footprint stayed visible until its replacement arrived, so the old highlight was rendered from the new camera and appeared offset or oversized. Affine center-ray and nearest-surface picking remained correct.
+Hover previews are computed asynchronously. When the Fly camera moved, the previously accepted world-space brush footprint stayed visible until its replacement arrived, so the old highlight was rendered from the new camera for a transient frame. This was separate from the persistent inside-occupancy picking defect documented in `fly-highlight-encloses-camera-inside-volume.md`.
 
 ## Changes
 

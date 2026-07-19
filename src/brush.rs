@@ -379,12 +379,14 @@ fn millimeters_per_spatial_unit(units: SpatialUnits) -> Result<f64> {
     }
 }
 
-/// Finds the first occupied voxel crossed by `world_ray`.
+/// Finds the nearest occupied surface crossed by `world_ray`.
 ///
-/// The hit is always on existing volume data. A miss stays a miss: this helper
-/// never projects the ray onto an arbitrary slice or creates a seed in empty
-/// space. `exterior` is the face-adjacent empty voxel immediately before the
-/// hit when that voxel lies inside the volume.
+/// A ray starting in empty space hits the next occupied voxel. A ray starting
+/// inside occupied data hits that run's forward exit surface, which keeps
+/// no-clip Fly picking on the visible boundary instead of the camera voxel.
+/// A miss stays a miss: this helper never projects onto an arbitrary slice or
+/// creates a seed in empty space. `exterior` is the face-adjacent empty voxel
+/// beside the hit when that voxel lies inside the volume.
 #[must_use]
 pub fn ray_surface_hit(
     occupancy: &[u8],
@@ -458,6 +460,9 @@ fn ray_surface_hit_with_occupancy(
             t_delta[axis] = 1.0 / direction[axis].abs();
         }
     }
+    let initial = checked_voxel(voxel, dimensions)?;
+    let initial_index = linear_index(dimensions, initial)?;
+    let seeking_exit = entry < 0.0 && occupied(initial_index)?;
     let mut previous = None;
     let mut face_normal = [0_i8; 3];
     if entry >= 0.0
@@ -468,7 +473,8 @@ fn ray_surface_hit_with_occupancy(
     loop {
         let current = checked_voxel(voxel, dimensions)?;
         let index = linear_index(dimensions, current)?;
-        if occupied(index)? {
+        let current_occupied = occupied(index)?;
+        if current_occupied && !seeking_exit {
             return Some(SurfaceHit {
                 voxel: current,
                 exterior: previous,
@@ -486,6 +492,46 @@ fn ray_surface_hit_with_occupancy(
                 voxel[axis] += step[axis];
                 t_max[axis] += t_delta[axis];
             }
+        }
+        if seeking_exit && current_occupied {
+            let next = checked_voxel(voxel, dimensions);
+            let next_is_occupied = if let Some(next) = next {
+                occupied(linear_index(dimensions, next)?)?
+            } else {
+                false
+            };
+            if !next_is_occupied {
+                let mut exterior = None;
+                let mut outward_axis = tied
+                    .iter()
+                    .enumerate()
+                    .find_map(|(axis, &is_tied)| is_tied.then_some(axis))?;
+                for axis in 0..3 {
+                    if !tied[axis] {
+                        continue;
+                    }
+                    let mut candidate = current.map(i64::from);
+                    candidate[axis] += step[axis];
+                    let Some(candidate) = checked_voxel(candidate, dimensions) else {
+                        outward_axis = axis;
+                        continue;
+                    };
+                    let candidate_index = linear_index(dimensions, candidate)?;
+                    if !occupied(candidate_index)? {
+                        exterior = Some(candidate);
+                        outward_axis = axis;
+                        break;
+                    }
+                }
+                let mut face_normal = [0; 3];
+                face_normal[outward_axis] = i8::try_from(step[outward_axis]).ok()?;
+                return Some(SurfaceHit {
+                    voxel: current,
+                    exterior,
+                    face_normal,
+                });
+            }
+            continue;
         }
         face_normal = [0; 3];
         previous = None;
