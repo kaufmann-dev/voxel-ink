@@ -184,6 +184,29 @@ fn enclosed_cavity_is_one_undoable_edit_and_is_idempotent() {
 }
 
 #[test]
+fn cavity_fill_fast_paths_leave_empty_full_and_thin_volumes_unchanged() {
+    for (dimensions, occupancy) in [
+        ([64, 64, 64], vec![0; 64 * 64 * 64]),
+        ([64, 64, 64], vec![1; 64 * 64 * 64]),
+        (
+            [5, 5, 2],
+            (0..50).map(|index| u8::from(index % 3 == 0)).collect(),
+        ),
+    ] {
+        let mut document = make_document(dimensions, occupancy.clone(), false);
+        assert_eq!(
+            document
+                .fill_enclosed_cavities(&CancellationToken::default())
+                .unwrap(),
+            0
+        );
+        assert_eq!(document.view().occupancy, occupancy);
+        assert_eq!(document.revision(), 1);
+        assert!(!document.summary().can_undo);
+    }
+}
+
+#[test]
 fn any_face_opening_keeps_the_shell_interior_empty() {
     for opening in [
         [1, 2, 2],

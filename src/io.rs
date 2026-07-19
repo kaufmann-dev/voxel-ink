@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, Metadata},
-    io::{self, BufReader, BufWriter, Read, Write},
+    io::{self, BufRead, BufReader, BufWriter, Read, Write},
     path::Path,
     time::SystemTime,
 };
@@ -48,19 +48,22 @@ pub fn load_path(path: &Path, cancel: &CancellationToken) -> Result<LoadedVolume
         .map_err(|source| AppError::io(path, source))?;
     let before = fs::metadata(&canonical).map_err(|source| AppError::io(&canonical, source))?;
     validate_regular_size(&canonical, &before)?;
-    let hash = hash_path(&canonical, cancel)?;
-    cancel.check()?;
 
     let hint = variant_from_path(&canonical, None)?;
     let file = File::open(&canonical).map_err(|source| AppError::io(&canonical, source))?;
-    let mut buffered = BufReader::new(file);
-    let mut signature = [0_u8; 2];
-    buffered
-        .read_exact(&mut signature)
+    let mut source_hasher = Sha256::new();
+    let hashing = HashingReader::new(file, &mut source_hasher);
+    let mut buffered = BufReader::with_capacity(COPY_BUFFER, hashing);
+    let prefix = buffered
+        .fill_buf()
         .map_err(|source| AppError::io(&canonical, source))?;
-    buffered =
-        BufReader::new(File::open(&canonical).map_err(|source| AppError::io(&canonical, source))?);
-    let gzip_magic = signature == [0x1f, 0x8b];
+    if prefix.len() < 2 {
+        return Err(AppError::io(
+            &canonical,
+            io::Error::new(io::ErrorKind::UnexpectedEof, "file has no format signature"),
+        ));
+    }
+    let gzip_magic = prefix[..2] == [0x1f, 0x8b];
     let expects_gzip = matches!(
         hint,
         SourceVariant::Nifti {
@@ -75,12 +78,17 @@ pub fn load_path(path: &Path, cancel: &CancellationToken) -> Result<LoadedVolume
         ));
     }
 
-    let decoded = if expects_gzip {
-        let decoder = GzDecoder::new(buffered);
-        decode_bounded(decoder, hint, cancel)?
+    let decoded;
+    if expects_gzip {
+        let mut decoder = GzDecoder::new(buffered);
+        decoded = decode_bounded(&mut decoder, hint, cancel)?;
+        buffered = decoder.into_inner();
     } else {
-        decode_bounded(buffered, hint, cancel)?
-    };
+        decoded = decode_bounded(&mut buffered, hint, cancel)?;
+    }
+    drain_reader(&mut buffered, &canonical, cancel)?;
+    drop(buffered);
+    let hash: [u8; 32] = source_hasher.finalize().into();
 
     let after = fs::metadata(&canonical).map_err(|source| AppError::io(&canonical, source))?;
     let after_hash = hash_path(&canonical, cancel)?;
@@ -138,9 +146,12 @@ pub fn save_document(
         .prefix(".voxel-ink-save-")
         .tempfile_in(&canonical_parent)
         .map_err(|source| AppError::io(&canonical_parent, source))?;
+    let mut output_hasher = Sha256::new();
+    let mut output_bytes = 0_u64;
     {
         let file = temporary.as_file_mut();
-        let mut buffered = BufWriter::with_capacity(COPY_BUFFER, file);
+        let hashing = HashingWriter::new(file, &mut output_hasher, &mut output_bytes);
+        let mut buffered = BufWriter::with_capacity(COPY_BUFFER, hashing);
         if matches!(
             destination_variant,
             SourceVariant::Nifti {
@@ -181,11 +192,17 @@ pub fn save_document(
         .as_file()
         .sync_all()
         .map_err(|source| AppError::io(&final_path, source))?;
-    let output_hash = hash_path(temporary.path(), cancel)?;
+    let output_hash = output_hasher.finalize().into();
     let output_metadata = temporary
         .as_file()
         .metadata()
         .map_err(|source| AppError::io(&final_path, source))?;
+    if output_metadata.len() != output_bytes {
+        return Err(AppError::io(
+            &final_path,
+            io::Error::other("saved byte count does not match the temporary file"),
+        ));
+    }
     if targets_source {
         verify_source_unchanged(document.source_identity(), cancel)?;
     }
@@ -231,8 +248,7 @@ pub fn verify_source_unchanged(
 }
 
 pub fn hash_path(path: &Path, cancel: &CancellationToken) -> Result<[u8; 32]> {
-    let file = File::open(path).map_err(|source| AppError::io(path, source))?;
-    let mut reader = BufReader::with_capacity(COPY_BUFFER, file);
+    let mut reader = File::open(path).map_err(|source| AppError::io(path, source))?;
     let mut buffer = Vec::new();
     buffer
         .try_reserve_exact(COPY_BUFFER)
@@ -250,6 +266,70 @@ pub fn hash_path(path: &Path, cancel: &CancellationToken) -> Result<[u8; 32]> {
         hasher.update(&buffer[..count]);
     }
     Ok(hasher.finalize().into())
+}
+
+fn drain_reader(reader: &mut impl Read, path: &Path, cancel: &CancellationToken) -> Result<()> {
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        cancel.check()?;
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|source| AppError::io(path, source))?;
+        if count == 0 {
+            return Ok(());
+        }
+    }
+}
+
+struct HashingReader<'a, R> {
+    inner: R,
+    hasher: &'a mut Sha256,
+}
+
+impl<'a, R> HashingReader<'a, R> {
+    fn new(inner: R, hasher: &'a mut Sha256) -> Self {
+        Self { inner, hasher }
+    }
+}
+
+impl<R: Read> Read for HashingReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.hasher.update(&buffer[..read]);
+        Ok(read)
+    }
+}
+
+struct HashingWriter<'a, W> {
+    inner: W,
+    hasher: &'a mut Sha256,
+    bytes_written: &'a mut u64,
+}
+
+impl<'a, W> HashingWriter<'a, W> {
+    fn new(inner: W, hasher: &'a mut Sha256, bytes_written: &'a mut u64) -> Self {
+        Self {
+            inner,
+            hasher,
+            bytes_written,
+        }
+    }
+}
+
+impl<W: Write> Write for HashingWriter<'_, W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        self.hasher.update(&buffer[..written]);
+        *self.bytes_written = self
+            .bytes_written
+            .checked_add(written as u64)
+            .ok_or_else(|| io::Error::other("saved byte count overflowed u64"))?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 pub fn variant_from_path(path: &Path, source: Option<SourceVariant>) -> Result<SourceVariant> {
@@ -403,5 +483,27 @@ mod tests {
             io::ErrorKind::FileTooLarge
         );
         assert!(reader.exceeded);
+    }
+
+    #[test]
+    fn hashing_reader_covers_a_partially_consumed_stream_exactly_once() {
+        let bytes = (0_u8..=u8::MAX).collect::<Vec<_>>();
+        let expected: [u8; 32] = Sha256::digest(&bytes).into();
+        let mut hasher = Sha256::new();
+        {
+            let hashing = HashingReader::new(Cursor::new(&bytes), &mut hasher);
+            let mut buffered = BufReader::with_capacity(17, hashing);
+            let mut decoded_prefix = [0_u8; 23];
+            buffered.read_exact(&mut decoded_prefix).unwrap();
+            assert_eq!(decoded_prefix, bytes[..23]);
+            drain_reader(
+                &mut buffered,
+                Path::new("hashing-reader-test"),
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        }
+        let actual: [u8; 32] = hasher.finalize().into();
+        assert_eq!(actual, expected);
     }
 }

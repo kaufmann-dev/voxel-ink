@@ -258,12 +258,15 @@ impl VolumeDocument {
                 occupancy.len()
             )));
         }
-        if occupancy.iter().any(|value| *value > 1) {
-            return Err(AppError::InvalidDimensions(
-                "occupancy must contain only zero or one".into(),
-            ));
+        let mut occupied_count = 0_u64;
+        for &value in &occupancy {
+            if value > 1 {
+                return Err(AppError::InvalidDimensions(
+                    "occupancy must contain only zero or one".into(),
+                ));
+            }
+            occupied_count += u64::from(value);
         }
-        let occupied_count = occupancy.iter().map(|&value| u64::from(value)).sum();
         let revision = 1;
         Ok(Self {
             cursor: geometry.dimensions.map(|axis| axis / 2),
@@ -399,7 +402,10 @@ impl VolumeDocument {
                     "stroke index {index} is outside the volume"
                 )));
             };
-            if *cell == stroke.value || stroke.seen.contains(&index) {
+            // Every index changed by this stroke already contains `stroke.value`,
+            // so the occupancy check also rejects repeated indices without a
+            // second hash-table lookup.
+            if *cell == stroke.value {
                 continue;
             }
             if stroke.indices.len() >= HISTORY_BYTES / size_of::<u32>() {
@@ -501,6 +507,16 @@ impl VolumeDocument {
         cancel.check()?;
 
         let dimensions = self.geometry.dimensions.map(|axis| axis as usize);
+        let voxel_count = self.occupancy.len() as u64;
+        // Empty and full masks are common import states, and a volume thinner
+        // than three voxels has no voxel that is interior on every axis.
+        if self.occupied_count == 0
+            || self.occupied_count == voxel_count
+            || dimensions.contains(&1)
+            || dimensions.contains(&2)
+        {
+            return Ok(0);
+        }
         let exterior = classify_exterior_empty(&self.occupancy, dimensions, cancel)?;
 
         let max_spans = HISTORY_BYTES / size_of::<IndexSpan>();

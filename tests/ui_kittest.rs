@@ -1721,6 +1721,16 @@ fn four_view_splitters_resize_the_grid_and_survive_full_screen_restore() {
         (restored_column_x - saved_column_x).abs() < 1.0,
         "column splitter moved across full-screen restore: {saved_column_x} -> {restored_column_x}; panel {saved_panel:?} -> {restored_panel:?}"
     );
+
+    harness.hover_at(egui::pos2(1.0, 1.0));
+    harness
+        .get_by_role_and_label(Role::Splitter, "Resize workspace columns")
+        .focus();
+    harness.step();
+    assert!(
+        harness.try_run().is_ok(),
+        "a focused idle splitter must not keep the entire application repainting"
+    );
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use std::io::{BufWriter, ErrorKind, Read, Write};
+use std::io::{BufReader, ErrorKind, Read, Write};
 
 use crate::{
     AppError, Result,
@@ -14,6 +14,8 @@ use crate::{
 const FORMAT: &str = "VOX";
 const VOX_VERSION: u32 = 150;
 const CHUNK_HEADER_BYTES: u64 = 12;
+const IO_BUFFER_BYTES: usize = 64 * 1024;
+const XYZI_RECORD_BYTES: usize = 4;
 
 pub static VOX_CODEC: VoxCodec = VoxCodec;
 
@@ -37,12 +39,15 @@ impl VolumeCodec for VoxCodec {
                 "the source variant is not MagicaVoxel VOX".into(),
             ));
         }
+        // Keep small chunk headers and XYZI blocks on the codec side of the
+        // dynamic reader and the global input limiter.
+        let mut buffered = BufReader::with_capacity(IO_BUFFER_BYTES, reader);
 
-        let magic = read_array::<4>(reader, "file signature")?;
+        let magic = read_array::<4>(&mut buffered, "file signature")?;
         if magic != *b"VOX " {
             return Err(AppError::invalid(FORMAT, "missing VOX signature"));
         }
-        let version = read_u32(reader, "file version")?;
+        let version = read_u32(&mut buffered, "file version")?;
         if version != VOX_VERSION {
             return Err(AppError::invalid(
                 FORMAT,
@@ -50,7 +55,7 @@ impl VolumeCodec for VoxCodec {
             ));
         }
 
-        let main = read_chunk_header(reader, "MAIN chunk")?;
+        let main = read_chunk_header(&mut buffered, "MAIN chunk")?;
         if main.id != *b"MAIN" {
             return Err(AppError::invalid(FORMAT, "the root chunk is not MAIN"));
         }
@@ -81,7 +86,7 @@ impl VolumeCodec for VoxCodec {
                     "MAIN children end in a partial chunk header",
                 ));
             }
-            let chunk = read_chunk_header(reader, "child chunk")?;
+            let chunk = read_chunk_header(&mut buffered, "child chunk")?;
             remaining -= CHUNK_HEADER_BYTES;
             let payload_bytes = u64::from(chunk.content_bytes)
                 .checked_add(u64::from(chunk.children_bytes))
@@ -116,7 +121,7 @@ impl VolumeCodec for VoxCodec {
                             "SIZE chunk must contain exactly 12 bytes and no children",
                         ));
                     }
-                    let parsed_dimensions = read_dimensions(reader)?;
+                    let parsed_dimensions = read_dimensions(&mut buffered)?;
                     let voxel_count = checked_voxel_count(parsed_dimensions)?;
                     let mut parsed_occupancy = Vec::new();
                     parsed_occupancy
@@ -146,7 +151,7 @@ impl VolumeCodec for VoxCodec {
                         ));
                     }
                     normalized_non_binary |= read_xyzi(
-                        reader,
+                        &mut buffered,
                         chunk.content_bytes,
                         parsed_dimensions,
                         parsed_occupancy,
@@ -154,7 +159,7 @@ impl VolumeCodec for VoxCodec {
                     )?;
                     xyzi_seen = true;
                 }
-                _ => skip_exact(reader, payload_bytes, cancel)?,
+                _ => skip_exact(&mut buffered, payload_bytes, cancel)?,
             }
             remaining -= payload_bytes;
         }
@@ -170,7 +175,7 @@ impl VolumeCodec for VoxCodec {
             ));
         }
         let mut trailing = [0_u8; 1];
-        match reader.read(&mut trailing) {
+        match buffered.read(&mut trailing) {
             Ok(0) => {}
             Ok(_) => {
                 return Err(AppError::invalid(
@@ -206,13 +211,7 @@ impl VolumeCodec for VoxCodec {
         let CodecSaveState::Vox(metadata) = state else {
             return Err(AppError::ConversionNotAllowed("VOX".into()));
         };
-        validate_volume(volume, metadata.dimensions)?;
-
-        let occupied_count = volume
-            .occupancy
-            .iter()
-            .try_fold(0_u32, |count, &value| count.checked_add(u32::from(value)))
-            .ok_or_else(|| AppError::invalid(FORMAT, "occupied voxel count overflow"))?;
+        let occupied_count = validate_volume(volume, metadata.dimensions)?;
         let xyzi_content_bytes = occupied_count
             .checked_mul(4)
             .and_then(|bytes| bytes.checked_add(4))
@@ -222,7 +221,12 @@ impl VolumeCodec for VoxCodec {
             .and_then(|bytes| bytes.checked_add(xyzi_content_bytes))
             .ok_or_else(|| AppError::invalid(FORMAT, "MAIN chunk is too large"))?;
 
-        let mut buffered = BufWriter::with_capacity(64 * 1024, writer);
+        let mut buffered = Vec::new();
+        buffered
+            .try_reserve_exact(IO_BUFFER_BYTES)
+            .map_err(|_| AppError::Allocation {
+                bytes: IO_BUFFER_BYTES,
+            })?;
         write_bytes(&mut buffered, b"VOX ")?;
         write_u32(&mut buffered, VOX_VERSION)?;
         write_chunk_header(&mut buffered, *b"MAIN", 0, main_children_bytes)?;
@@ -242,32 +246,34 @@ impl VolumeCodec for VoxCodec {
         let slice = nx
             .checked_mul(ny)
             .ok_or_else(|| AppError::invalid(FORMAT, "slice size overflow"))?;
-        for (index, &value) in volume.occupancy.iter().enumerate() {
-            if index % 4096 == 0 {
-                cancel.check()?;
+        let mut voxels_until_cancel_check = 0_usize;
+        let mut z = 0_u8;
+        for plane in volume.occupancy.chunks_exact(slice) {
+            let mut y = 0_u8;
+            for row in plane.chunks_exact(nx) {
+                let mut x = 0_u8;
+                for &value in row {
+                    if voxels_until_cancel_check == 0 {
+                        cancel.check()?;
+                        voxels_until_cancel_check = 4096;
+                    }
+                    voxels_until_cancel_check -= 1;
+                    if value != 0 {
+                        push_xyzi_record(writer, &mut buffered, [x, y, z, 1])?;
+                    }
+                    x = x.wrapping_add(1);
+                }
+                y = y.wrapping_add(1);
             }
-            if value == 0 {
-                continue;
-            }
-            let z = index / slice;
-            let within_slice = index % slice;
-            let y = within_slice / nx;
-            let x = within_slice % nx;
-            write_bytes(
-                &mut buffered,
-                &[
-                    u8::try_from(x)
-                        .map_err(|_| AppError::invalid(FORMAT, "x coordinate exceeds 255"))?,
-                    u8::try_from(y)
-                        .map_err(|_| AppError::invalid(FORMAT, "y coordinate exceeds 255"))?,
-                    u8::try_from(z)
-                        .map_err(|_| AppError::invalid(FORMAT, "z coordinate exceeds 255"))?,
-                    1,
-                ],
-            )?;
+            z = z.wrapping_add(1);
         }
         cancel.check()?;
-        buffered
+        if !buffered.is_empty() {
+            writer
+                .write_all(&buffered)
+                .map_err(|error| stream_error("flush encoded data", error))?;
+        }
+        writer
             .flush()
             .map_err(|error| stream_error("flush encoded data", error))
     }
@@ -280,7 +286,7 @@ struct ChunkHeader {
     children_bytes: u32,
 }
 
-fn read_chunk_header(reader: &mut dyn Read, field: &str) -> Result<ChunkHeader> {
+fn read_chunk_header(reader: &mut impl Read, field: &str) -> Result<ChunkHeader> {
     Ok(ChunkHeader {
         id: read_array(reader, field)?,
         content_bytes: read_u32(reader, field)?,
@@ -288,7 +294,7 @@ fn read_chunk_header(reader: &mut dyn Read, field: &str) -> Result<ChunkHeader> 
     })
 }
 
-fn read_dimensions(reader: &mut dyn Read) -> Result<[u32; 3]> {
+fn read_dimensions(reader: &mut impl Read) -> Result<[u32; 3]> {
     let mut dimensions = [0_u32; 3];
     for (axis, dimension) in dimensions.iter_mut().enumerate() {
         let raw = i32::from_le_bytes(read_array(reader, "SIZE dimensions")?);
@@ -305,7 +311,7 @@ fn read_dimensions(reader: &mut dyn Read) -> Result<[u32; 3]> {
 }
 
 fn read_xyzi(
-    reader: &mut dyn Read,
+    reader: &mut impl Read,
     content_bytes: u32,
     dimensions: [u32; 3],
     occupancy: &mut [u8],
@@ -324,7 +330,8 @@ fn read_xyzi(
             ),
         ));
     }
-    if usize::try_from(voxel_records).unwrap_or(usize::MAX) > occupancy.len() {
+    let voxel_records = usize::try_from(voxel_records).unwrap_or(usize::MAX);
+    if voxel_records > occupancy.len() {
         return Err(AppError::invalid(
             FORMAT,
             "XYZI contains more records than cells in the model",
@@ -338,11 +345,14 @@ fn read_xyzi(
     let ny = ny?;
     let nz = nz?;
     let mut normalized_non_binary = false;
+    let mut records_until_cancel_check = 0_usize;
 
-    for record in 0..voxel_records {
-        if record % 1024 == 0 {
+    for _ in 0..voxel_records {
+        if records_until_cancel_check == 0 {
             cancel.check()?;
+            records_until_cancel_check = 1024;
         }
+        records_until_cancel_check -= 1;
         let [x, y, z, palette_index] = read_array(reader, "XYZI voxel record")?;
         if palette_index == 0 {
             return Err(AppError::invalid(
@@ -372,7 +382,7 @@ fn read_xyzi(
     Ok(normalized_non_binary)
 }
 
-fn validate_volume(volume: VolumeView<'_>, expected_dimensions: [u32; 3]) -> Result<()> {
+fn validate_volume(volume: VolumeView<'_>, expected_dimensions: [u32; 3]) -> Result<u32> {
     if volume.dimensions != expected_dimensions || volume.geometry.dimensions != expected_dimensions
     {
         return Err(AppError::InvalidDimensions(
@@ -394,12 +404,16 @@ fn validate_volume(volume: VolumeView<'_>, expected_dimensions: [u32; 3]) -> Res
             volume.occupancy.len()
         )));
     }
-    if volume.occupancy.iter().any(|&value| value > 1) {
-        return Err(AppError::InvalidDimensions(
-            "occupancy must contain only zero or one".into(),
-        ));
-    }
-    Ok(())
+    volume.occupancy.iter().try_fold(0_u32, |count, &value| {
+        if value > 1 {
+            return Err(AppError::InvalidDimensions(
+                "occupancy must contain only zero or one".into(),
+            ));
+        }
+        count
+            .checked_add(u32::from(value))
+            .ok_or_else(|| AppError::invalid(FORMAT, "occupied voxel count overflow"))
+    })
 }
 
 fn identity_geometry(dimensions: [u32; 3]) -> Result<VolumeGeometry> {
@@ -415,10 +429,15 @@ fn identity_geometry(dimensions: [u32; 3]) -> Result<VolumeGeometry> {
     )
 }
 
-fn read_array<const N: usize>(reader: &mut dyn Read, field: &str) -> Result<[u8; N]> {
+fn read_array<const N: usize>(reader: &mut impl Read, field: &str) -> Result<[u8; N]> {
     let mut bytes = [0_u8; N];
-    match reader.read_exact(&mut bytes) {
-        Ok(()) => Ok(bytes),
+    read_exact_field(reader, &mut bytes, field)?;
+    Ok(bytes)
+}
+
+fn read_exact_field(reader: &mut impl Read, bytes: &mut [u8], field: &str) -> Result<()> {
+    match reader.read_exact(bytes) {
+        Ok(()) => Ok(()),
         Err(error) if error.kind() == ErrorKind::UnexpectedEof => Err(AppError::invalid(
             FORMAT,
             format!("file is truncated while reading {field}"),
@@ -427,11 +446,11 @@ fn read_array<const N: usize>(reader: &mut dyn Read, field: &str) -> Result<[u8;
     }
 }
 
-fn read_u32(reader: &mut dyn Read, field: &str) -> Result<u32> {
+fn read_u32(reader: &mut impl Read, field: &str) -> Result<u32> {
     Ok(u32::from_le_bytes(read_array(reader, field)?))
 }
 
-fn skip_exact(reader: &mut dyn Read, mut bytes: u64, cancel: &CancellationToken) -> Result<()> {
+fn skip_exact(reader: &mut impl Read, mut bytes: u64, cancel: &CancellationToken) -> Result<()> {
     let mut scratch = [0_u8; 8192];
     while bytes != 0 {
         cancel.check()?;
@@ -468,6 +487,19 @@ fn write_u32(writer: &mut dyn Write, value: u32) -> Result<()> {
     write_bytes(writer, &value.to_le_bytes())
 }
 
+fn push_xyzi_record(
+    writer: &mut dyn Write,
+    buffer: &mut Vec<u8>,
+    record: [u8; XYZI_RECORD_BYTES],
+) -> Result<()> {
+    if buffer.len() + XYZI_RECORD_BYTES > IO_BUFFER_BYTES {
+        write_bytes(writer, buffer)?;
+        buffer.clear();
+    }
+    buffer.extend_from_slice(&record);
+    Ok(())
+}
+
 fn write_bytes(writer: &mut dyn Write, bytes: &[u8]) -> Result<()> {
     writer
         .write_all(bytes)
@@ -492,9 +524,41 @@ fn stream_error(action: &str, error: std::io::Error) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::io::{Cursor, Read};
 
     use super::*;
+
+    struct TrackingReader {
+        inner: Cursor<Vec<u8>>,
+        read_calls: usize,
+    }
+
+    impl Read for TrackingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.read_calls += 1;
+            self.inner.read(buffer)
+        }
+    }
+
+    #[derive(Default)]
+    struct TrackingWriter {
+        bytes: Vec<u8>,
+        write_sizes: Vec<usize>,
+        flushes: usize,
+    }
+
+    impl Write for TrackingWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.write_sizes.push(buffer.len());
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
 
     fn chunk(id: [u8; 4], content: &[u8], children: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -638,6 +702,81 @@ mod tests {
         let decoded = decode(encoded).unwrap();
         assert_eq!(decoded.occupancy, occupancy);
         assert!(!decoded.normalized_non_binary);
+    }
+
+    #[test]
+    fn buffered_round_trip_crosses_xyzi_batch_and_coordinate_boundaries() {
+        const ENCODED_HEADER_BYTES: usize = 60;
+        let dimensions = [256, 65, 2];
+        let geometry = identity_geometry(dimensions).unwrap();
+        let voxel_count = checked_voxel_count(dimensions).unwrap();
+        let first_record_after_64_kib = IO_BUFFER_BYTES / XYZI_RECORD_BYTES;
+        let mut occupancy = vec![0_u8; voxel_count];
+        occupancy[..=first_record_after_64_kib].fill(1);
+        *occupancy.last_mut().unwrap() = 1;
+        let occupied_count = first_record_after_64_kib + 2;
+        let mut writer = TrackingWriter::default();
+
+        VOX_CODEC
+            .encode(
+                VolumeView {
+                    dimensions,
+                    occupancy: &occupancy,
+                    geometry: &geometry,
+                },
+                &CodecSaveState::Vox(VoxMetadata { dimensions }),
+                &mut writer,
+                EncodeOptions {
+                    destination_variant: SourceVariant::Vox,
+                },
+                &CancellationToken::default(),
+            )
+            .unwrap();
+
+        assert_eq!(writer.flushes, 1);
+        assert_eq!(writer.write_sizes.len(), 2);
+        assert!(
+            writer
+                .write_sizes
+                .iter()
+                .all(|&size| size <= IO_BUFFER_BYTES),
+            "VOX writes exceeded the codec buffer: {:?}",
+            writer.write_sizes
+        );
+        assert_eq!(writer.write_sizes[0], IO_BUFFER_BYTES);
+        assert_eq!(
+            writer.bytes.len(),
+            ENCODED_HEADER_BYTES + occupied_count * XYZI_RECORD_BYTES
+        );
+        let boundary_record = ENCODED_HEADER_BYTES + first_record_after_64_kib * XYZI_RECORD_BYTES;
+        assert_eq!(
+            &writer.bytes[boundary_record..boundary_record + XYZI_RECORD_BYTES],
+            &[0, 64, 0, 1]
+        );
+        assert_eq!(
+            &writer.bytes[writer.bytes.len() - XYZI_RECORD_BYTES..],
+            &[255, 64, 1, 1]
+        );
+
+        let mut reader = TrackingReader {
+            inner: Cursor::new(writer.bytes),
+            read_calls: 0,
+        };
+        let decoded = VOX_CODEC
+            .decode(
+                &mut reader,
+                DecodeOptions {
+                    source_variant: SourceVariant::Vox,
+                },
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        assert_eq!(decoded.occupancy, occupancy);
+        assert!(
+            reader.read_calls <= 3,
+            "buffered decode crossed the underlying reader {} times",
+            reader.read_calls
+        );
     }
 
     #[test]

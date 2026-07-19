@@ -6,6 +6,8 @@ use crate::{
     volume::{SpatialUnits, Tool, VolumeGeometry, linear_index, transform_vector},
 };
 
+const INITIAL_BRUSH_INDEX_CAPACITY: usize = 64;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum BrushShape {
     #[default]
@@ -227,7 +229,7 @@ pub(crate) fn brush_indices_cancellable(
                 )));
             }
             if output.len() == output.capacity() {
-                let additional = output.capacity().max(4_096);
+                let additional = output.capacity().max(INITIAL_BRUSH_INDEX_CAPACITY);
                 output
                     .try_reserve_exact(additional)
                     .map_err(|_| AppError::Allocation {
@@ -278,8 +280,16 @@ pub(crate) fn visit_brush_indices_cancellable(
         let last = i64::from(geometry.dimensions[axis] - 1);
         (-bounds[axis].min(center), bounds[axis].min(last - center))
     });
+    let [width, height, _] = geometry.dimensions.map(u64::from);
+    let first_x = u64::try_from(i64::from(center[0]) + ranges[0].0)
+        .expect("brush ranges are clipped to the volume");
     for z in ranges[2].0..=ranges[2].1 {
+        let voxel_z = u64::try_from(i64::from(center[2]) + z)
+            .expect("brush ranges are clipped to the volume");
         for y in ranges[1].0..=ranges[1].1 {
+            let voxel_y = u64::try_from(i64::from(center[1]) + y)
+                .expect("brush ranges are clipped to the volume");
+            let row_start = first_x + width * (voxel_y + height * voxel_z);
             for x in ranges[0].0..=ranges[0].1 {
                 if *traversal.examined >= traversal.maximum_examined {
                     return Err(AppError::BridgeWorkLimit {
@@ -290,20 +300,17 @@ pub(crate) fn visit_brush_indices_cancellable(
                 if *traversal.examined & 0x0fff == 0 {
                     traversal.cancel.check()?;
                 }
-                let delta = [x, y, z];
-                if !brush_contains_delta(geometry, delta, spec.shape, metric) {
+                if !matches!(
+                    (spec.shape, metric),
+                    (BrushShape::Square, BrushMetric::Voxels { .. })
+                ) && !brush_contains_delta(geometry, [x, y, z], spec.shape, metric)
+                {
                     continue;
                 }
-                let voxel = [
-                    i64::from(center[0]) + x,
-                    i64::from(center[1]) + y,
-                    i64::from(center[2]) + z,
-                ];
-                let voxel = voxel.map(|coordinate| {
-                    u32::try_from(coordinate).expect("brush ranges are clipped to the volume")
-                });
-                let index = linear_index(geometry.dimensions, voxel)
-                    .expect("brush ranges are clipped to the volume");
+                let x_offset =
+                    u64::try_from(x - ranges[0].0).expect("brush x offset is non-negative");
+                let index = u32::try_from(row_start + x_offset)
+                    .expect("the volume voxel limit fits linear indices in u32");
                 visit(index)?;
             }
         }
@@ -773,5 +780,25 @@ mod tests {
             brush_indices_cancellable(&geometry, [2; 3], 0, spec, &cancel, Some(124)),
             Err(AppError::InvalidDimensions(message)) if message.contains("124-voxel")
         ));
+    }
+
+    #[test]
+    fn small_footprint_uses_a_small_initial_allocation() {
+        let footprint = brush_indices_cancellable(
+            &identity_geometry([1; 3]),
+            [0; 3],
+            0,
+            BrushSpec {
+                shape: BrushShape::Round,
+                depth: BrushDepth::Slice,
+                size: BrushSize::voxels(1).unwrap(),
+            },
+            &CancellationToken::default(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(footprint, vec![0]);
+        assert!(footprint.capacity() <= INITIAL_BRUSH_INDEX_CAPACITY * 2);
     }
 }

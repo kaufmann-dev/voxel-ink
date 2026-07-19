@@ -114,6 +114,12 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
 ```
 
+Run the repeatable CPU hot-path benchmarks after changing meshing, brushes, or codecs:
+
+```sh
+cargo bench --locked --bench hot_paths -- --noplot
+```
+
 The Linux CI workflow also builds an x86_64 AppImage, builds a Fedora RPM with Podman, and smoke-tests the native application.
 
 ## License

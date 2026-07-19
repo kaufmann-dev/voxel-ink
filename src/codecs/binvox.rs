@@ -1,4 +1,4 @@
-use std::io::{BufWriter, ErrorKind, Read, Write};
+use std::io::{BufReader, ErrorKind, Read, Write};
 
 use crate::{
     AppError, Result,
@@ -14,6 +14,7 @@ use crate::{
 const FORMAT: &str = "BINVOX";
 const MAX_HEADER_BYTES: usize = 4096;
 const MAX_HEADER_LINE_BYTES: usize = 1024;
+const IO_BUFFER_BYTES: usize = 64 * 1024;
 
 pub static BINVOX_CODEC: BinvoxCodec = BinvoxCodec;
 
@@ -32,7 +33,10 @@ impl VolumeCodec for BinvoxCodec {
         cancel: &CancellationToken,
     ) -> Result<DecodedVolume> {
         cancel.check()?;
-        let (metadata, header_bytes) = read_header(reader)?;
+        // Codec-local buffering keeps tiny header and RLE reads away from the
+        // dynamic reader supplied by the generic codec interface.
+        let mut buffered = BufReader::with_capacity(IO_BUFFER_BYTES, reader);
+        let (metadata, header_bytes) = read_header(&mut buffered)?;
         match options.source_variant {
             SourceVariant::Binvox { .. } => {}
             _ => {
@@ -61,8 +65,7 @@ impl VolumeCodec for BinvoxCodec {
 
         while file_index < total_voxels {
             cancel.check()?;
-            let value = read_payload_byte(reader, "voxel value")?;
-            let count = read_payload_byte(reader, "run length")?;
+            let [value, count] = read_payload_pair(&mut buffered)?;
             payload_bytes = payload_bytes.checked_add(2).ok_or(AppError::InputLimit)?;
             if u64::try_from(header_bytes).unwrap_or(u64::MAX) + payload_bytes > MAX_INPUT_BYTES {
                 return Err(AppError::InputLimit);
@@ -90,24 +93,13 @@ impl VolumeCodec for BinvoxCodec {
                 normalized_non_binary = true;
             }
             if value != 0 {
-                for ordered_index in file_index..end {
-                    // BINVOX stores y fastest, followed by z, then x.
-                    let x = ordered_index / yz_plane;
-                    let within_x = ordered_index % yz_plane;
-                    let z = within_x / ny;
-                    let y = within_x % ny;
-                    let canonical_index = x + nx * (y + ny * z);
-                    let canonical_index = usize::try_from(canonical_index).map_err(|_| {
-                        AppError::invalid(FORMAT, "voxel index cannot be represented")
-                    })?;
-                    occupancy[canonical_index] = 1;
-                }
+                fill_occupied_run(&mut occupancy, [nx, ny, nz], yz_plane, file_index, end)?;
             }
             file_index = end;
         }
 
         let mut trailing = [0_u8; 1];
-        match reader.read(&mut trailing) {
+        match buffered.read(&mut trailing) {
             Ok(0) => {}
             Ok(_) => {
                 return Err(AppError::invalid(
@@ -168,43 +160,56 @@ impl VolumeCodec for BinvoxCodec {
             return Err(AppError::invalid(FORMAT, "generated header is too large"));
         }
 
-        let mut buffered = BufWriter::with_capacity(64 * 1024, writer);
-        write_bytes(&mut buffered, header.as_bytes())?;
+        write_bytes(writer, header.as_bytes())?;
 
-        let [nx, ny, nz] = metadata.dimensions.map(u64::from);
-        let yz_plane = ny * nz;
-        let total_voxels = nx * yz_plane;
+        let [nx, ny, nz] = metadata.dimensions.map(|extent| extent as usize);
         let mut current_value = None;
         let mut current_count = 0_u8;
+        let mut run_bytes = Vec::new();
+        run_bytes
+            .try_reserve_exact(IO_BUFFER_BYTES)
+            .map_err(|_| AppError::Allocation {
+                bytes: IO_BUFFER_BYTES,
+            })?;
+        let mut processed = 0_usize;
 
-        for file_index in 0..total_voxels {
-            if file_index % 4096 == 0 {
-                cancel.check()?;
-            }
-            let x = file_index / yz_plane;
-            let within_x = file_index % yz_plane;
-            let z = within_x / ny;
-            let y = within_x % ny;
-            let canonical_index = x + nx * (y + ny * z);
-            let canonical_index = usize::try_from(canonical_index)
-                .map_err(|_| AppError::invalid(FORMAT, "voxel index cannot be represented"))?;
-            let value = volume.occupancy[canonical_index];
-
-            if current_value == Some(value) && current_count < u8::MAX {
-                current_count += 1;
-            } else {
-                if let Some(previous_value) = current_value {
-                    write_bytes(&mut buffered, &[previous_value, current_count])?;
+        // BINVOX stores y fastest, followed by z, then x. Nested cursors avoid
+        // division and modulo for every voxel while preserving that order.
+        for x in 0..nx {
+            for z in 0..nz {
+                let mut canonical_index = x + nx * ny * z;
+                for _y in 0..ny {
+                    if processed.is_multiple_of(4096) {
+                        cancel.check()?;
+                    }
+                    let value = volume.occupancy[canonical_index];
+                    if current_value == Some(value) && current_count < u8::MAX {
+                        current_count += 1;
+                    } else {
+                        if let Some(previous_value) = current_value {
+                            push_encoded_run(
+                                writer,
+                                &mut run_bytes,
+                                previous_value,
+                                current_count,
+                            )?;
+                        }
+                        current_value = Some(value);
+                        current_count = 1;
+                    }
+                    processed += 1;
+                    canonical_index += nx;
                 }
-                current_value = Some(value);
-                current_count = 1;
             }
         }
         if let Some(value) = current_value {
-            write_bytes(&mut buffered, &[value, current_count])?;
+            push_encoded_run(writer, &mut run_bytes, value, current_count)?;
+        }
+        if !run_bytes.is_empty() {
+            write_bytes(writer, &run_bytes)?;
         }
         cancel.check()?;
-        buffered
+        writer
             .flush()
             .map_err(|error| stream_error("flush encoded data", error))
     }
@@ -364,16 +369,49 @@ fn parse_f64(value: &str, field: &str) -> Result<f64> {
     Ok(parsed)
 }
 
-fn read_payload_byte(reader: &mut dyn Read, field: &str) -> Result<u8> {
-    let mut byte = [0_u8; 1];
-    match reader.read_exact(&mut byte) {
-        Ok(()) => Ok(byte[0]),
+fn read_payload_pair(reader: &mut impl Read) -> Result<[u8; 2]> {
+    let mut pair = [0_u8; 2];
+    match reader.read_exact(&mut pair) {
+        Ok(()) => Ok(pair),
         Err(error) if error.kind() == ErrorKind::UnexpectedEof => Err(AppError::invalid(
             FORMAT,
-            format!("RLE stream is truncated while reading {field}"),
+            "RLE stream is truncated while reading a value/count pair",
         )),
         Err(error) => Err(stream_error("read RLE data", error)),
     }
+}
+
+fn fill_occupied_run(
+    occupancy: &mut [u8],
+    dimensions: [u64; 3],
+    yz_plane: u64,
+    start: u64,
+    end: u64,
+) -> Result<()> {
+    let [nx, ny, nz] = dimensions;
+    let mut x = start / yz_plane;
+    let within_x = start % yz_plane;
+    let mut z = within_x / ny;
+    let mut y = within_x % ny;
+    let mut canonical = x + nx * (y + ny * z);
+    for _ in start..end {
+        let index = usize::try_from(canonical)
+            .map_err(|_| AppError::invalid(FORMAT, "voxel index cannot be represented"))?;
+        occupancy[index] = 1;
+        y += 1;
+        if y == ny {
+            y = 0;
+            z += 1;
+            if z == nz {
+                z = 0;
+                x += 1;
+            }
+            canonical = x + nx * ny * z;
+        } else {
+            canonical += nx;
+        }
+    }
+    Ok(())
 }
 
 fn validate_metadata(metadata: &BinvoxMetadata) -> Result<()> {
@@ -449,6 +487,20 @@ fn geometry_from_metadata(metadata: &BinvoxMetadata) -> Result<VolumeGeometry> {
         ],
         SpatialUnits::Unknown,
     )
+}
+
+fn push_encoded_run(
+    writer: &mut dyn Write,
+    buffer: &mut Vec<u8>,
+    value: u8,
+    count: u8,
+) -> Result<()> {
+    if buffer.len() + 2 > IO_BUFFER_BYTES {
+        write_bytes(writer, buffer)?;
+        buffer.clear();
+    }
+    buffer.extend_from_slice(&[value, count]);
+    Ok(())
 }
 
 fn write_bytes(writer: &mut dyn Write, bytes: &[u8]) -> Result<()> {

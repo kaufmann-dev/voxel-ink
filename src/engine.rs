@@ -35,6 +35,7 @@ const EVENT_CAPACITY: usize = 256;
 const MESH_EVENT_BACKLOG_LIMIT: usize = 8;
 const PATCH_TILE: u32 = 32;
 const MAX_PREVIEW_VOXELS: usize = 2_000_000;
+const INITIAL_PREVIEW_VOXEL_CAPACITY: usize = 64;
 const MAX_BRIDGE_CHANGED_VOXELS: usize = 2_000_000;
 const MAX_BRIDGE_PREVIEW_WORK: usize = 16_000_000;
 const MAX_BRIDGE_COMMIT_WORK: usize = 64_000_000;
@@ -646,6 +647,7 @@ struct EngineState {
     mesh_scan_grid: [u32; 3],
     mesh_scan_next: u64,
     mesh_scan_total: u64,
+    mesh_scan_promoted: HashSet<ChunkCoord>,
     mesh_pass_generation: u64,
     mesh_generations: HashMap<ChunkCoord, u64>,
     mesh_edit_generations: HashMap<ChunkCoord, u64>,
@@ -698,6 +700,7 @@ impl EngineState {
             mesh_scan_grid: [0; 3],
             mesh_scan_next: 0,
             mesh_scan_total: 0,
+            mesh_scan_promoted: HashSet::new(),
             mesh_pass_generation: 0,
             mesh_generations: HashMap::new(),
             mesh_edit_generations: HashMap::new(),
@@ -1014,6 +1017,7 @@ impl EngineState {
         self.mesh_scan_grid = [0; 3];
         self.mesh_scan_next = 0;
         self.mesh_scan_total = 0;
+        self.mesh_scan_promoted.clear();
         self.mesh_generations.clear();
         self.mesh_edit_generations.clear();
         self.mesh_live_chunks.clear();
@@ -1033,10 +1037,16 @@ impl EngineState {
         let Some(document) = self.document.as_mut() else {
             return;
         };
+        let previous_cursor = document.cursor();
         document.set_cursor(cursor);
+        let cursor = document.cursor();
+        if cursor == previous_cursor {
+            return;
+        }
         let summary = document.summary();
         let revision = document.revision();
-        let slices = match visible_slices(document) {
+        let changed_axes = axes_with_changed_coordinate(previous_cursor, cursor);
+        let slices = match slices_for_axes(document, changed_axes) {
             Ok(slices) => slices,
             Err(error) => {
                 self.emit_error(None, error);
@@ -1138,15 +1148,18 @@ impl EngineState {
     }
 
     fn apply_target(&mut self, target: [u32; 3]) {
-        let Some((tool, spec, space, start, cancel)) = self.stroke.as_ref().map(|stroke| {
-            (
-                stroke.tool,
-                stroke.spec,
-                stroke.space,
-                stroke.last_applied.unwrap_or(target),
-                stroke.cancel.clone(),
-            )
-        }) else {
+        let Some((tool, spec, space, start, skip_start, cancel)) =
+            self.stroke.as_ref().map(|stroke| {
+                (
+                    stroke.tool,
+                    stroke.spec,
+                    stroke.space,
+                    stroke.last_applied.unwrap_or(target),
+                    stroke.last_applied.is_some(),
+                    stroke.cancel.clone(),
+                )
+            })
+        else {
             return;
         };
         let Some(document) = self.document.as_mut() else {
@@ -1164,7 +1177,8 @@ impl EngineState {
                 .last_applied = Some(target);
             let summary = document.summary();
             let revision = document.revision();
-            let slices = match visible_slices(document) {
+            let changed_axes = axes_with_changed_coordinate(previous_cursor, document.cursor());
+            let slices = match slices_for_axes(document, changed_axes) {
                 Ok(slices) => slices,
                 Err(error) => {
                     self.emit_error(None, error);
@@ -1183,19 +1197,31 @@ impl EngineState {
             return;
         }
         let replacement_axes = axes_with_changed_coordinate(previous_cursor, target);
-        let replaced_axes = replacement_axes.iter().copied().collect::<HashSet<_>>();
+        let replaced_coordinates = changed_coordinate_mask(previous_cursor, target);
         let mut patch_tiles = HashSet::new();
         let stroke_change_start = document.active_stroke_indices().map_or(0, <[u32]>::len);
+        let mut first_center = true;
         let apply_result = walk_supercover(start, target, |center| {
+            if std::mem::take(&mut first_center) && skip_start {
+                return Ok(());
+            }
             cancel.check()?;
             let footprint = footprint_indices(document, center, spec, space, &cancel)?;
             for batch in footprint.chunks(4_096) {
                 cancel.check()?;
+                let batch_change_start = document
+                    .active_stroke_indices()
+                    .expect("an editable stroke owns its exact changes")
+                    .len();
                 document.apply_stroke_indices(batch.iter().copied())?;
                 add_slice_patch_tiles(
                     document,
-                    batch.iter().copied(),
-                    &replaced_axes,
+                    document
+                        .active_stroke_indices()
+                        .expect("an editable stroke owns its exact changes")[batch_change_start..]
+                        .iter()
+                        .copied(),
+                    replaced_coordinates,
                     &mut patch_tiles,
                 )?;
             }
@@ -1430,14 +1456,45 @@ impl EngineState {
         };
         let previous_cursor = document.cursor();
         let replacement_axes = axes_with_changed_coordinate(previous_cursor, end);
-        let replaced_axes = replacement_axes.iter().copied().collect::<HashSet<_>>();
+        if candidates.is_empty() {
+            document.set_cursor(end);
+            let replacements = replacement_axes
+                .iter()
+                .map(|&axis| document.try_extract_slice(axis, end[axis.normal_axis()]))
+                .collect::<Result<Vec<_>>>();
+            let replacements = match replacements {
+                Ok(replacements) => replacements,
+                Err(error) => {
+                    document.set_cursor(previous_cursor);
+                    self.emit_error(None, error);
+                    self.emit_edit_finished(edit_id, EditOutcome::Cancelled);
+                    return;
+                }
+            };
+            let summary = document.summary();
+            let revision = document.revision();
+            self.emit(EngineEvent::Summary {
+                epoch: self.epoch,
+                summary,
+            });
+            if !replacements.is_empty() {
+                self.emit(EngineEvent::SlicesReplaced {
+                    epoch: self.epoch,
+                    revision,
+                    slices: replacements,
+                });
+            }
+            self.emit_edit_finished(edit_id, EditOutcome::Completed);
+            return;
+        }
+        let replaced_coordinates = changed_coordinate_mask(previous_cursor, end);
         let mut patch_tiles = HashSet::new();
         if let Err(error) = document.begin_stroke(1).and_then(|()| {
             document.apply_stroke_indices(candidates.iter().copied())?;
             add_slice_patch_tiles(
                 document,
                 candidates.iter().copied(),
-                &replaced_axes,
+                replaced_coordinates,
                 &mut patch_tiles,
             )
         }) {
@@ -1768,6 +1825,7 @@ impl EngineState {
             self.mesh_scan_grid = [0; 3];
             self.mesh_scan_next = 0;
             self.mesh_scan_total = 0;
+            self.mesh_scan_promoted.clear();
             return;
         };
         let dimensions = document.geometry().dimensions;
@@ -1777,6 +1835,7 @@ impl EngineState {
         self.mesh_dirty.configure(self.mesh_scan_grid);
         self.mesh_scan_next = 0;
         self.mesh_scan_total = self.mesh_scan_grid.into_iter().map(u64::from).product();
+        self.mesh_scan_promoted.clear();
         self.prioritize_mesh_near_cursor();
         self.emit(EngineEvent::MeshReset {
             epoch: self.epoch,
@@ -1824,7 +1883,7 @@ impl EngineState {
             self.mesh_edit_generations
                 .insert(chunk, self.preview_generation);
             self.mesh_live_chunks.insert(chunk);
-            self.mesh_dirty.promote(chunk);
+            self.promote_dirty_mesh_chunk(chunk);
         }
     }
 
@@ -1912,10 +1971,8 @@ impl EngineState {
         let cursor_chunk = ChunkCoord::from_voxel(document.cursor());
         let center_chunk =
             ChunkCoord::from_voxel(document.geometry().dimensions.map(|axis| axis / 2));
-        self.mesh_dirty.promote(center_chunk);
-        self.mesh_dirty.promote(cursor_chunk);
         let grid = chunk_grid(document.geometry().dimensions);
-        for radius in 1_i64..=2 {
+        for radius in (1_i64..=2).rev() {
             for z in -radius..=radius {
                 for y in -radius..=radius {
                     for x in -radius..=radius {
@@ -1932,7 +1989,7 @@ impl EngineState {
                         }) {
                             continue;
                         }
-                        self.mesh_dirty.promote(ChunkCoord::new(
+                        self.prioritize_mesh_chunk(ChunkCoord::new(
                             candidate[0] as u32,
                             candidate[1] as u32,
                             candidate[2] as u32,
@@ -1941,6 +1998,35 @@ impl EngineState {
                 }
             }
         }
+        self.prioritize_mesh_chunk(center_chunk);
+        self.prioritize_mesh_chunk(cursor_chunk);
+    }
+
+    fn prioritize_mesh_chunk(&mut self, chunk: ChunkCoord) {
+        if self.mesh_dirty.members.contains(&chunk) {
+            self.promote_dirty_mesh_chunk(chunk);
+            return;
+        }
+        if !self.mark_promoted_scan_chunk(chunk) {
+            return;
+        }
+        self.mesh_dirty.promote(chunk);
+    }
+
+    fn promote_dirty_mesh_chunk(&mut self, chunk: ChunkCoord) {
+        self.mark_promoted_scan_chunk(chunk);
+        self.mesh_dirty.promote(chunk);
+    }
+
+    fn mark_promoted_scan_chunk(&mut self, chunk: ChunkCoord) -> bool {
+        let Some(index) = chunk_linear_index(chunk, self.mesh_scan_grid) else {
+            return false;
+        };
+        if index < self.mesh_scan_next || index >= self.mesh_scan_total {
+            return false;
+        }
+        self.mesh_scan_promoted.insert(chunk);
+        true
     }
 
     fn dispatch_mesh_jobs(&mut self) {
@@ -1991,7 +2077,7 @@ impl EngineState {
                     .is_some_and(|at| at.elapsed() < LIVE_FEEDBACK_GRACE)
             {
                 self.mesh_live_chunks.insert(chunk);
-                self.mesh_dirty.promote(chunk);
+                self.promote_dirty_mesh_chunk(chunk);
                 break;
             }
             if priority == MeshUpdatePriority::Background && self.stroke.is_some() {
@@ -2029,7 +2115,7 @@ impl EngineState {
                     if self.mesh_recovery_chunks.contains(&chunk) {
                         self.mesh_cancel = CancellationToken::default();
                         self.mesh_live_chunks.insert(chunk);
-                        self.mesh_dirty.promote(chunk);
+                        self.promote_dirty_mesh_chunk(chunk);
                     }
                     break;
                 }
@@ -2078,6 +2164,9 @@ impl EngineState {
         while self.mesh_scan_next < self.mesh_scan_total {
             let chunk = chunk_from_linear(self.mesh_scan_next, self.mesh_scan_grid)?;
             self.mesh_scan_next += 1;
+            if self.mesh_scan_promoted.remove(&chunk) {
+                continue;
+            }
             if self.mesh_in_flight_chunks.contains(&chunk) {
                 let queued = self.mesh_dirty.enqueue_back(chunk);
                 debug_assert!(queued);
@@ -2141,7 +2230,7 @@ impl EngineState {
                         self.mesh_cancel = CancellationToken::default();
                     }
                     self.mesh_live_chunks.insert(tag.chunk);
-                    self.mesh_dirty.promote(tag.chunk);
+                    self.promote_dirty_mesh_chunk(tag.chunk);
                 }
                 return;
             }
@@ -2186,6 +2275,7 @@ impl EngineState {
             self.preview_too_complex = true;
             self.mesh_dirty.clear();
             self.mesh_scan_next = self.mesh_scan_total;
+            self.mesh_scan_promoted.clear();
             self.emit(EngineEvent::PreviewTooComplex {
                 epoch: self.epoch,
                 revision: document.revision(),
@@ -2234,6 +2324,7 @@ impl EngineState {
         self.mesh_dirty.clear();
         self.mesh_live_chunks.clear();
         self.mesh_scan_next = self.mesh_scan_total;
+        self.mesh_scan_promoted.clear();
         self.progressive_live_jobs.clear();
         self.pending_live_mesh_chunks
             .retain(|(tag, _)| !failed_chunks.contains(&tag.chunk));
@@ -2407,9 +2498,18 @@ impl EngineState {
 }
 
 fn visible_slices(document: &VolumeDocument) -> Result<Vec<SliceImage>> {
+    slices_for_axes(
+        document,
+        [SliceAxis::Axial, SliceAxis::Coronal, SliceAxis::Sagittal],
+    )
+}
+
+fn slices_for_axes(
+    document: &VolumeDocument,
+    axes: impl IntoIterator<Item = SliceAxis>,
+) -> Result<Vec<SliceImage>> {
     let cursor = document.cursor();
-    [SliceAxis::Axial, SliceAxis::Coronal, SliceAxis::Sagittal]
-        .into_iter()
+    axes.into_iter()
         .map(|axis| document.try_extract_slice(axis, cursor[axis.normal_axis()]))
         .collect()
 }
@@ -2495,7 +2595,7 @@ fn calculate_brush_preview(
 ) -> Result<BrushPreviewComputation> {
     cancel.check()?;
     let generation = preview_request_generation(request);
-    let (tool, target, candidates) = match request {
+    match request {
         BrushPreviewRequest::Brush {
             tool,
             spec,
@@ -2513,11 +2613,19 @@ fn calculate_brush_preview(
                     voxels: target.into_iter().collect(),
                 });
             }
-            let candidates = match target {
-                None => Vec::new(),
-                Some(center) => preview_footprint_indices(document, center, spec, space, cancel)?,
+            let voxels = match (target, edit_value(tool)) {
+                (Some(center), Some(value)) => preview_changed_brush_voxels_cancellable(
+                    document, center, spec, space, value, cancel,
+                )?,
+                _ => Vec::new(),
             };
-            (tool, target, candidates)
+            cancel.check()?;
+            Ok(BrushPreviewComputation {
+                generation,
+                tool,
+                target,
+                voxels,
+            })
         }
         BrushPreviewRequest::Bridge {
             spec,
@@ -2549,28 +2657,14 @@ fn calculate_brush_preview(
                 .filter_map(|index| voxel_from_linear(dimensions, index))
                 .collect();
             cancel.check()?;
-            return Ok(BrushPreviewComputation {
+            Ok(BrushPreviewComputation {
                 generation,
                 tool: Tool::Bridge,
                 target,
                 voxels,
-            });
+            })
         }
-    };
-    let voxels = changed_voxels_cancellable(
-        document,
-        candidates,
-        edit_value(tool),
-        cancel,
-        Some(MAX_PREVIEW_VOXELS),
-    )?;
-    cancel.check()?;
-    Ok(BrushPreviewComputation {
-        generation,
-        tool,
-        target,
-        voxels,
-    })
+    }
 }
 
 fn footprint_indices(
@@ -2587,25 +2681,48 @@ fn footprint_indices(
     brush_indices_cancellable(document.geometry(), center, normal_axis, spec, cancel, None)
 }
 
-fn preview_footprint_indices(
+fn preview_changed_brush_voxels_cancellable(
     document: &VolumeDocument,
     center: [u32; 3],
     spec: BrushSpec,
     space: StrokeSpace,
+    value: u8,
     cancel: &CancellationToken,
-) -> Result<Vec<u32>> {
+) -> Result<Vec<[u32; 3]>> {
     let (normal_axis, spec) = match space {
         StrokeSpace::Slice(axis) => (axis.normal_axis(), spec),
         StrokeSpace::Volume3D => (0, spec.with_depth(BrushDepth::Volume)),
     };
-    brush_indices_cancellable(
+    let dimensions = document.geometry().dimensions;
+    let occupancy = document.view().occupancy;
+    let mut voxels = Vec::new();
+    let mut footprint_len = 0_usize;
+    let mut examined = 0_usize;
+    let mut traversal = BrushTraversal {
+        cancel,
+        examined: &mut examined,
+        maximum_examined: usize::MAX,
+    };
+    visit_brush_indices_cancellable(
         document.geometry(),
         center,
         normal_axis,
         spec,
-        cancel,
-        Some(MAX_PREVIEW_VOXELS),
-    )
+        &mut traversal,
+        |index| {
+            if footprint_len >= MAX_PREVIEW_VOXELS {
+                return Err(AppError::InvalidDimensions(format!(
+                    "brush footprint exceeds the {MAX_PREVIEW_VOXELS}-voxel preview safety limit"
+                )));
+            }
+            footprint_len += 1;
+            if occupancy.get(index as usize).copied() == Some(value) {
+                return Ok(());
+            }
+            try_push_preview_voxel(&mut voxels, dimensions, index)
+        },
+    )?;
+    Ok(voxels)
 }
 
 fn bridge_changed_indices_cancellable(
@@ -2646,16 +2763,22 @@ fn bridge_changed_indices_cancellable(
             spec,
             &mut traversal,
             |index| {
-                if occupancy.get(index as usize).copied() == Some(1) || unique.contains(&index) {
+                if occupancy.get(index as usize).copied() == Some(1) {
                     return Ok(());
                 }
                 if unique.len() >= limits.maximum_changed {
+                    if unique.contains(&index) {
+                        return Ok(());
+                    }
                     return Err(AppError::BridgeVoxelLimit {
                         limit: limits.maximum_changed,
                     });
                 }
                 if unique.len() == unique.capacity() {
-                    let additional = 4_096.min(limits.maximum_changed - unique.len());
+                    let additional = unique
+                        .capacity()
+                        .max(INITIAL_PREVIEW_VOXEL_CAPACITY)
+                        .min(limits.maximum_changed - unique.len());
                     unique
                         .try_reserve(additional)
                         .map_err(|_| AppError::Allocation {
@@ -2664,6 +2787,12 @@ fn bridge_changed_indices_cancellable(
                                 .saturating_add(additional)
                                 .saturating_mul(size_of::<u32>() + size_of::<usize>()),
                         })?;
+                }
+                if indices.len() == indices.capacity() {
+                    let additional = indices
+                        .capacity()
+                        .max(INITIAL_PREVIEW_VOXEL_CAPACITY)
+                        .min(limits.maximum_changed - indices.len());
                     indices
                         .try_reserve(additional)
                         .map_err(|_| AppError::Allocation {
@@ -2673,8 +2802,9 @@ fn bridge_changed_indices_cancellable(
                                 .saturating_mul(size_of::<u32>()),
                         })?;
                 }
-                unique.insert(index);
-                indices.push(index);
+                if unique.insert(index) {
+                    indices.push(index);
+                }
                 Ok(())
             },
         )
@@ -2684,49 +2814,30 @@ fn bridge_changed_indices_cancellable(
     Ok(indices)
 }
 
-fn preview_voxel_limit_error() -> AppError {
-    AppError::InvalidDimensions(format!(
-        "brush preview exceeds the {MAX_PREVIEW_VOXELS}-voxel safety limit; reduce the brush size or bridge length"
-    ))
-}
-
-fn changed_voxels_cancellable(
-    document: &VolumeDocument,
-    indices: Vec<u32>,
-    value: Option<u8>,
-    cancel: &CancellationToken,
-    maximum_voxels: Option<usize>,
-) -> Result<Vec<[u32; 3]>> {
-    cancel.check()?;
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    let dimensions = document.geometry().dimensions;
-    let occupancy = document.view().occupancy;
-    let mut voxels = Vec::new();
-    let initial_capacity = indices.len().min(maximum_voxels.unwrap_or(usize::MAX));
-    voxels
-        .try_reserve(initial_capacity)
-        .map_err(|_| AppError::Allocation {
-            bytes: initial_capacity.saturating_mul(size_of::<[u32; 3]>()),
-        })?;
-    for (offset, index) in indices.into_iter().enumerate() {
-        if offset & 0x0fff == 0 {
-            cancel.check()?;
-        }
-        if occupancy.get(index as usize).copied() == Some(value) {
-            continue;
-        }
-        if maximum_voxels.is_some_and(|maximum| voxels.len() >= maximum) {
-            return Err(preview_voxel_limit_error());
-        }
-        let voxel = voxel_from_linear(dimensions, index).ok_or_else(|| {
-            AppError::InvalidDimensions("brush produced an out-of-volume voxel".into())
-        })?;
-        voxels.push(voxel);
+fn try_push_preview_voxel(
+    voxels: &mut Vec<[u32; 3]>,
+    dimensions: [u32; 3],
+    index: u32,
+) -> Result<()> {
+    if voxels.len() == voxels.capacity() {
+        let additional = voxels
+            .capacity()
+            .max(INITIAL_PREVIEW_VOXEL_CAPACITY)
+            .min(MAX_PREVIEW_VOXELS - voxels.len());
+        voxels
+            .try_reserve_exact(additional)
+            .map_err(|_| AppError::Allocation {
+                bytes: voxels
+                    .len()
+                    .saturating_add(additional)
+                    .saturating_mul(size_of::<[u32; 3]>()),
+            })?;
     }
-    cancel.check()?;
-    Ok(voxels)
+    let voxel = voxel_from_linear(dimensions, index).ok_or_else(|| {
+        AppError::InvalidDimensions("brush produced an out-of-volume voxel".into())
+    })?;
+    voxels.push(voxel);
+    Ok(())
 }
 
 fn voxel_from_linear(dimensions: [u32; 3], index: u32) -> Option<[u32; 3]> {
@@ -2770,10 +2881,14 @@ fn axes_with_changed_coordinate(before: [u32; 3], after: [u32; 3]) -> Vec<SliceA
         .collect()
 }
 
+fn changed_coordinate_mask(before: [u32; 3], after: [u32; 3]) -> [bool; 3] {
+    std::array::from_fn(|axis| before[axis] != after[axis])
+}
+
 fn add_slice_patch_tiles(
     document: &VolumeDocument,
     indices: impl IntoIterator<Item = u32>,
-    replaced_axes: &HashSet<SliceAxis>,
+    replaced_coordinates: [bool; 3],
     tiles: &mut HashSet<(SliceAxis, u32, u32)>,
 ) -> Result<()> {
     let dimensions = document.geometry().dimensions;
@@ -2786,7 +2901,7 @@ fn add_slice_patch_tiles(
         let y = (remainder / u64::from(dimensions[0])) as u32;
         let x = (remainder % u64::from(dimensions[0])) as u32;
         for axis in [SliceAxis::Axial, SliceAxis::Coronal, SliceAxis::Sagittal] {
-            if replaced_axes.contains(&axis) {
+            if replaced_coordinates[axis.normal_axis()] {
                 continue;
             }
             let (coordinate, u, v) = match axis {
@@ -2884,6 +2999,18 @@ fn chunk_from_linear(index: u64, grid: [u32; 3]) -> Option<ChunkCoord> {
         u32::try_from(y).ok()?,
         u32::try_from(z).ok()?,
     ))
+}
+
+fn chunk_linear_index(chunk: ChunkCoord, grid: [u32; 3]) -> Option<u64> {
+    let [x, y, z] = chunk.as_array();
+    if [x, y, z]
+        .into_iter()
+        .zip(grid)
+        .any(|(coordinate, extent)| coordinate >= extent)
+    {
+        return None;
+    }
+    Some(u64::from(x) + u64::from(grid[0]) * (u64::from(y) + u64::from(grid[1]) * u64::from(z)))
 }
 
 #[cfg(test)]
@@ -3326,6 +3453,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(changes, vec![4]);
+        assert!(changes.capacity() < 4_096);
+    }
+
+    #[test]
+    fn preview_changes_allocate_only_when_voxels_actually_change() {
+        let state = state_with_empty_document([128, 1, 1]);
+        let unchanged = preview_changed_brush_voxels_cancellable(
+            state.document.as_ref().unwrap(),
+            [64, 0, 0],
+            BrushSpec {
+                shape: BrushShape::Square,
+                depth: BrushDepth::Slice,
+                size: BrushSize::voxels(101).unwrap(),
+            },
+            StrokeSpace::Slice(SliceAxis::Axial),
+            0,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+
+        assert!(unchanged.is_empty());
+        assert_eq!(unchanged.capacity(), 0);
     }
 
     #[test]
@@ -3445,6 +3594,69 @@ mod tests {
         ));
         assert!(event_rx.try_recv().is_err());
         assert_eq!(state.document.as_ref().unwrap().summary(), before);
+    }
+
+    #[test]
+    fn unchanged_bridge_moves_the_cursor_without_restarting_mesh_work() {
+        let mut state = state_with_empty_document([3, 1, 1]);
+        let document = state.document.as_mut().unwrap();
+        document.begin_stroke(1).unwrap();
+        document.apply_stroke_indices([0, 1, 2]).unwrap();
+        document.finish_stroke().unwrap();
+        document.set_cursor([0, 0, 0]);
+        let revision = document.revision();
+        let occupied_count = document.summary().occupied_count;
+        let live_batch = state.mesh_cancel.clone();
+        let background_batch = state.mesh_background_cancel.clone();
+        let (event_tx, event_rx) = bounded(4);
+        state.event_tx = event_tx;
+
+        state.commit_bridge(
+            103,
+            BridgeCommitRequest {
+                anchor: [0, 0, 0],
+                plane_normal: [0.0, 0.0, 1.0],
+                sample: PointerSample::Slice {
+                    axis: SliceAxis::Axial,
+                    voxel: [2, 0, 0],
+                },
+                spec: one_voxel_brush(),
+                space: StrokeSpace::Slice(SliceAxis::Axial),
+            },
+            &CancellationToken::default(),
+        );
+
+        assert!(!live_batch.is_cancelled());
+        assert!(!background_batch.is_cancelled());
+        let document = state.document.as_ref().unwrap();
+        assert_eq!(document.cursor(), [2, 0, 0]);
+        assert_eq!(document.revision(), revision);
+        assert_eq!(document.summary().occupied_count, occupied_count);
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            EngineEvent::Summary { summary, .. }
+                if summary.cursor == [2, 0, 0] && summary.revision == revision
+        ));
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            EngineEvent::SlicesReplaced {
+                revision: event_revision,
+                slices,
+                ..
+            } if event_revision == revision
+                && slices.len() == 1
+                && slices[0].axis == SliceAxis::Sagittal
+                && slices[0].coordinate == 2
+        ));
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            EngineEvent::EditFinished {
+                edit_id: 103,
+                outcome: EditOutcome::Completed,
+                ..
+            }
+        ));
+        assert!(event_rx.is_empty());
     }
 
     #[test]
@@ -4332,6 +4544,14 @@ mod tests {
             Some(ChunkCoord::new(grid[0] - 1, 0, 0))
         );
         assert_eq!(chunk_from_linear(total, grid), None);
+        assert_eq!(
+            chunk_linear_index(ChunkCoord::new(grid[0] - 1, 0, 0), grid),
+            Some(total - 1)
+        );
+        assert_eq!(
+            chunk_linear_index(ChunkCoord::new(grid[0], 0, 0), grid),
+            None
+        );
 
         let mut dirty = DirtyChunkQueue::default();
         dirty.configure([4, 1, 1]);
@@ -4345,5 +4565,88 @@ mod tests {
         dirty.promote(ChunkCoord::new(2, 0, 0));
         assert_eq!(dirty.pop_front(), Some(ChunkCoord::new(2, 0, 0)));
         assert_eq!(dirty.len(), 3);
+    }
+
+    #[test]
+    fn cursor_navigation_replaces_only_changed_axes_without_dirtying_clean_meshes() {
+        let mut state = state_with_empty_document([96, 64, 32]);
+        let (event_tx, event_rx) = bounded(4);
+        state.event_tx = event_tx;
+
+        state.set_cursor([49, 32, 16]);
+
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        let slices = events
+            .iter()
+            .find_map(|event| match event {
+                EngineEvent::SlicesReplaced { slices, .. } => Some(slices),
+                _ => None,
+            })
+            .expect("cursor navigation publishes its changed slice");
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].axis, SliceAxis::Sagittal);
+        assert_eq!(slices[0].coordinate, 49);
+        assert!(state.mesh_dirty.order.is_empty());
+
+        state.set_cursor([49, 32, 16]);
+        assert!(
+            event_rx.is_empty(),
+            "an unchanged cursor should publish no work"
+        );
+        assert!(state.mesh_dirty.order.is_empty());
+    }
+
+    #[test]
+    fn prioritized_initial_chunks_are_nearest_first_and_scanned_only_once() {
+        let mut state = state_with_empty_document([160, 1, 1]);
+        state.mesh_scan_next = 0;
+        state.mesh_dirty.clear();
+        state.mesh_scan_promoted.clear();
+        state.prioritize_mesh_near_cursor();
+
+        let mut dispatched = Vec::new();
+        while let Some((chunk, priority)) = state.next_mesh_chunk() {
+            assert_eq!(priority, MeshUpdatePriority::Background);
+            dispatched.push(chunk);
+        }
+
+        assert_eq!(dispatched.len(), state.mesh_scan_total as usize);
+        assert_eq!(dispatched[0], ChunkCoord::new(2, 0, 0));
+        assert_eq!(
+            dispatched
+                .iter()
+                .map(|chunk| chunk.x.abs_diff(2))
+                .collect::<Vec<_>>(),
+            vec![0, 1, 1, 2, 2]
+        );
+        assert_eq!(
+            dispatched.iter().copied().collect::<HashSet<_>>().len(),
+            dispatched.len()
+        );
+    }
+
+    #[test]
+    fn live_promoted_unscanned_chunk_is_not_repeated_by_lazy_scan() {
+        let mut state = state_with_empty_document([320, 1, 1]);
+        state.mesh_scan_next = 0;
+        state.mesh_dirty.clear();
+        state.mesh_scan_promoted.clear();
+        let live = ChunkCoord::new(9, 0, 0);
+
+        state.promote_live_mesh_chunks([live]);
+        assert_eq!(
+            state.next_mesh_chunk(),
+            Some((live, MeshUpdatePriority::Live))
+        );
+        let mut dispatched = vec![live];
+        while let Some((chunk, _)) = state.next_mesh_chunk() {
+            dispatched.push(chunk);
+        }
+
+        assert_eq!(dispatched.len(), state.mesh_scan_total as usize);
+        assert_eq!(
+            dispatched.iter().copied().collect::<HashSet<_>>().len(),
+            dispatched.len()
+        );
     }
 }

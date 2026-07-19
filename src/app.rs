@@ -281,6 +281,88 @@ impl SliceViewState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SliceTextureRegion {
+    axis: SliceAxis,
+    coordinate: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+impl From<&SlicePatch> for SliceTextureRegion {
+    fn from(patch: &SlicePatch) -> Self {
+        Self {
+            axis: patch.axis,
+            coordinate: patch.coordinate,
+            x: patch.x,
+            y: patch.y,
+            width: patch.width,
+            height: patch.height,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum PendingSliceTextureUpload {
+    Full,
+    Patches(Vec<SliceTextureRegion>),
+}
+
+#[derive(Debug, Default)]
+struct PendingSliceTextureUploads {
+    axes: HashMap<SliceAxis, PendingSliceTextureUpload>,
+}
+
+impl PendingSliceTextureUploads {
+    fn full(&mut self, axis: SliceAxis) {
+        self.axes.insert(axis, PendingSliceTextureUpload::Full);
+    }
+
+    fn patch(&mut self, region: SliceTextureRegion) {
+        let update = self
+            .axes
+            .entry(region.axis)
+            .or_insert_with(|| PendingSliceTextureUpload::Patches(Vec::new()));
+        if let PendingSliceTextureUpload::Patches(patches) = update
+            && !patches.contains(&region)
+        {
+            patches.push(region);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.axes.clear();
+    }
+}
+
+fn apply_slice_patch_pixels(slice: &mut SliceImage, patch: &SlicePatch) -> bool {
+    let Some(pixel_count) = (patch.width as usize).checked_mul(patch.height as usize) else {
+        return false;
+    };
+    if slice.coordinate != patch.coordinate
+        || patch
+            .x
+            .checked_add(patch.width)
+            .is_none_or(|right| right > slice.width)
+        || patch
+            .y
+            .checked_add(patch.height)
+            .is_none_or(|bottom| bottom > slice.height)
+        || patch.pixels.len() != pixel_count
+    {
+        return false;
+    }
+    for row in 0..patch.height {
+        let source = row as usize * patch.width as usize;
+        let destination = (patch.y + row) as usize * slice.width as usize + patch.x as usize;
+        slice.pixels[destination..destination + patch.width as usize]
+            .copy_from_slice(&patch.pixels[source..source + patch.width as usize]);
+    }
+    true
+}
+
 pub struct VoxelInkApp {
     egui_ctx: egui::Context,
     engine: EngineHandle,
@@ -503,6 +585,7 @@ impl VoxelInkApp {
 
     fn process_engine_events(&mut self, ctx: &egui::Context) {
         let mut exhausted_budget = true;
+        let mut slice_texture_uploads = PendingSliceTextureUploads::default();
         for _ in 0..MAX_ENGINE_EVENTS_PER_FRAME {
             let Some(event) = self.engine.try_event() else {
                 exhausted_budget = false;
@@ -587,7 +670,7 @@ impl VoxelInkApp {
                     for view in self.slice_views.values_mut() {
                         view.reset();
                     }
-                    self.replace_slices(ctx, slices);
+                    self.replace_slices(slices, &mut slice_texture_uploads);
                     self.preview_notice = None;
                     self.bridge_notice = None;
                     self.mesh_preview_failed = false;
@@ -598,6 +681,7 @@ impl VoxelInkApp {
                     self.summary = None;
                     self.slices.clear();
                     self.textures.clear();
+                    slice_texture_uploads.clear();
                     self.slice_revision = 0;
                     self.slice_preview_generation = 0;
                     self.brush_preview_generation = 0;
@@ -658,7 +742,7 @@ impl VoxelInkApp {
                     self.brush_preview_voxels.clear();
                     self.brush_preview_kind = None;
                     self.refresh_scene_brush_preview(epoch, revision);
-                    self.replace_slices(ctx, slices);
+                    self.replace_slices(slices, &mut slice_texture_uploads);
                 }
                 EngineEvent::SlicePatch {
                     epoch,
@@ -678,7 +762,9 @@ impl VoxelInkApp {
                         self.slice_preview_generation = 0;
                     }
                     self.slice_preview_generation = preview_generation;
-                    self.apply_slice_patch(ctx, patch);
+                    if let Some(region) = self.apply_slice_patch(&patch) {
+                        slice_texture_uploads.patch(region);
+                    }
                 }
                 EngineEvent::BrushPreview {
                     epoch,
@@ -795,6 +881,7 @@ impl VoxelInkApp {
                 _ => {}
             }
         }
+        self.flush_slice_texture_uploads(ctx, slice_texture_uploads);
         if exhausted_budget {
             ctx.request_repaint();
         }
@@ -2047,13 +2134,6 @@ impl VoxelInkApp {
             0.0,
             splitter_color(&column_response),
         );
-        if row_response.dragged()
-            || column_response.dragged()
-            || row_response.has_focus()
-            || column_response.has_focus()
-        {
-            ui.ctx().request_repaint();
-        }
         grid
     }
 
@@ -2750,7 +2830,6 @@ impl VoxelInkApp {
             }
             VolumeViewMode::Fly if self.fly_captured => {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::None);
-                ui.ctx().request_repaint();
                 if !self.fly_primary_suppressed {
                     let (motion, movement, delta_seconds, speed_wheel) = ui.input(|input| {
                         let motion = input
@@ -3697,42 +3776,69 @@ impl VoxelInkApp {
         self.dialog = Some((purpose, receiver));
     }
 
-    fn replace_slices(&mut self, ctx: &egui::Context, slices: Vec<SliceImage>) {
+    fn replace_slices(
+        &mut self,
+        slices: Vec<SliceImage>,
+        uploads: &mut PendingSliceTextureUploads,
+    ) {
         for slice in slices {
             let axis = slice.axis;
             self.slices.insert(axis, slice);
-            self.refresh_texture(ctx, axis);
+            uploads.full(axis);
         }
     }
 
-    fn apply_slice_patch(&mut self, ctx: &egui::Context, patch: SlicePatch) {
-        let Some(pixel_count) = (patch.width as usize).checked_mul(patch.height as usize) else {
+    fn apply_slice_patch(&mut self, patch: &SlicePatch) -> Option<SliceTextureRegion> {
+        let slice = self.slices.get_mut(&patch.axis)?;
+        apply_slice_patch_pixels(slice, patch).then(|| SliceTextureRegion::from(patch))
+    }
+
+    fn flush_slice_texture_uploads(
+        &mut self,
+        ctx: &egui::Context,
+        uploads: PendingSliceTextureUploads,
+    ) {
+        for (axis, upload) in uploads.axes {
+            match upload {
+                PendingSliceTextureUpload::Full => self.refresh_texture(ctx, axis),
+                PendingSliceTextureUpload::Patches(regions) => {
+                    let can_patch_existing_texture = self
+                        .slices
+                        .get(&axis)
+                        .zip(self.textures.get(&axis))
+                        .is_some_and(|(slice, texture)| {
+                            texture.size() == [slice.width as usize, slice.height as usize]
+                        });
+                    if !can_patch_existing_texture {
+                        self.refresh_texture(ctx, axis);
+                        continue;
+                    }
+                    for region in regions {
+                        self.upload_slice_texture_region(region);
+                    }
+                }
+            }
+        }
+    }
+
+    fn upload_slice_texture_region(&mut self, region: SliceTextureRegion) {
+        let Some(pixel_count) = (region.width as usize).checked_mul(region.height as usize) else {
             return;
         };
+        let Some(slice) = self.slices.get(&region.axis) else {
+            return;
+        };
+        if slice.coordinate != region.coordinate
+            || region
+                .x
+                .checked_add(region.width)
+                .is_none_or(|right| right > slice.width)
+            || region
+                .y
+                .checked_add(region.height)
+                .is_none_or(|bottom| bottom > slice.height)
         {
-            let Some(slice) = self.slices.get_mut(&patch.axis) else {
-                return;
-            };
-            if slice.coordinate != patch.coordinate
-                || patch
-                    .x
-                    .checked_add(patch.width)
-                    .is_none_or(|right| right > slice.width)
-                || patch
-                    .y
-                    .checked_add(patch.height)
-                    .is_none_or(|bottom| bottom > slice.height)
-                || patch.pixels.len() != pixel_count
-            {
-                return;
-            }
-            for row in 0..patch.height {
-                let source = row as usize * patch.width as usize;
-                let destination =
-                    (patch.y + row) as usize * slice.width as usize + patch.x as usize;
-                slice.pixels[destination..destination + patch.width as usize]
-                    .copy_from_slice(&patch.pixels[source..source + patch.width as usize]);
-            }
+            return;
         }
         let filled = if self.forced_colors {
             Color32::WHITE
@@ -3751,20 +3857,20 @@ impl VoxelInkApp {
             ));
             return;
         }
-        pixels.extend(
-            patch
-                .pixels
-                .iter()
-                .map(|value| if *value == 0 { empty } else { filled }),
-        );
-        if let Some(texture) = self.textures.get_mut(&patch.axis) {
+        for row in 0..region.height {
+            let source = (region.y + row) as usize * slice.width as usize + region.x as usize;
+            pixels.extend(
+                slice.pixels[source..source + region.width as usize]
+                    .iter()
+                    .map(|value| if *value == 0 { empty } else { filled }),
+            );
+        }
+        if let Some(texture) = self.textures.get_mut(&region.axis) {
             texture.set_partial(
-                [patch.x as usize, patch.y as usize],
-                egui::ColorImage::new([patch.width as usize, patch.height as usize], pixels),
+                [region.x as usize, region.y as usize],
+                egui::ColorImage::new([region.width as usize, region.height as usize], pixels),
                 SLICE_TEXTURE_OPTIONS,
             );
-        } else {
-            self.refresh_texture(ctx, patch.axis);
         }
     }
 
@@ -3804,7 +3910,13 @@ impl VoxelInkApp {
         );
         let image = egui::ColorImage::new([slice.width as usize, slice.height as usize], pixels);
         if let Some(texture) = self.textures.get_mut(&axis) {
-            texture.set(image, SLICE_TEXTURE_OPTIONS);
+            if texture.size() == image.size {
+                // A full `set` makes egui-wgpu recreate the GPU texture. A
+                // same-sized full-region patch updates the existing allocation.
+                texture.set_partial([0, 0], image, SLICE_TEXTURE_OPTIONS);
+            } else {
+                texture.set(image, SLICE_TEXTURE_OPTIONS);
+            }
         } else {
             let texture = ctx.load_texture(
                 format!("voxel-slice-{axis:?}"),
@@ -4764,6 +4876,91 @@ fn suggested_save_name(summary: &DocumentSummary, purpose: DialogPurpose) -> Str
 mod tests {
     use super::*;
     use crate::brush::Ray;
+
+    #[test]
+    fn pending_full_slice_upload_dominates_same_frame_patches() {
+        let axial_patch = SliceTextureRegion {
+            axis: SliceAxis::Axial,
+            coordinate: 3,
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        };
+        let coronal_patch = SliceTextureRegion {
+            axis: SliceAxis::Coronal,
+            coordinate: 5,
+            x: 2,
+            y: 3,
+            width: 4,
+            height: 5,
+        };
+        let later_coronal_patch = SliceTextureRegion {
+            x: 7,
+            ..coronal_patch
+        };
+        let mut uploads = PendingSliceTextureUploads::default();
+
+        uploads.patch(axial_patch);
+        uploads.full(SliceAxis::Axial);
+        uploads.patch(axial_patch);
+        uploads.full(SliceAxis::Axial);
+        uploads.patch(coronal_patch);
+        uploads.patch(coronal_patch);
+        uploads.patch(later_coronal_patch);
+
+        assert!(matches!(
+            uploads.axes.get(&SliceAxis::Axial),
+            Some(PendingSliceTextureUpload::Full)
+        ));
+        let Some(PendingSliceTextureUpload::Patches(coronal_patches)) =
+            uploads.axes.get(&SliceAxis::Coronal)
+        else {
+            panic!("coronal patches should remain incremental");
+        };
+        assert_eq!(coronal_patches, &[coronal_patch, later_coronal_patch]);
+    }
+
+    #[test]
+    fn slice_patch_pixels_preserve_event_order_for_overlapping_regions() {
+        let mut slice = SliceImage {
+            axis: SliceAxis::Axial,
+            coordinate: 3,
+            width: 4,
+            height: 2,
+            pixels: vec![0; 8],
+        };
+        let first = SlicePatch {
+            axis: SliceAxis::Axial,
+            coordinate: 3,
+            x: 1,
+            y: 0,
+            width: 2,
+            height: 1,
+            pixels: vec![1, 1],
+        };
+        let second = SlicePatch {
+            axis: SliceAxis::Axial,
+            coordinate: 3,
+            x: 2,
+            y: 0,
+            width: 2,
+            height: 2,
+            pixels: vec![0, 1, 1, 1],
+        };
+
+        assert!(apply_slice_patch_pixels(&mut slice, &first));
+        assert!(apply_slice_patch_pixels(&mut slice, &second));
+        assert_eq!(slice.pixels, vec![0, 1, 0, 1, 0, 0, 1, 1]);
+
+        let before_invalid_patch = slice.pixels.clone();
+        let invalid = SlicePatch {
+            coordinate: 4,
+            ..first
+        };
+        assert!(!apply_slice_patch_pixels(&mut slice, &invalid));
+        assert_eq!(slice.pixels, before_invalid_patch);
+    }
 
     #[test]
     fn every_button_palette_changes_fill_without_changing_border_width() {

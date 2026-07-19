@@ -15,7 +15,6 @@ pub const MAX_MESH_BYTES: usize = 256 * 1024 * 1024;
 
 const HALO_WIDTH: u32 = 1;
 const MAX_FACE_CELLS: usize = CHUNK_SIZE as usize * CHUNK_SIZE as usize;
-const QUAD_RESERVE_BLOCK: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ChunkCoord {
@@ -96,6 +95,7 @@ pub struct ChunkInput {
     extent: [u32; 3],
     halo_dimensions: [u32; 3],
     occupancy: Vec<u8>,
+    has_occupied_core: bool,
 }
 
 impl ChunkInput {
@@ -140,6 +140,17 @@ impl ChunkInput {
             .map_err(|_| AppError::Allocation { bytes: halo_len })?;
         copied.resize(halo_len, 0);
 
+        let volume_width = dimensions[0] as usize;
+        let volume_height = dimensions[1] as usize;
+        let source_x_start = origin[0].saturating_sub(HALO_WIDTH) as usize;
+        let source_x_end =
+            (origin[0] as usize + extent[0] as usize + HALO_WIDTH as usize).min(volume_width);
+        let copied_row_width = source_x_end - source_x_start;
+        let destination_x = usize::from(origin[0] == 0);
+        let halo_width = halo_dimensions[0] as usize;
+        let halo_plane = halo_width * halo_dimensions[1] as usize;
+        let mut has_occupied_core = false;
+
         for local_z in 0..halo_dimensions[2] {
             cancellation.check()?;
             let global_z = i64::from(origin[2]) + i64::from(local_z) - i64::from(HALO_WIDTH);
@@ -159,21 +170,20 @@ impl ChunkInput {
                         "negative y coordinate escaped halo clipping".into(),
                     )
                 })?;
-                for local_x in 0..halo_dimensions[0] {
-                    let global_x =
-                        i64::from(origin[0]) + i64::from(local_x) - i64::from(HALO_WIDTH);
-                    if !(0..i64::from(dimensions[0])).contains(&global_x) {
-                        continue;
-                    }
-                    let global_x = usize::try_from(global_x).map_err(|_| {
-                        AppError::InvalidDimensions(
-                            "negative x coordinate escaped halo clipping".into(),
-                        )
-                    })?;
-                    let source = global_x
-                        + dimensions[0] as usize * (global_y + dimensions[1] as usize * global_z);
-                    let destination = halo_index(halo_dimensions, [local_x, local_y, local_z]);
-                    copied[destination] = occupancy[source];
+                let source = source_x_start + volume_width * (global_y + volume_height * global_z);
+                let destination =
+                    destination_x + halo_width * local_y as usize + halo_plane * local_z as usize;
+                copied[destination..destination + copied_row_width]
+                    .copy_from_slice(&occupancy[source..source + copied_row_width]);
+                if !has_occupied_core
+                    && (origin[1]..origin[1] + extent[1]).contains(&(global_y as u32))
+                    && (origin[2]..origin[2] + extent[2]).contains(&(global_z as u32))
+                {
+                    let core_source =
+                        origin[0] as usize + volume_width * (global_y + volume_height * global_z);
+                    has_occupied_core = occupancy[core_source..core_source + extent[0] as usize]
+                        .iter()
+                        .any(|&value| value != 0);
                 }
             }
         }
@@ -184,6 +194,7 @@ impl ChunkInput {
             extent,
             halo_dimensions,
             occupancy: copied,
+            has_occupied_core,
         })
     }
 
@@ -212,6 +223,7 @@ impl ChunkInput {
         self.occupancy.len()
     }
 
+    #[cfg(test)]
     fn occupied(&self, local: [i32; 3]) -> bool {
         debug_assert!(local[0] >= -1 && local[0] <= self.extent[0] as i32);
         debug_assert!(local[1] >= -1 && local[1] <= self.extent[1] as i32);
@@ -223,12 +235,6 @@ impl ChunkInput {
         let plane = width * self.halo_dimensions[1] as usize;
         self.occupancy[x + width * y + plane * z] != 0
     }
-}
-
-const fn halo_index(dimensions: [u32; 3], coordinate: [u32; 3]) -> usize {
-    coordinate[0] as usize
-        + dimensions[0] as usize
-            * (coordinate[1] as usize + dimensions[1] as usize * coordinate[2] as usize)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -485,6 +491,12 @@ pub fn mesh_chunk(
             input.coord.as_array()
         )));
     }
+    if !input.has_occupied_core {
+        return Ok(TaggedChunkMesh {
+            tag,
+            mesh: ChunkMesh::default(),
+        });
+    }
 
     let mut quads = Vec::new();
     quads
@@ -527,6 +539,7 @@ struct PlaneLayout {
     v_extent: usize,
     normal_extent: usize,
     plane: usize,
+    halo_strides: [usize; 3],
 }
 
 fn mesh_axis(
@@ -542,6 +555,12 @@ fn mesh_axis(
     let u_extent = input.extent[u_axis] as usize;
     let v_extent = input.extent[v_axis] as usize;
     let normal_extent = input.extent[normal_axis_index] as usize;
+    let halo_width = input.halo_dimensions[0] as usize;
+    let halo_strides = [
+        1,
+        halo_width,
+        halo_width * input.halo_dimensions[1] as usize,
+    ];
 
     for plane in 0..=normal_extent {
         cancellation.check()?;
@@ -554,6 +573,7 @@ fn mesh_axis(
             v_extent,
             normal_extent,
             plane,
+            halo_strides,
         };
         let active_mask = &mut mask[..u_extent * v_extent];
         fill_face_mask(input, layout, active_mask);
@@ -563,17 +583,16 @@ fn mesh_axis(
 }
 
 fn fill_face_mask(input: &ChunkInput, layout: PlaneLayout, mask: &mut [i8]) {
-    mask.fill(0);
+    let normal_stride = layout.halo_strides[layout.normal_axis_index];
+    let u_stride = layout.halo_strides[layout.u_axis];
+    let v_stride = layout.halo_strides[layout.v_axis];
     for v in 0..layout.v_extent {
         for u in 0..layout.u_extent {
-            let mut positive_voxel = [0_i32; 3];
-            positive_voxel[layout.normal_axis_index] = layout.plane as i32;
-            positive_voxel[layout.u_axis] = u as i32;
-            positive_voxel[layout.v_axis] = v as i32;
-            let mut negative_voxel = positive_voxel;
-            negative_voxel[layout.normal_axis_index] -= 1;
-            let occupied_negative = input.occupied(negative_voxel);
-            let occupied_positive = input.occupied(positive_voxel);
+            let negative_index = layout.plane * normal_stride
+                + (u + HALO_WIDTH as usize) * u_stride
+                + (v + HALO_WIDTH as usize) * v_stride;
+            let occupied_negative = input.occupancy[negative_index] != 0;
+            let occupied_positive = input.occupancy[negative_index + normal_stride] != 0;
 
             mask[v * layout.u_extent + u] = match (occupied_negative, occupied_positive) {
                 // A neighboring chunk owns a face when the occupied voxel is
@@ -663,28 +682,46 @@ fn quad_corner_occlusion(
     positive: bool,
 ) -> [u8; 4] {
     let mut levels = [0; 4];
+    let normal_offset =
+        (layout.plane + usize::from(positive)) * layout.halo_strides[layout.normal_axis_index];
+    let u_stride = layout.halo_strides[layout.u_axis];
+    let v_stride = layout.halo_strides[layout.v_axis];
     for (corner, [maximum_u, maximum_v]) in
         [[false, false], [true, false], [true, true], [false, true]]
             .into_iter()
             .enumerate()
     {
-        let mut outside = [0_i32; 3];
-        outside[layout.normal_axis_index] = layout.plane as i32 - i32::from(!positive);
-        outside[layout.u_axis] = (u + usize::from(maximum_u) * (width - 1)) as i32;
-        outside[layout.v_axis] = (v + usize::from(maximum_v) * (height - 1)) as i32;
-        let u_direction = if maximum_u { 1 } else { -1 };
-        let v_direction = if maximum_v { 1 } else { -1 };
-        let mut side_u = outside;
-        side_u[layout.u_axis] += u_direction;
-        let mut side_v = outside;
-        side_v[layout.v_axis] += v_direction;
-        let mut diagonal = side_u;
-        diagonal[layout.v_axis] += v_direction;
-        levels[corner] = corner_occlusion(input, side_u, side_v, diagonal);
+        let outside = normal_offset
+            + (u + 1 + usize::from(maximum_u) * (width - 1)) * u_stride
+            + (v + 1 + usize::from(maximum_v) * (height - 1)) * v_stride;
+        let side_u = if maximum_u {
+            outside + u_stride
+        } else {
+            outside - u_stride
+        };
+        let side_v = if maximum_v {
+            outside + v_stride
+        } else {
+            outside - v_stride
+        };
+        let diagonal = match (maximum_u, maximum_v) {
+            (true, true) => outside + u_stride + v_stride,
+            (true, false) => outside + u_stride - v_stride,
+            (false, true) => outside - u_stride + v_stride,
+            (false, false) => outside - u_stride - v_stride,
+        };
+        let occupied_u = input.occupancy[side_u] != 0;
+        let occupied_v = input.occupancy[side_v] != 0;
+        levels[corner] = if occupied_u && occupied_v {
+            3
+        } else {
+            u8::from(occupied_u) + u8::from(occupied_v) + u8::from(input.occupancy[diagonal] != 0)
+        };
     }
     levels
 }
 
+#[cfg(test)]
 fn corner_occlusion(
     input: &ChunkInput,
     side_u: [i32; 3],
@@ -709,13 +746,13 @@ fn try_push_quad(quads: &mut Vec<CompactQuad>, quad: CompactQuad) -> Result<()> 
     if quads.len() == quads.capacity() {
         let desired_capacity = quads
             .len()
-            .checked_add(QUAD_RESERVE_BLOCK)
+            .checked_add(1)
             .ok_or(AppError::Allocation { bytes: usize::MAX })?;
         let bytes = desired_capacity
             .checked_mul(size_of::<CompactQuad>())
             .ok_or(AppError::Allocation { bytes: usize::MAX })?;
         quads
-            .try_reserve_exact(QUAD_RESERVE_BLOCK)
+            .try_reserve(1)
             .map_err(|_| AppError::Allocation { bytes })?;
     }
     quads.push(quad);
@@ -1214,6 +1251,18 @@ mod tests {
     }
 
     #[test]
+    fn empty_core_skips_neighbor_owned_halo_faces() {
+        let mut occupancy = vec![0; 64];
+        occupancy[31] = 1;
+        let right = mesh([64, 1, 1], &occupancy, ChunkCoord::new(1, 0, 0));
+        assert!(right.quads.is_empty());
+        assert_eq!(right.exposed_voxel_faces, 0);
+
+        let left = mesh([64, 1, 1], &occupancy, ChunkCoord::new(0, 0, 0));
+        assert_eq!(left.exposed_voxel_faces, 6);
+    }
+
+    #[test]
     fn greedy_mesher_collapses_solid_chunk_to_six_quads() {
         let mesh = mesh(
             [32, 32, 32],
@@ -1312,6 +1361,86 @@ mod tests {
         assert_eq!(level([false, false, true]), 1);
         assert_eq!(level([true, false, true]), 2);
         assert_eq!(level([true, true, false]), 3);
+    }
+
+    #[test]
+    fn direct_corner_occlusion_addressing_matches_coordinate_reference() {
+        let dimensions = [7, 6, 5];
+        let mut occupancy = vec![0; 7 * 6 * 5];
+        let mut state = 0x3141_5926_u32;
+        for voxel in &mut occupancy {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *voxel = u8::from(state & 3 == 0);
+        }
+        let input = input(dimensions, &occupancy, ChunkCoord::new(0, 0, 0));
+        let halo_width = input.halo_dimensions[0] as usize;
+        let halo_strides = [
+            1,
+            halo_width,
+            halo_width * input.halo_dimensions[1] as usize,
+        ];
+
+        for normal_axis in [FaceAxis::X, FaceAxis::Y, FaceAxis::Z] {
+            let normal_axis_index = normal_axis.index();
+            let [u_axis, v_axis] = normal_axis.tangent_axes();
+            let layout_base = PlaneLayout {
+                normal_axis,
+                normal_axis_index,
+                u_axis,
+                v_axis,
+                u_extent: input.extent[u_axis] as usize,
+                v_extent: input.extent[v_axis] as usize,
+                normal_extent: input.extent[normal_axis_index] as usize,
+                plane: 0,
+                halo_strides,
+            };
+            for plane in 0..=layout_base.normal_extent {
+                let layout = PlaneLayout {
+                    plane,
+                    ..layout_base
+                };
+                for v in 0..layout.v_extent {
+                    for u in 0..layout.u_extent {
+                        for height in 1..=layout.v_extent - v {
+                            for width in 1..=layout.u_extent - u {
+                                for positive in [false, true] {
+                                    let actual = quad_corner_occlusion(
+                                        &input, layout, u, v, width, height, positive,
+                                    );
+                                    let mut expected = [0; 4];
+                                    for (corner, [maximum_u, maximum_v]) in
+                                        [[false, false], [true, false], [true, true], [false, true]]
+                                            .into_iter()
+                                            .enumerate()
+                                    {
+                                        let mut outside = [0_i32; 3];
+                                        outside[normal_axis_index] =
+                                            plane as i32 - i32::from(!positive);
+                                        outside[u_axis] =
+                                            (u + usize::from(maximum_u) * (width - 1)) as i32;
+                                        outside[v_axis] =
+                                            (v + usize::from(maximum_v) * (height - 1)) as i32;
+                                        let u_direction = if maximum_u { 1 } else { -1 };
+                                        let v_direction = if maximum_v { 1 } else { -1 };
+                                        let mut side_u = outside;
+                                        side_u[u_axis] += u_direction;
+                                        let mut side_v = outside;
+                                        side_v[v_axis] += v_direction;
+                                        let mut diagonal = side_u;
+                                        diagonal[v_axis] += v_direction;
+                                        expected[corner] =
+                                            corner_occlusion(&input, side_u, side_v, diagonal);
+                                    }
+                                    assert_eq!(actual, expected);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

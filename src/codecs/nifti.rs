@@ -815,6 +815,24 @@ fn decode_payload(
     occupancy
         .try_reserve_exact(voxel_count)
         .map_err(|_| AppError::Allocation { bytes: voxel_count })?;
+
+    let byte_scaling_is_identity =
+        header.scale_slope == 0.0 || (header.scale_slope == 1.0 && header.scale_intercept == 0.0);
+    if matches!(header.scalar, ScalarType::Uint8 | ScalarType::Int8) && byte_scaling_is_identity {
+        occupancy.resize(voxel_count, 0);
+        let mut normalized_non_binary = false;
+        for chunk in occupancy.chunks_mut(IO_CHUNK_SIZE) {
+            read_exact_limited(reader, consumed, chunk, "voxel payload", cancel)?;
+            for value in chunk {
+                if *value > 1 {
+                    normalized_non_binary = true;
+                    *value = 1;
+                }
+            }
+        }
+        return Ok((occupancy, normalized_non_binary));
+    }
+
     let scalars_per_chunk = (IO_CHUNK_SIZE / header.scalar.bytes()).max(1);
     let mut buffer = [0_u8; IO_CHUNK_SIZE];
     let mut normalized_non_binary = false;
@@ -1536,6 +1554,73 @@ mod tests {
             },
             &CancellationToken::default(),
         )
+    }
+
+    fn byte_payload_reference(
+        payload: &[u8],
+        signed: bool,
+        slope: f64,
+        intercept: f64,
+    ) -> (Vec<u8>, bool) {
+        let mut occupancy = Vec::with_capacity(payload.len());
+        let mut normalized_non_binary = false;
+        for &byte in payload {
+            let raw = if signed {
+                f64::from(i8::from_ne_bytes([byte]))
+            } else {
+                f64::from(byte)
+            };
+            let effective = if slope == 0.0 {
+                raw
+            } else {
+                raw * slope + intercept
+            };
+            occupancy.push(u8::from(effective != 0.0));
+            normalized_non_binary |= effective != 0.0 && effective != 1.0;
+        }
+        (occupancy, normalized_non_binary)
+    }
+
+    #[test]
+    fn byte_payload_fast_path_matches_scalar_semantics() {
+        for (version, endian) in [
+            (NiftiVersion::One, Endian::Little),
+            (NiftiVersion::Two, Endian::Big),
+        ] {
+            for (datatype, signed, payload) in [
+                (2, false, [0, 1, 1, 0]),
+                (2, false, [0, 1, 2, u8::MAX]),
+                (256, true, [0, 1, 1, 0]),
+                (
+                    256,
+                    true,
+                    [0, 1, (-1_i8).cast_unsigned(), i8::MIN.cast_unsigned()],
+                ),
+            ] {
+                for (slope, intercept) in [(1.0, 0.0), (0.0, 37.0), (0.0, f64::NAN), (1.0, 1.0)] {
+                    let expected = byte_payload_reference(&payload, signed, slope, intercept);
+                    let decoded = decode(
+                        &fixture(
+                            version,
+                            endian,
+                            datatype,
+                            8,
+                            payload.len(),
+                            &payload,
+                            slope,
+                            intercept,
+                        ),
+                        version,
+                    )
+                    .expect("byte payload fixture should decode");
+                    assert_eq!(
+                        (decoded.occupancy, decoded.normalized_non_binary),
+                        expected,
+                        "{version:?} {endian:?} datatype={datatype} slope={slope} intercept={intercept}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

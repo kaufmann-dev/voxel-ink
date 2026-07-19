@@ -285,8 +285,15 @@ const FLY_CLIP_MARGIN_RADIUS_FACTOR: f32 = 0.01;
 // the sample scan's 50 mm volume is about 1.64 M voxels but only 92,160 faces.
 pub const MAX_VOXEL_HIGHLIGHT_VOXELS: usize = 2_000_000;
 pub const MAX_VOXEL_HIGHLIGHT_FACES: usize = 4_000_000;
+// Keep small chunk buffers through normal remesh variation, but release a
+// pathological peak once the replacement is substantially smaller.
+const CHUNK_BUFFER_REUSE_BASE_BYTES: u64 = 64 * 1024;
+const MAX_CHUNK_BUFFER_REUSE_RATIO: u64 = 4;
+// Preserve enough storage for common dense previews without pinning the 64 MiB hard maximum.
+const MAX_RETAINED_HIGHLIGHT_BUFFER_BYTES: u64 = 4 * 1024 * 1024;
 const HIGHLIGHT_ALLOCATION_CHUNK: usize = 65_536;
 const HIGHLIGHT_CANCELLATION_INTERVAL: usize = 1_024;
+const CLIP_PLANE_RELATIVE_TOLERANCE: f64 = 128.0 * f32::EPSILON as f64;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum VolumeViewMode {
@@ -564,7 +571,7 @@ fn try_push_highlight_face(
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, PartialEq, Pod, Zeroable)]
 struct Uniforms {
     view_projection: [[f32; 4]; 4],
     index_to_world: [[f32; 4]; 4],
@@ -1292,17 +1299,21 @@ impl CallbackTrait for VolumePaintCallback {
         let renderer = resources
             .get_mut::<GpuVolumeRenderer>()
             .expect("renderer was inserted above");
-        let mut state = self.scene.state.lock().expect("3D scene state poisoned");
-        for _ in 0..MAX_GPU_UPDATES_PER_FRAME {
-            let Some(update) = state.updates.pop_front() else {
-                break;
-            };
-            renderer.apply_update(device, update);
+        let (updates, uniforms, has_more_updates) = {
+            let mut state = self.scene.state.lock().expect("3D scene state poisoned");
+            let updates: [Option<SceneUpdate>; MAX_GPU_UPDATES_PER_FRAME] =
+                std::array::from_fn(|_| state.updates.pop_front());
+            let uniforms = scene_uniforms(&state);
+            (updates, uniforms, !state.updates.is_empty())
+        };
+        for update in updates.into_iter().flatten() {
+            renderer.apply_update(device, queue, update);
         }
-        let uniforms = scene_uniforms(&state);
-        let has_more_updates = !state.updates.is_empty();
-        drop(state);
-        queue.write_buffer(&renderer.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        renderer.refresh_chunk_visibility(&uniforms);
+        if renderer.uniforms != uniforms {
+            queue.write_buffer(&renderer.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+            renderer.uniforms = uniforms;
+        }
         if has_more_updates
             && let Some(context) = self
                 .scene
@@ -1328,10 +1339,17 @@ impl CallbackTrait for VolumePaintCallback {
         render_pass.set_pipeline(&renderer.pipeline);
         render_pass.set_bind_group(0, &renderer.bind_group, &[]);
         for chunk in renderer.chunks.values() {
+            if !chunk.visible {
+                continue;
+            }
             render_pass.set_vertex_buffer(0, chunk.buffer.slice(..));
             render_pass.draw(0..6, 0..chunk.instances);
         }
-        if let Some(highlight) = renderer.highlight.as_ref() {
+        if let Some(highlight) = renderer
+            .highlight
+            .as_ref()
+            .filter(|highlight| highlight.faces != 0)
+        {
             render_pass.set_pipeline(&renderer.highlight_pipeline);
             render_pass.set_bind_group(0, &renderer.bind_group, &[]);
             render_pass.set_vertex_buffer(0, highlight.buffer.slice(..));
@@ -1343,6 +1361,8 @@ impl CallbackTrait for VolumePaintCallback {
 struct GpuChunk {
     buffer: wgpu::Buffer,
     instances: u32,
+    visible: bool,
+    visibility_dirty: bool,
 }
 
 struct GpuHighlight {
@@ -1350,13 +1370,38 @@ struct GpuHighlight {
     faces: u32,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+struct ChunkVisibilityView {
+    view_projection: [[f32; 4]; 4],
+    index_to_world: [[f32; 4]; 4],
+    dimensions: [u32; 3],
+}
+
+impl ChunkVisibilityView {
+    fn new(uniforms: &Uniforms, dimensions: [u32; 3]) -> Self {
+        Self {
+            view_projection: uniforms.view_projection,
+            index_to_world: uniforms.index_to_world,
+            dimensions,
+        }
+    }
+
+    fn index_to_clip(self) -> Mat4 {
+        Mat4::from_cols_array_2d(&self.view_projection)
+            * Mat4::from_cols_array_2d(&self.index_to_world)
+    }
+}
+
 struct GpuVolumeRenderer {
     pipeline: wgpu::RenderPipeline,
     highlight_pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
+    uniforms: Uniforms,
     bind_group: wgpu::BindGroup,
     chunks: HashMap<ChunkCoord, GpuChunk>,
     chunk_generations: HashMap<ChunkCoord, u64>,
+    chunk_visibility_view: Option<ChunkVisibilityView>,
+    has_dirty_chunk_visibility: bool,
     highlight: Option<GpuHighlight>,
     epoch: u64,
     revision: u64,
@@ -1370,9 +1415,10 @@ impl GpuVolumeRenderer {
             label: Some("VoxelInk compact quad shader"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
         });
+        let uniforms = Uniforms::default();
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("VoxelInk volume uniforms"),
-            contents: bytemuck::bytes_of(&Uniforms::default()),
+            contents: bytemuck::bytes_of(&uniforms),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1507,9 +1553,12 @@ impl GpuVolumeRenderer {
             pipeline,
             highlight_pipeline,
             uniform_buffer,
+            uniforms,
             bind_group,
             chunks: HashMap::new(),
             chunk_generations: HashMap::new(),
+            chunk_visibility_view: None,
+            has_dirty_chunk_visibility: false,
             highlight: None,
             epoch: 0,
             revision: 0,
@@ -1518,7 +1567,7 @@ impl GpuVolumeRenderer {
         }
     }
 
-    fn apply_update(&mut self, device: &wgpu::Device, update: SceneUpdate) {
+    fn apply_update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, update: SceneUpdate) {
         match update {
             SceneUpdate::Reset {
                 epoch,
@@ -1528,6 +1577,8 @@ impl GpuVolumeRenderer {
             } => {
                 self.chunks.clear();
                 self.chunk_generations.clear();
+                self.chunk_visibility_view = None;
+                self.has_dirty_chunk_visibility = false;
                 self.highlight = None;
                 self.epoch = epoch;
                 self.revision = revision;
@@ -1536,7 +1587,7 @@ impl GpuVolumeRenderer {
             }
             SceneUpdate::Invalidate { revision } => {
                 self.revision = revision;
-                self.highlight = None;
+                self.clear_highlight();
             }
             SceneUpdate::Chunk { tag, quads, .. } => {
                 if tag.document_epoch != self.epoch || tag.revision != self.revision {
@@ -1555,16 +1606,32 @@ impl GpuVolumeRenderer {
                     self.chunks.remove(&tag.chunk);
                     return;
                 }
+                let contents = bytemuck::cast_slice(&quads);
+                if let Some(chunk) = self.chunks.get_mut(&tag.chunk)
+                    && can_reuse_chunk_buffer(chunk.buffer.size(), contents.len() as u64)
+                {
+                    queue.write_buffer(&chunk.buffer, 0, contents);
+                    chunk.instances = quads.len() as u32;
+                    return;
+                }
                 let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("VoxelInk chunk quad instances"),
-                    contents: bytemuck::cast_slice(&quads),
-                    usage: wgpu::BufferUsages::VERTEX,
+                    contents,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 });
+                let previous_visibility = self
+                    .chunks
+                    .get(&tag.chunk)
+                    .map(|chunk| (chunk.visible, chunk.visibility_dirty));
+                let (visible, visibility_dirty) = previous_visibility.unwrap_or((true, true));
+                self.has_dirty_chunk_visibility |= previous_visibility.is_none();
                 self.chunks.insert(
                     tag.chunk,
                     GpuChunk {
                         buffer,
                         instances: quads.len() as u32,
+                        visible,
+                        visibility_dirty,
                     },
                 );
             }
@@ -1583,10 +1650,18 @@ impl GpuVolumeRenderer {
                 {
                     return;
                 }
+                let contents = bytemuck::cast_slice(&faces);
+                if let Some(highlight) = self.highlight.as_mut()
+                    && highlight.buffer.size() >= contents.len() as u64
+                {
+                    queue.write_buffer(&highlight.buffer, 0, contents);
+                    highlight.faces = face_count;
+                    return;
+                }
                 let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("VoxelInk highlight boundary-face instances"),
-                    contents: bytemuck::cast_slice(&faces),
-                    usage: wgpu::BufferUsages::VERTEX,
+                    contents,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 });
                 self.highlight = Some(GpuHighlight {
                     buffer,
@@ -1594,10 +1669,107 @@ impl GpuVolumeRenderer {
                 });
             }
             SceneUpdate::ClearHighlight => {
-                self.highlight = None;
+                self.clear_highlight();
             }
         }
     }
+
+    fn clear_highlight(&mut self) {
+        if let Some(highlight) = self.highlight.as_mut()
+            && highlight.buffer.size() <= MAX_RETAINED_HIGHLIGHT_BUFFER_BYTES
+        {
+            highlight.faces = 0;
+        } else {
+            self.highlight = None;
+        }
+    }
+
+    fn refresh_chunk_visibility(&mut self, uniforms: &Uniforms) -> usize {
+        let view = ChunkVisibilityView::new(uniforms, self.dimensions);
+        let refresh_all = self.chunk_visibility_view != Some(view);
+        if !refresh_all && !self.has_dirty_chunk_visibility {
+            return 0;
+        }
+
+        let index_to_clip = view.index_to_clip();
+        let mut refreshed = 0;
+        for (coordinate, chunk) in &mut self.chunks {
+            if refresh_all || chunk.visibility_dirty {
+                chunk.visible =
+                    chunk_intersects_clip_volume(*coordinate, view.dimensions, index_to_clip);
+                chunk.visibility_dirty = false;
+                refreshed += 1;
+            }
+        }
+        self.chunk_visibility_view = Some(view);
+        self.has_dirty_chunk_visibility = false;
+        refreshed
+    }
+}
+
+fn can_reuse_chunk_buffer(existing_bytes: u64, replacement_bytes: u64) -> bool {
+    let reuse_ceiling = replacement_bytes
+        .saturating_mul(MAX_CHUNK_BUFFER_REUSE_RATIO)
+        .max(CHUNK_BUFFER_REUSE_BASE_BYTES);
+    existing_bytes >= replacement_bytes && existing_bytes <= reuse_ceiling
+}
+
+fn chunk_intersects_clip_volume(
+    coordinate: ChunkCoord,
+    dimensions: [u32; 3],
+    index_to_clip: Mat4,
+) -> bool {
+    let Some(origin) = coordinate.origin() else {
+        return true;
+    };
+    let Some(extent) = coordinate.extent(dimensions) else {
+        return true;
+    };
+    if !index_to_clip.is_finite() {
+        return true;
+    }
+
+    let minimum: [f64; 3] = std::array::from_fn(|axis| f64::from(origin[axis]) - 0.5);
+    let maximum: [f64; 3] =
+        std::array::from_fn(|axis| f64::from(origin[axis]) + f64::from(extent[axis]) - 0.5);
+    let columns = index_to_clip.to_cols_array_2d();
+    let rows: [[f64; 4]; 4] =
+        std::array::from_fn(|row| std::array::from_fn(|column| f64::from(columns[column][row])));
+    let add_rows = |left: usize, right: usize| {
+        std::array::from_fn(|column| rows[left][column] + rows[right][column])
+    };
+    let subtract_rows = |left: usize, right: usize| {
+        std::array::from_fn(|column| rows[left][column] - rows[right][column])
+    };
+    // WGPU's homogeneous clip volume is -w <= x,y <= w and 0 <= z <= w.
+    let planes = [
+        add_rows(3, 0),
+        subtract_rows(3, 0),
+        add_rows(3, 1),
+        subtract_rows(3, 1),
+        rows[2],
+        subtract_rows(3, 2),
+    ];
+
+    for plane in planes {
+        // A clip-plane distance is linear in index space, so its maximum over the
+        // transformed chunk occurs at one AABB support corner. Only a strictly
+        // negative maximum can prove the entire chunk is outside. The relative
+        // margin covers f32 matrix composition and shader arithmetic differences.
+        let mut maximum_distance = plane[3];
+        let mut magnitude = plane[3].abs();
+        for axis in 0..3 {
+            let at_minimum = plane[axis] * minimum[axis];
+            let at_maximum = plane[axis] * maximum[axis];
+            maximum_distance += at_minimum.max(at_maximum);
+            magnitude += at_minimum.abs().max(at_maximum.abs());
+        }
+        let tolerance = magnitude.max(1.0) * CLIP_PLANE_RELATIVE_TOLERANCE;
+        if maximum_distance < -tolerance {
+            return false;
+        }
+    }
+    true
 }
 
 fn scene_uniforms(state: &SceneState) -> Uniforms {
@@ -1864,6 +2036,138 @@ mod tests {
         assert!(transformed_normal.dot(transformed_tangent_y).abs() < 1.0e-6);
         assert!(transformed_normal.dot(transformed_tangent_z).abs() < 1.0e-6);
         assert!(transformed_normal.dot(transformed_axis_x) > 0.0);
+    }
+
+    #[test]
+    fn chunk_culling_uses_surface_extents_tolerance_and_wgpu_depth_planes() {
+        let dimensions = [64, 1, 64];
+        let x_chunk = ChunkCoord::new(1, 0, 0);
+        assert!(!chunk_intersects_clip_volume(
+            x_chunk,
+            dimensions,
+            Mat4::IDENTITY,
+        ));
+
+        // Chunk 1 spans x = 31.5..63.5, including voxel surface extents. Moving
+        // its maximum to x = -1 touches the left clip plane and remains visible.
+        assert!(chunk_intersects_clip_volume(
+            x_chunk,
+            dimensions,
+            Mat4::from_translation(Vec3::new(-64.5, 0.0, 0.0)),
+        ));
+        assert!(chunk_intersects_clip_volume(
+            x_chunk,
+            dimensions,
+            Mat4::from_translation(Vec3::new(-64.500_1, 0.0, 0.0)),
+        ));
+        assert!(!chunk_intersects_clip_volume(
+            x_chunk,
+            dimensions,
+            Mat4::from_translation(Vec3::new(-64.51, 0.0, 0.0)),
+        ));
+
+        let origin_chunk = ChunkCoord::new(0, 0, 0);
+        assert!(chunk_intersects_clip_volume(
+            origin_chunk,
+            dimensions,
+            Mat4::IDENTITY,
+        ));
+        assert!(!chunk_intersects_clip_volume(
+            origin_chunk,
+            dimensions,
+            Mat4::from_translation(Vec3::new(0.0, 0.0, -32.51)),
+        ));
+        assert!(!chunk_intersects_clip_volume(
+            origin_chunk,
+            dimensions,
+            Mat4::from_translation(Vec3::new(0.0, 0.0, 1.51)),
+        ));
+    }
+
+    #[test]
+    fn chunk_buffer_reuse_is_bounded_around_the_replacement_size() {
+        assert!(can_reuse_chunk_buffer(32, 16));
+        assert!(can_reuse_chunk_buffer(CHUNK_BUFFER_REUSE_BASE_BYTES, 16));
+        assert!(!can_reuse_chunk_buffer(
+            CHUNK_BUFFER_REUSE_BASE_BYTES + 1,
+            16
+        ));
+        assert!(can_reuse_chunk_buffer(4 * 128 * 1024, 128 * 1024));
+        assert!(!can_reuse_chunk_buffer(4 * 128 * 1024 + 1, 128 * 1024));
+        assert!(!can_reuse_chunk_buffer(16, 32));
+    }
+
+    #[test]
+    fn chunk_culling_keeps_non_finite_and_unrepresentable_bounds_visible() {
+        let mut non_finite = Mat4::IDENTITY.to_cols_array();
+        non_finite[0] = f32::NAN;
+        assert!(chunk_intersects_clip_volume(
+            ChunkCoord::new(1, 0, 0),
+            [64, 1, 1],
+            Mat4::from_cols_array(&non_finite),
+        ));
+        assert!(chunk_intersects_clip_volume(
+            ChunkCoord::new(u32::MAX, 0, 0),
+            [u32::MAX, 1, 1],
+            Mat4::IDENTITY,
+        ));
+    }
+
+    #[test]
+    fn chunk_culling_is_conservative_for_shear_reflection_and_camera_inside() {
+        let mut orbit = SceneState {
+            dimensions: [73, 41, 19],
+            affine: [
+                [-0.315, 0.014, 0.18, 106.0],
+                [-0.014, -0.315, -0.07, 289.0],
+                [0.03, -0.05, 0.8, -679.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            ..SceneState::default()
+        };
+        let uniforms = scene_uniforms(&orbit);
+        let index_to_clip = Mat4::from_cols_array_2d(&uniforms.view_projection)
+            * Mat4::from_cols_array_2d(&uniforms.index_to_world);
+        let grid = crate::mesh::chunk_grid(orbit.dimensions);
+        for z in 0..grid[2] {
+            for y in 0..grid[1] {
+                for x in 0..grid[0] {
+                    assert!(
+                        chunk_intersects_clip_volume(
+                            ChunkCoord::new(x, y, z),
+                            orbit.dimensions,
+                            index_to_clip,
+                        ),
+                        "orbit framing culled affine chunk {x},{y},{z}"
+                    );
+                }
+            }
+        }
+
+        let position = affine_mat4(orbit.affine).transform_point3(Vec3::splat(48.0));
+        let home = FlyHomeState {
+            position,
+            yaw: 0.0,
+            pitch: 0.0,
+            speed: 1.0,
+        };
+        orbit.dimensions = [96; 3];
+        orbit.view_mode = VolumeViewMode::Fly;
+        orbit.fly = Some(FlyCameraState {
+            position,
+            yaw: 0.0,
+            pitch: 0.0,
+            speed: 1.0,
+            home,
+        });
+        let uniforms = scene_uniforms(&orbit);
+        let index_to_clip = Mat4::from_cols_array_2d(&uniforms.view_projection)
+            * Mat4::from_cols_array_2d(&uniforms.index_to_world);
+        assert!(chunk_intersects_clip_volume(
+            ChunkCoord::new(1, 1, 1),
+            orbit.dimensions,
+            index_to_clip,
+        ));
     }
 
     #[test]
@@ -3003,6 +3307,7 @@ mod tests {
         ];
         renderer.apply_update(
             &device,
+            &queue,
             SceneUpdate::Reset {
                 epoch: 1,
                 revision: 1,
@@ -3012,6 +3317,7 @@ mod tests {
         );
         renderer.apply_update(
             &device,
+            &queue,
             SceneUpdate::Chunk {
                 tag: MeshJobTag {
                     document_epoch: 1,
@@ -3036,6 +3342,7 @@ mod tests {
         );
         renderer.apply_update(
             &device,
+            &queue,
             SceneUpdate::Highlight {
                 epoch: 1,
                 revision: 1,
@@ -3256,23 +3563,31 @@ mod tests {
         let info = adapter.get_info();
         assert_eq!(info.backend, wgpu::Backend::Vulkan);
         assert_eq!(info.device_type, wgpu::DeviceType::Cpu);
-        let (device, _queue) =
+        let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
                 .expect("software Vulkan device must initialize");
         let mut renderer = GpuVolumeRenderer::new(&device, wgpu::TextureFormat::Bgra8UnormSrgb);
         let affine = SceneState::default().affine;
+        let dimensions = [96, 32, 32];
+        let visibility_uniforms = scene_uniforms(&SceneState {
+            dimensions,
+            affine,
+            ..SceneState::default()
+        });
         let chunk = ChunkCoord::new(0, 0, 0);
         renderer.apply_update(
             &device,
+            &queue,
             SceneUpdate::Reset {
                 epoch: 4,
                 revision: 8,
-                dimensions: [32; 3],
+                dimensions,
                 affine,
             },
         );
         renderer.apply_update(
             &device,
+            &queue,
             SceneUpdate::Chunk {
                 tag: MeshJobTag {
                     document_epoch: 4,
@@ -3284,14 +3599,165 @@ mod tests {
                 quads: vec![
                     CompactQuad::new([0, 0, 0], 1, 1, crate::mesh::FaceAxis::X, true, [0; 4])
                         .expect("unit face is representable"),
+                    CompactQuad::new([1, 0, 0], 1, 1, crate::mesh::FaceAxis::X, true, [0; 4])
+                        .expect("unit face is representable"),
                 ],
                 priority: MeshUpdatePriority::Background,
             },
         );
         assert!(renderer.chunks.contains_key(&chunk));
+        let initial_chunk_buffer = renderer
+            .chunks
+            .get(&chunk)
+            .expect("the test chunk was uploaded")
+            .buffer
+            .clone();
+        assert_eq!(renderer.refresh_chunk_visibility(&visibility_uniforms), 1);
+        assert!(renderer.chunks.get(&chunk).unwrap().visible);
+        assert_eq!(renderer.refresh_chunk_visibility(&visibility_uniforms), 0);
 
         renderer.apply_update(
             &device,
+            &queue,
+            SceneUpdate::Chunk {
+                tag: MeshJobTag {
+                    document_epoch: 4,
+                    revision: 8,
+                    chunk_generation: 4,
+                    edit_generation: 1,
+                    chunk,
+                },
+                quads: vec![
+                    CompactQuad::new([2, 0, 0], 1, 1, crate::mesh::FaceAxis::Y, true, [0; 4])
+                        .expect("unit face is representable"),
+                ],
+                priority: MeshUpdatePriority::Live,
+            },
+        );
+        let reused_chunk = renderer
+            .chunks
+            .get(&chunk)
+            .expect("the smaller replacement remains resident");
+        assert_eq!(reused_chunk.buffer, initial_chunk_buffer);
+        assert_eq!(reused_chunk.instances, 1);
+        assert_eq!(renderer.refresh_chunk_visibility(&visibility_uniforms), 0);
+
+        renderer.apply_update(
+            &device,
+            &queue,
+            SceneUpdate::Chunk {
+                tag: MeshJobTag {
+                    document_epoch: 4,
+                    revision: 8,
+                    chunk_generation: 5,
+                    edit_generation: 2,
+                    chunk,
+                },
+                quads: (0..3)
+                    .map(|z| {
+                        CompactQuad::new([0, 0, z], 1, 1, crate::mesh::FaceAxis::Z, true, [0; 4])
+                            .expect("unit face is representable")
+                    })
+                    .collect(),
+                priority: MeshUpdatePriority::Live,
+            },
+        );
+        let grown_chunk = renderer
+            .chunks
+            .get(&chunk)
+            .expect("the larger replacement remains resident");
+        assert_ne!(grown_chunk.buffer, initial_chunk_buffer);
+        assert_eq!(grown_chunk.instances, 3);
+        assert_eq!(renderer.refresh_chunk_visibility(&visibility_uniforms), 0);
+
+        let representative_quad =
+            CompactQuad::new([0, 0, 0], 1, 1, crate::mesh::FaceAxis::Z, true, [0; 4])
+                .expect("unit face is representable");
+        let oversized_quad_count =
+            CHUNK_BUFFER_REUSE_BASE_BYTES as usize / size_of::<CompactQuad>() + 1;
+        renderer.apply_update(
+            &device,
+            &queue,
+            SceneUpdate::Chunk {
+                tag: MeshJobTag {
+                    document_epoch: 4,
+                    revision: 8,
+                    chunk_generation: 6,
+                    edit_generation: 3,
+                    chunk,
+                },
+                quads: vec![representative_quad; oversized_quad_count],
+                priority: MeshUpdatePriority::Live,
+            },
+        );
+        let oversized_chunk_buffer = renderer
+            .chunks
+            .get(&chunk)
+            .expect("the oversized replacement remains resident")
+            .buffer
+            .clone();
+        assert!(oversized_chunk_buffer.size() > CHUNK_BUFFER_REUSE_BASE_BYTES);
+
+        renderer.apply_update(
+            &device,
+            &queue,
+            SceneUpdate::Chunk {
+                tag: MeshJobTag {
+                    document_epoch: 4,
+                    revision: 8,
+                    chunk_generation: 7,
+                    edit_generation: 4,
+                    chunk,
+                },
+                quads: vec![representative_quad],
+                priority: MeshUpdatePriority::Live,
+            },
+        );
+        let shrunk_chunk = renderer
+            .chunks
+            .get(&chunk)
+            .expect("the tiny replacement remains resident");
+        assert_ne!(shrunk_chunk.buffer, oversized_chunk_buffer);
+        assert_eq!(shrunk_chunk.instances, 1);
+
+        let far_chunk = ChunkCoord::new(2, 0, 0);
+        renderer.apply_update(
+            &device,
+            &queue,
+            SceneUpdate::Chunk {
+                tag: MeshJobTag {
+                    document_epoch: 4,
+                    revision: 8,
+                    chunk_generation: 1,
+                    edit_generation: 0,
+                    chunk: far_chunk,
+                },
+                quads: vec![
+                    CompactQuad::new([64, 0, 0], 1, 1, crate::mesh::FaceAxis::X, true, [0; 4])
+                        .expect("unit face is representable"),
+                ],
+                priority: MeshUpdatePriority::Background,
+            },
+        );
+        assert_eq!(renderer.refresh_chunk_visibility(&visibility_uniforms), 1);
+        assert!(renderer.chunks.get(&far_chunk).unwrap().visible);
+
+        let identity_clip_uniforms = Uniforms::default();
+        assert_eq!(
+            renderer.refresh_chunk_visibility(&identity_clip_uniforms),
+            2
+        );
+        assert!(renderer.chunks.get(&chunk).unwrap().visible);
+        assert!(!renderer.chunks.get(&far_chunk).unwrap().visible);
+        assert_eq!(
+            renderer.refresh_chunk_visibility(&identity_clip_uniforms),
+            0
+        );
+        assert_eq!(renderer.refresh_chunk_visibility(&visibility_uniforms), 2);
+
+        renderer.apply_update(
+            &device,
+            &queue,
             SceneUpdate::Highlight {
                 epoch: 4,
                 revision: 8,
@@ -3308,14 +3774,44 @@ mod tests {
             renderer.highlight.as_ref().map(|highlight| highlight.faces),
             Some(10)
         );
+        let initial_highlight_buffer = renderer
+            .highlight
+            .as_ref()
+            .expect("the test highlight was uploaded")
+            .buffer
+            .clone();
         assert!(
             renderer.chunks.contains_key(&chunk),
             "transient highlight must not alter resident chunk meshes"
         );
 
-        renderer.apply_update(&device, SceneUpdate::Invalidate { revision: 9 });
+        renderer.apply_update(
+            &device,
+            &queue,
+            SceneUpdate::Highlight {
+                epoch: 4,
+                revision: 8,
+                faces: (0..5)
+                    .map(|x| HighlightFace::new([x, 1, 1], 0, true, VoxelHighlightKind::Paint))
+                    .collect(),
+            },
+        );
+        let reused_highlight = renderer
+            .highlight
+            .as_ref()
+            .expect("the smaller highlight remains resident");
+        assert_eq!(reused_highlight.buffer, initial_highlight_buffer);
+        assert_eq!(reused_highlight.faces, 5);
+
+        renderer.apply_update(&device, &queue, SceneUpdate::Invalidate { revision: 9 });
         assert_eq!(renderer.revision, 9);
-        assert!(renderer.highlight.is_none());
+        assert_eq!(renderer.refresh_chunk_visibility(&visibility_uniforms), 0);
+        let cleared_highlight = renderer
+            .highlight
+            .as_ref()
+            .expect("a small cleared highlight allocation is retained");
+        assert_eq!(cleared_highlight.buffer, initial_highlight_buffer);
+        assert_eq!(cleared_highlight.faces, 0);
         assert!(
             renderer.chunks.contains_key(&chunk),
             "the previous mesh must remain resident until its replacement is ready"
@@ -3323,11 +3819,12 @@ mod tests {
 
         renderer.apply_update(
             &device,
+            &queue,
             SceneUpdate::Chunk {
                 tag: MeshJobTag {
                     document_epoch: 4,
                     revision: 9,
-                    chunk_generation: 4,
+                    chunk_generation: 8,
                     edit_generation: 0,
                     chunk,
                 },
@@ -3341,11 +3838,12 @@ mod tests {
         );
         renderer.apply_update(
             &device,
+            &queue,
             SceneUpdate::Chunk {
                 tag: MeshJobTag {
                     document_epoch: 4,
                     revision: 9,
-                    chunk_generation: 3,
+                    chunk_generation: 5,
                     edit_generation: 0,
                     chunk,
                 },
@@ -3360,5 +3858,116 @@ mod tests {
             !renderer.chunks.contains_key(&chunk),
             "an older background upload must not resurrect a live empty replacement"
         );
+
+        let current_faces = (0..3)
+            .map(|y| HighlightFace::new([1, y, 1], 1, true, VoxelHighlightKind::BridgePath))
+            .collect::<Vec<_>>();
+        renderer.apply_update(
+            &device,
+            &queue,
+            SceneUpdate::Highlight {
+                epoch: 4,
+                revision: 9,
+                faces: current_faces.clone(),
+            },
+        );
+        let post_invalidation_highlight = renderer
+            .highlight
+            .as_ref()
+            .expect("the current highlight was uploaded");
+        assert_eq!(post_invalidation_highlight.buffer, initial_highlight_buffer);
+        assert_eq!(post_invalidation_highlight.faces, 3);
+
+        renderer.apply_update(&device, &queue, SceneUpdate::ClearHighlight);
+        let explicitly_cleared_highlight = renderer
+            .highlight
+            .as_ref()
+            .expect("a small explicitly cleared allocation is retained");
+        assert_eq!(
+            explicitly_cleared_highlight.buffer,
+            initial_highlight_buffer
+        );
+        assert_eq!(explicitly_cleared_highlight.faces, 0);
+
+        renderer.apply_update(
+            &device,
+            &queue,
+            SceneUpdate::Highlight {
+                epoch: 4,
+                revision: 9,
+                faces: current_faces,
+            },
+        );
+        assert_eq!(
+            renderer
+                .highlight
+                .as_ref()
+                .expect("the retained allocation was reused after clear")
+                .buffer,
+            initial_highlight_buffer
+        );
+
+        let oversized_face_count =
+            MAX_RETAINED_HIGHLIGHT_BUFFER_BYTES as usize / size_of::<HighlightFace>() + 1;
+        assert!(oversized_face_count <= MAX_VOXEL_HIGHLIGHT_FACES);
+        renderer.apply_update(
+            &device,
+            &queue,
+            SceneUpdate::Highlight {
+                epoch: 4,
+                revision: 9,
+                faces: vec![
+                    HighlightFace::new([1, 1, 1], 2, true, VoxelHighlightKind::Erase,);
+                    oversized_face_count
+                ],
+            },
+        );
+        let oversized_highlight_buffer = renderer
+            .highlight
+            .as_ref()
+            .expect("the oversized visible highlight was uploaded")
+            .buffer
+            .clone();
+        assert_ne!(oversized_highlight_buffer, initial_highlight_buffer);
+        assert!(oversized_highlight_buffer.size() > MAX_RETAINED_HIGHLIGHT_BUFFER_BYTES);
+
+        renderer.apply_update(&device, &queue, SceneUpdate::ClearHighlight);
+        assert!(
+            renderer.highlight.is_none(),
+            "an oversized cleared highlight allocation must be released"
+        );
+
+        renderer.apply_update(
+            &device,
+            &queue,
+            SceneUpdate::Highlight {
+                epoch: 4,
+                revision: 9,
+                faces: vec![HighlightFace::new(
+                    [1, 1, 1],
+                    2,
+                    true,
+                    VoxelHighlightKind::BridgeAnchor,
+                )],
+            },
+        );
+        assert!(renderer.highlight.is_some());
+        renderer.apply_update(
+            &device,
+            &queue,
+            SceneUpdate::Reset {
+                epoch: 5,
+                revision: 0,
+                dimensions: [16; 3],
+                affine,
+            },
+        );
+        assert!(
+            renderer.highlight.is_none(),
+            "a document reset must release retained highlight storage"
+        );
+        assert!(renderer.chunk_visibility_view.is_none());
+
+        let _ = queue.submit(std::iter::empty());
     }
 }

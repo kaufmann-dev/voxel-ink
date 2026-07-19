@@ -28,7 +28,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
 ```
 
-UI tests live in `tests/ui_kittest.rs`. Renderer validation includes a headless Vulkan path; CI runs it with Mesa Lavapipe and `VOXEL_INK_REQUIRE_SOFTWARE_VULKAN=1`. Performance acceptance tests are opt-in through `VOXEL_INK_RUN_ACCEPTANCE=1`, with an optional local dataset selected by `VOXEL_INK_CRANIOFACIAL_NIFTI`.
+UI tests live in `tests/ui_kittest.rs`. Renderer validation includes a headless Vulkan path; CI runs it with Mesa Lavapipe and `VOXEL_INK_REQUIRE_SOFTWARE_VULKAN=1`. Repeatable CPU microbenchmarks live in `benches/hot_paths.rs` and run with `cargo bench --locked --bench hot_paths -- --noplot`. Performance acceptance tests are opt-in through `VOXEL_INK_RUN_ACCEPTANCE=1`, with an optional local dataset selected by `VOXEL_INK_CRANIOFACIAL_NIFTI`.
 
 Run `shellcheck` for changed packaging scripts. Validate changed desktop metadata with `desktop-file-validate`, AppStream metadata with `appstreamcli validate --no-net`, and XML with `xmllint --noout`.
 
