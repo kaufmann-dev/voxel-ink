@@ -2655,7 +2655,7 @@ impl VoxelInkApp {
         let controls = match (view_mode, self.fly_captured, self.tool) {
             (VolumeViewMode::Fly, false, _) => "Click viewport to fly",
             (VolumeViewMode::Fly, true, _) => {
-                "WASD move · Space/Shift height · Ctrl boost · Wheel speed · -/+ brush · V outlines · Home reset · Esc release"
+                "WASD move · Space/Shift height · Ctrl boost · Wheel speed · Esc release"
             }
             (VolumeViewMode::Orbit, _, Tool::Inspect) => {
                 "Left / middle drag: rotate   Right drag: move   Wheel: zoom"
@@ -2669,7 +2669,7 @@ impl VoxelInkApp {
         };
         let compact_controls = match (view_mode, self.fly_captured, self.tool) {
             (VolumeViewMode::Fly, false, _) => "Click to fly",
-            (VolumeViewMode::Fly, true, _) => "WASD · Wheel · -/+ brush · V · Home · Esc",
+            (VolumeViewMode::Fly, true, _) => "WASD · Space/Shift · Ctrl · Wheel · Esc",
             (VolumeViewMode::Orbit, _, Tool::Inspect) => "Rotate · Move · Zoom",
             (VolumeViewMode::Orbit, _, Tool::Bridge) => "Bridge · Rotate · Move · Zoom",
             (VolumeViewMode::Orbit, _, Tool::Paint | Tool::Erase) => "Edit · Rotate · Move · Zoom",
