@@ -335,8 +335,8 @@ fn highlight_depth_stencil_state() -> wgpu::DepthStencilState {
         depth_compare: Some(wgpu::CompareFunction::LessEqual),
         stencil: wgpu::StencilState::default(),
         bias: wgpu::DepthBiasState {
-            constant: -2,
-            slope_scale: -0.5,
+            constant: -64,
+            slope_scale: 0.0,
             clamp: 0.0,
         },
     }
@@ -1923,6 +1923,12 @@ mod tests {
             highlight_depth_stencil_state().depth_write_enabled,
             Some(false)
         );
+        assert_eq!(
+            highlight_depth_stencil_state().depth_compare,
+            Some(wgpu::CompareFunction::LessEqual)
+        );
+        assert_eq!(highlight_depth_stencil_state().bias.constant, -64);
+        assert_eq!(highlight_depth_stencil_state().bias.slope_scale, 0.0);
         assert!(VOXEL_HIGHLIGHT_SHADER.contains("230.0 / 255.0"));
         assert!(!VOXEL_HIGHLIGHT_SHADER.contains("0.0, 0.82, 1.0"));
     }
@@ -2963,6 +2969,272 @@ mod tests {
             (ndc.x + 1.0) * 0.5 * viewport.x,
             (1.0 - ndc.y) * 0.5 * viewport.y,
         )
+    }
+
+    #[test]
+    fn headless_software_vulkan_keeps_close_coplanar_highlights_rectangular() {
+        if std::env::var_os("VOXEL_INK_REQUIRE_SOFTWARE_VULKAN").is_none() {
+            eprintln!("set VOXEL_INK_REQUIRE_SOFTWARE_VULKAN=1 to exercise Mesa Vulkan");
+            return;
+        }
+
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::VULKAN;
+        let instance = wgpu::Instance::new(descriptor);
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            force_fallback_adapter: true,
+            compatible_surface: None,
+        }))
+        .expect("Mesa software Vulkan adapter must be available");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("software Vulkan device must initialize");
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut renderer = GpuVolumeRenderer::new(&device, format);
+        // This is the sform from the craniofacial NIfTI that exposed the bug. Keeping
+        // the large index coordinates and anisotropic affine is important: the old,
+        // weak depth bias looked stable on a small identity-space test plane.
+        let affine = [
+            [-0.314_702_45, 0.013_688_04, 0.0, 106.237_23],
+            [-0.013_688_04, -0.314_702_45, 0.0, 289.382_54],
+            [0.0, 0.0, 0.8, -678.939],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        renderer.apply_update(
+            &device,
+            SceneUpdate::Reset {
+                epoch: 1,
+                revision: 1,
+                dimensions: [617, 560, 231],
+                affine,
+            },
+        );
+        renderer.apply_update(
+            &device,
+            SceneUpdate::Chunk {
+                tag: MeshJobTag {
+                    document_epoch: 1,
+                    revision: 1,
+                    chunk_generation: 1,
+                    edit_generation: 0,
+                    chunk: ChunkCoord::new(0, 0, 0),
+                },
+                quads: vec![
+                    CompactQuad::new(
+                        [288, 280, 116],
+                        32,
+                        32,
+                        crate::mesh::FaceAxis::Z,
+                        true,
+                        [3, 0, 3, 0],
+                    )
+                    .expect("the test surface fits one greedy quad"),
+                ],
+                priority: MeshUpdatePriority::Background,
+            },
+        );
+        renderer.apply_update(
+            &device,
+            SceneUpdate::Highlight {
+                epoch: 1,
+                revision: 1,
+                faces: (0..32)
+                    .flat_map(|y| {
+                        (0..32).map(move |x| {
+                            HighlightFace::new(
+                                [288 + x, 280 + y, 115],
+                                2,
+                                true,
+                                VoxelHighlightKind::Erase,
+                            )
+                        })
+                    })
+                    .collect(),
+            },
+        );
+
+        let affine = affine_mat4(affine);
+        let target = affine.transform_point3(Vec3::new(304.0, 296.0, 115.5));
+        let tangent = affine.transform_vector3(Vec3::Y).normalize();
+        let normal = affine.transform_vector3(Vec3::Z).normalize();
+        let eye = target - tangent * 5.0 + normal * 2.0;
+        let view = Mat4::look_at_rh(eye, target, normal);
+        let projection = Mat4::perspective_rh(FLY_FIELD_OF_VIEW_RADIANS, 1.0, 0.01, 1_000.0);
+        let uniforms = Uniforms {
+            view_projection: (projection * view).to_cols_array_2d(),
+            index_to_world: affine.to_cols_array_2d(),
+            world_to_view: view.to_cols_array_2d(),
+            index_normal_to_view: normal_matrix(view * affine).to_cols_array_2d(),
+            ..Uniforms::default()
+        };
+        queue.write_buffer(&renderer.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+
+        const WIDTH: u32 = 512;
+        const HEIGHT: u32 = 512;
+        let texture = |label, sample_count, usage| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: WIDTH,
+                    height: HEIGHT,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let multisampled_color = texture(
+            "close highlight multisampled color",
+            MSAA_SAMPLES,
+            wgpu::TextureUsages::RENDER_ATTACHMENT,
+        );
+        let resolved_color = texture(
+            "close highlight resolved color",
+            1,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("close highlight depth"),
+            size: wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: MSAA_SAMPLES,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth24Plus,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let multisampled_view = multisampled_color.create_view(&Default::default());
+        let resolved_view = resolved_color.create_view(&Default::default());
+        let depth_view = depth.create_view(&Default::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("close highlight encoder"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("close highlight pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &multisampled_view,
+                    depth_slice: None,
+                    resolve_target: Some(&resolved_view),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Discard,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&renderer.pipeline);
+            pass.set_bind_group(0, &renderer.bind_group, &[]);
+            for chunk in renderer.chunks.values() {
+                pass.set_vertex_buffer(0, chunk.buffer.slice(..));
+                pass.draw(0..6, 0..chunk.instances);
+            }
+            let highlight = renderer
+                .highlight
+                .as_ref()
+                .expect("the test highlight was uploaded");
+            pass.set_pipeline(&renderer.highlight_pipeline);
+            pass.set_vertex_buffer(0, highlight.buffer.slice(..));
+            pass.draw(0..6, 0..highlight.faces);
+        }
+
+        let bytes_per_row = WIDTH * size_of::<u32>() as u32;
+        let output = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("close highlight readback"),
+            size: u64::from(bytes_per_row * HEIGHT),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            resolved_color.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &output,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+        );
+        let submission = queue.submit([encoder.finish()]);
+        let slice = output.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(std::time::Duration::from_secs(10)),
+            })
+            .expect("software Vulkan render must complete");
+        receiver
+            .recv()
+            .expect("readback callback must run")
+            .expect("readback buffer must map");
+        let pixels = slice.get_mapped_range();
+        let mut surface_mask = vec![false; (WIDTH * HEIGHT) as usize];
+        let mut highlight_mask = vec![false; (WIDTH * HEIGHT) as usize];
+        for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+            let [red, green, blue, _] = <[u8; 4]>::try_from(pixel).unwrap();
+            surface_mask[index] = red.max(green).max(blue) >= 16;
+            highlight_mask[index] = red > green.saturating_add(8) && red > blue.saturating_add(8);
+        }
+        let mut surface_pixels = 0_usize;
+        let mut highlighted_pixels = 0_usize;
+        // Ignore the outer MSAA resolve fringe. Depth-fighting holes remain surface
+        // pixels and are still counted; only pixels near the black background drop out.
+        const EDGE_MARGIN: u32 = 3;
+        for y in EDGE_MARGIN..HEIGHT - EDGE_MARGIN {
+            for x in EDGE_MARGIN..WIDTH - EDGE_MARGIN {
+                let index = (y * WIDTH + x) as usize;
+                let inside_surface = [
+                    index,
+                    (y * WIDTH + x - EDGE_MARGIN) as usize,
+                    (y * WIDTH + x + EDGE_MARGIN) as usize,
+                    ((y - EDGE_MARGIN) * WIDTH + x) as usize,
+                    ((y + EDGE_MARGIN) * WIDTH + x) as usize,
+                ]
+                .into_iter()
+                .all(|sample| surface_mask[sample]);
+                if inside_surface {
+                    surface_pixels += 1;
+                    highlighted_pixels += usize::from(highlight_mask[index]);
+                }
+            }
+        }
+        assert!(
+            surface_pixels > 20_000,
+            "the close surface must cover the frame"
+        );
+        assert!(
+            highlighted_pixels * 1_000 >= surface_pixels * 985,
+            "coplanar highlight coverage was only {highlighted_pixels}/{surface_pixels} pixels"
+        );
     }
 
     #[test]

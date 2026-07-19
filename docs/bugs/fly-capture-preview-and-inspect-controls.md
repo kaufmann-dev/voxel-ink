@@ -15,7 +15,7 @@ Fly began accepting raw wheel events on the pointer-button release frame even th
 
 The Inspect regression used `add_enabled_ui`, which renders children in a disabled state, where the intended behavior was to omit brush-only controls entirely.
 
-Hover previews are computed asynchronously. When the Fly camera moved, the previously accepted world-space brush footprint stayed visible until its replacement arrived, so the old highlight was rendered from the new camera for a transient frame. This was separate from the persistent inside-occupancy picking defect documented in `fly-highlight-encloses-camera-inside-volume.md`.
+Hover previews are computed asynchronously. When the Fly camera moved, the previously accepted world-space brush footprint stayed visible until its replacement arrived, so the old highlight was rendered from the new camera for a transient frame. This was separate from both the inside-occupancy picking defect documented in `fly-highlight-encloses-camera-inside-volume.md` and the close-range coplanar rendering defect documented in `fly-highlight-depth-fighting.md`.
 
 ## Changes
 
