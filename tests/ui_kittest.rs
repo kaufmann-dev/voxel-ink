@@ -572,6 +572,15 @@ fn fly_selector_is_accessible_without_resizing_and_expand_stays_independent() {
 
     let orbit = harness.get_by_label("Orbit view");
     let fly = harness.get_by_label("Fly view");
+    let reset = harness.get_by_label("Reset view (Home)");
+    let expand = harness.get_by_label("Full screen 3D");
+    let selector_gap = fly.rect().left() - orbit.rect().right();
+    let reset_gap = reset.rect().left() - fly.rect().right();
+    let expand_gap = expand.rect().left() - reset.rect().right();
+    assert!(
+        (selector_gap - reset_gap).abs() < 0.1 && (selector_gap - expand_gap).abs() < 0.1,
+        "3D header button gaps differ: Orbit/Fly={selector_gap}, Fly/Reset={reset_gap}, Reset/Expand={expand_gap}"
+    );
     assert_eq!(orbit.accesskit_node().toggled(), Some(Toggled::True));
     assert_eq!(fly.accesskit_node().toggled(), Some(Toggled::False));
     assert_selected_view_button_text(&harness, "Orbit view", "Orbit");

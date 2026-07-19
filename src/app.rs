@@ -48,6 +48,7 @@ const REPAIR_PANEL_ABSOLUTE_MAX_WIDTH: f32 = 440.0;
 const WORKSPACE_GAP: f32 = 8.0;
 const CONTROL_MIN_HEIGHT: f32 = 30.0;
 const PANE_HEADER_CONTROL_INSET: f32 = 5.0;
+const PANE_HEADER_CONTROL_GAP: f32 = 5.0;
 const PANE_HEADER_HEIGHT: f32 = CONTROL_MIN_HEIGHT + 2.0 * PANE_HEADER_CONTROL_INSET;
 const PANE_CONTENT_INSET: f32 = 6.0;
 const WORKSPACE_MIN_PANE_WIDTH: f32 = 280.0;
@@ -2505,7 +2506,7 @@ impl VoxelInkApp {
         let reset_width = 58.0;
         let reset_rect = egui::Rect::from_min_size(
             egui::pos2(
-                maximize_rect.left() - reset_width - 5.0,
+                maximize_rect.left() - reset_width - PANE_HEADER_CONTROL_GAP,
                 header_controls.top(),
             ),
             egui::vec2(reset_width, header_controls.height()),
@@ -2526,17 +2527,16 @@ impl VoxelInkApp {
         if reset_response.clicked() {
             self.scene.reset_view();
         }
-        let selector_gap = 2.0;
         let fly_width = 42.0;
         let orbit_width = 58.0;
-        let selector_right = reset_rect.left() - 5.0;
+        let selector_right = reset_rect.left() - PANE_HEADER_CONTROL_GAP;
         let fly_rect = egui::Rect::from_min_size(
             egui::pos2(selector_right - fly_width, header_controls.top()),
             egui::vec2(fly_width, header_controls.height()),
         );
         let orbit_rect = egui::Rect::from_min_size(
             egui::pos2(
-                fly_rect.left() - selector_gap - orbit_width,
+                fly_rect.left() - PANE_HEADER_CONTROL_GAP - orbit_width,
                 header_controls.top(),
             ),
             egui::vec2(orbit_width, header_controls.height()),
