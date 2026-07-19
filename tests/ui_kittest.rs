@@ -822,6 +822,97 @@ fn fly_capture_is_first_click_safe_edits_with_erase_and_suppresses_shortcuts() {
 }
 
 #[test]
+fn fly_tool_shortcut_and_click_in_one_frame_use_the_new_tool() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("fly-same-frame-tool-switch.binvox");
+    let dimensions = [9, 9, 9];
+    let mut occupancy = vec![0; dimensions.into_iter().product::<u32>() as usize];
+    for z in 3..=5 {
+        for y in 3..=5 {
+            for x in 3..=5 {
+                occupancy[(x + dimensions[0] * (y + dimensions[1] * z)) as usize] = 1;
+            }
+        }
+    }
+    let initial_occupied = occupancy.iter().map(|&value| u64::from(value)).sum::<u64>();
+    write_binvox(&path, dimensions, &occupancy);
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "27 occupied");
+
+    harness.key_press(egui::Key::E);
+    harness.step();
+    assert_eq!(tool_toggled(&harness, "Erase (E)"), Some(Toggled::True));
+    harness.get_by_label("Fly view").click_accesskit();
+    harness.step();
+    let viewport_center = harness
+        .get_by_label("Interactive 3D volume editor")
+        .rect()
+        .center();
+    queue_same_frame_primary_click(&mut harness, viewport_center);
+    harness.step();
+    for _ in 0..8 {
+        thread::sleep(Duration::from_millis(2));
+        harness.step();
+    }
+    assert_eq!(current_occupied_count(&harness), Some(initial_occupied));
+
+    harness.key_press(egui::Key::B);
+    queue_same_frame_primary_click(&mut harness, viewport_center);
+    harness.step();
+    assert_eq!(tool_toggled(&harness, "Paint (B)"), Some(Toggled::True));
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let painted_occupied = loop {
+        let occupied = current_occupied_count(&harness);
+        if occupied.is_some_and(|count| count != initial_occupied) {
+            assert!(
+                occupied.unwrap() > initial_occupied,
+                "Paint was selected in the click frame, but the old Erase tool removed voxels"
+            );
+            break occupied.unwrap();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the same-frame Paint click did not edit the center-ray surface"
+        );
+        thread::sleep(Duration::from_millis(2));
+        harness.step();
+    };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while harness.get_by_label("Undo").accesskit_node().is_disabled() {
+        assert!(
+            Instant::now() < deadline,
+            "the same-frame Paint stroke did not finish"
+        );
+        thread::sleep(Duration::from_millis(2));
+        harness.step();
+    }
+
+    harness.key_press(egui::Key::E);
+    queue_same_frame_primary_click(&mut harness, viewport_center);
+    harness.step();
+    assert_eq!(tool_toggled(&harness, "Erase (E)"), Some(Toggled::True));
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let occupied = current_occupied_count(&harness);
+        if occupied.is_some_and(|count| count != painted_occupied) {
+            assert!(
+                occupied.unwrap() < painted_occupied,
+                "Erase was selected in the click frame, but the old Paint tool added voxels"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the same-frame Erase click did not edit the center-ray surface"
+        );
+        thread::sleep(Duration::from_millis(2));
+        harness.step();
+    }
+}
+
+#[test]
 fn fly_held_erase_stroke_updates_center_rays_and_completes() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("fly-held-erase.binvox");

@@ -821,11 +821,7 @@ impl VoxelInkApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if self.prompt.is_some()
-            || self.error_message.is_some()
-            || !self.busy.is_empty()
-            || self.dialog.is_some()
-        {
+        if self.shortcuts_blocked() {
             return;
         }
         if self.fly_captured && consume_fly_key(ctx, egui::Key::Escape) {
@@ -902,7 +898,6 @@ impl VoxelInkApp {
             self.clear_brush_preview();
             let _ = self.send_command(EngineCommand::Undo);
         }
-        self.handle_tool_shortcuts(ctx);
         if self.fly_captured {
             return;
         }
@@ -911,6 +906,13 @@ impl VoxelInkApp {
         {
             self.handle_cursor_keys(ctx);
         }
+    }
+
+    fn shortcuts_blocked(&self) -> bool {
+        self.prompt.is_some()
+            || self.error_message.is_some()
+            || !self.busy.is_empty()
+            || self.dialog.is_some()
     }
 
     fn handle_tool_shortcuts(&mut self, ctx: &egui::Context) {
@@ -3634,6 +3636,11 @@ impl eframe::App for VoxelInkApp {
             self.cancel_edit_and_release_fly(&ctx);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
+        }
+        // Tool selection must precede pane input so a shortcut and edit click
+        // delivered in one frame cannot start a stroke with the previous tool.
+        if !self.shortcuts_blocked() {
+            self.handle_tool_shortcuts(&ctx);
         }
         if self.dialog.is_some() {
             ui.disable();
