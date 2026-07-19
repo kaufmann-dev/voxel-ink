@@ -90,7 +90,7 @@ Use **File → Open** to load a supported volume. Common shortcuts are `Ctrl+O` 
 
 ## Editing basics
 
-Choose a tool from the toolbar or press `I` for Inspect, `B` for Paint, `E` for Erase, or `L` for Bridge. The slice views support wheel-based slice navigation, `Ctrl`+wheel zoom, drag-to-pan, and click/drag editing. Arrow keys plus Page Up/Page Down move through slices; Space or Enter applies Paint or Erase.
+Choose a tool from the toolbar or press `I` for Inspect, `B` for Paint, `E` for Erase, or `L` for Bridge. The slice views preview the exact Paint, Erase, or Bridge voxels in every intersected pane, and support wheel-based slice navigation, `Ctrl`+wheel zoom, drag-to-pan, and click/drag editing. Arrow keys plus Page Up/Page Down move through slices; Space or Enter applies Paint or Erase.
 
 With Paint, Erase, or Bridge selected, press `-` or `+` to change brush diameter, `R` or `Q` for Round or Square, `1` or `3` for One slice or 3D volume, and `U` to switch between voxel and millimetre sizing when physical units are available. Press `V` to toggle voxel outlines. A brush setting changed during an active stroke applies to the next stroke; the current stroke keeps the brush it started with.
 

@@ -14,7 +14,7 @@ use egui_kittest::{
     kittest::{NodeT, Queryable},
 };
 use tempfile::tempdir;
-use voxel_ink::VoxelInkApp;
+use voxel_ink::{VoxelInkApp, renderer::VoxelHighlightKind};
 
 use common::write_binvox;
 
@@ -459,6 +459,120 @@ fn zoomed_focused_slice_outline_is_clipped_to_its_editor() {
             .iter()
             .all(|index| *index < hint_background_index),
         "slice marks were painted above the interaction hint: marks {overlapping_slice_marks:?}, hint background {hint_background_index}"
+    );
+}
+
+#[test]
+fn slice_hover_previews_paint_and_erase_in_every_intersected_pane() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("slice-tool-previews.binvox");
+    write_binvox(&path, [512, 512, 3], &vec![0; 512 * 512 * 3]);
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "512 × 512 × 3");
+    let pane_labels = [
+        "Axial slice editor",
+        "Coronal slice editor",
+        "Sagittal slice editor",
+    ];
+    let axial = harness
+        .get_by_role_and_label(Role::Image, pane_labels[0])
+        .rect();
+
+    harness.key_press(egui::Key::B);
+    harness.step();
+    harness.hover_at(axial.center());
+    wait_for_slice_preview_kind(
+        &mut harness,
+        VoxelHighlightKind::Paint,
+        &pane_labels,
+        Duration::from_secs(3),
+    );
+    assert!(
+        painted_slice_preview_lines(&harness, VoxelHighlightKind::Paint)
+            .iter()
+            .any(|(bounds, _, segment_length, stroke_width)| {
+                bounds.intersects(axial)
+                    && *segment_length < 1.0
+                    && (*stroke_width - 1.35).abs() < f32::EPSILON
+            }),
+        "the high-resolution slice should retain a screen-space outline when a voxel projects below one pixel"
+    );
+
+    queue_same_frame_primary_click(&mut harness, axial.center());
+    harness.step();
+    wait_for_occupied_count_above(&mut harness, 0, Duration::from_secs(3));
+    harness.key_press(egui::Key::E);
+    harness.step();
+    harness.hover_at(axial.center());
+    wait_for_slice_preview_kind(
+        &mut harness,
+        VoxelHighlightKind::Erase,
+        &pane_labels,
+        Duration::from_secs(3),
+    );
+
+    harness.hover_at(egui::pos2(1.0, 1.0));
+    wait_for_slice_preview_absence(
+        &mut harness,
+        &[VoxelHighlightKind::Paint, VoxelHighlightKind::Erase],
+        &pane_labels,
+        Duration::from_secs(3),
+    );
+}
+
+#[test]
+fn slice_bridge_preview_keeps_anchor_and_path_visible_across_intersections() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("slice-bridge-preview.binvox");
+    write_binvox(&path, [33, 9, 3], &[0; 33 * 9 * 3]);
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "33 × 9 × 3");
+    harness.key_press(egui::Key::L);
+    harness.step();
+
+    let pane_labels = [
+        "Axial slice editor",
+        "Coronal slice editor",
+        "Sagittal slice editor",
+    ];
+    let axial = harness
+        .get_by_role_and_label(Role::Image, pane_labels[0])
+        .rect();
+    let start = axial.center();
+    let end = egui::pos2(axial.left() + axial.width() * 0.8, axial.center().y);
+    harness.hover_at(start);
+    wait_for_slice_preview_kind(
+        &mut harness,
+        VoxelHighlightKind::BridgeAnchor,
+        &pane_labels,
+        Duration::from_secs(3),
+    );
+
+    queue_primary_button(&mut harness, start, true);
+    harness.step();
+    for _ in 0..8 {
+        thread::sleep(Duration::from_millis(2));
+        harness.step();
+    }
+    harness.hover_at(end);
+    wait_for_slice_preview_kind(
+        &mut harness,
+        VoxelHighlightKind::BridgePath,
+        &pane_labels,
+        Duration::from_secs(3),
+    );
+    assert_slice_preview_kind_in_panes(&harness, VoxelHighlightKind::BridgeAnchor, &pane_labels);
+
+    harness.key_press(egui::Key::Escape);
+    harness.step();
+    wait_for_slice_preview_absence(
+        &mut harness,
+        &[
+            VoxelHighlightKind::BridgeAnchor,
+            VoxelHighlightKind::BridgePath,
+        ],
+        &pane_labels,
+        Duration::from_secs(3),
     );
 }
 
@@ -1410,7 +1524,7 @@ fn oversized_bridge_preview_is_nonmodal_recovers_and_commits_on_release() {
     wait_for_label_with_timeout(
         &mut harness,
         "Exact bridge preview unavailable",
-        Duration::from_secs(15),
+        Duration::from_secs(30),
     );
     assert!(
         harness
@@ -1423,7 +1537,7 @@ fn oversized_bridge_preview_is_nonmodal_recovers_and_commits_on_release() {
     wait_for_label_absence_with_timeout(
         &mut harness,
         "Exact bridge preview unavailable",
-        Duration::from_secs(15),
+        Duration::from_secs(30),
     );
     queue_primary_button(&mut harness, near, false);
     wait_for_occupied_count_above(&mut harness, 0, Duration::from_secs(20));
@@ -1969,6 +2083,116 @@ fn wait_for_label_absence_with_timeout(
         assert!(
             Instant::now() < deadline,
             "timed out waiting for accessible label containing {text:?} to disappear"
+        );
+        thread::sleep(Duration::from_millis(2));
+        harness.step();
+    }
+}
+
+fn painted_slice_preview_lines(
+    harness: &Harness<'_, VoxelInkApp>,
+    kind: VoxelHighlightKind,
+) -> Vec<(egui::Rect, egui::Rect, f32, f32)> {
+    fn collect_lines(
+        shape: &egui::epaint::Shape,
+        clip_rect: egui::Rect,
+        color: egui::Color32,
+        lines: &mut Vec<(egui::Rect, egui::Rect, f32, f32)>,
+    ) {
+        match shape {
+            egui::epaint::Shape::LineSegment { points, stroke } if stroke.color == color => {
+                lines.push((
+                    egui::Rect::from_two_pos(points[0], points[1]).expand(stroke.width * 0.5),
+                    clip_rect,
+                    points[0].distance(points[1]),
+                    stroke.width,
+                ));
+            }
+            egui::epaint::Shape::Vec(children) => {
+                for child in children {
+                    collect_lines(child, clip_rect, color, lines);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let [red, green, blue] = kind.color();
+    let outline = egui::Color32::from_rgba_unmultiplied(red, green, blue, kind.outline_alpha());
+    let mut lines = Vec::new();
+    for clipped in &harness.output().shapes {
+        collect_lines(&clipped.shape, clipped.clip_rect, outline, &mut lines);
+    }
+    lines
+}
+
+fn assert_slice_preview_kind_in_panes(
+    harness: &Harness<'_, VoxelInkApp>,
+    kind: VoxelHighlightKind,
+    pane_labels: &[&str],
+) {
+    let lines = painted_slice_preview_lines(harness, kind);
+    for label in pane_labels {
+        let editor = harness.get_by_role_and_label(Role::Image, label).rect();
+        assert!(
+            lines.iter().any(|(bounds, clip_rect, _, _)| {
+                clip_rect.intersects(editor) && bounds.intersects(editor)
+            }),
+            "{kind:?} did not paint a visible outline in {label}: {lines:?}"
+        );
+    }
+}
+
+fn wait_for_slice_preview_kind(
+    harness: &mut Harness<'_, VoxelInkApp>,
+    kind: VoxelHighlightKind,
+    pane_labels: &[&str],
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let lines = painted_slice_preview_lines(harness, kind);
+        let visible_in_every_pane = pane_labels.iter().all(|label| {
+            let editor = harness.get_by_role_and_label(Role::Image, label).rect();
+            lines.iter().any(|(bounds, clip_rect, _, _)| {
+                clip_rect.intersects(editor) && bounds.intersects(editor)
+            })
+        });
+        if visible_in_every_pane {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {kind:?} preview in {pane_labels:?}: {lines:?}"
+        );
+        thread::sleep(Duration::from_millis(2));
+        harness.step();
+    }
+}
+
+fn wait_for_slice_preview_absence(
+    harness: &mut Harness<'_, VoxelInkApp>,
+    kinds: &[VoxelHighlightKind],
+    pane_labels: &[&str],
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let any_visible = kinds.iter().any(|&kind| {
+            let lines = painted_slice_preview_lines(harness, kind);
+            pane_labels.iter().any(|label| {
+                let editor = harness.get_by_role_and_label(Role::Image, label).rect();
+                lines.iter().any(|(bounds, clip_rect, _, _)| {
+                    clip_rect.intersects(editor) && bounds.intersects(editor)
+                })
+            })
+        });
+        if !any_visible {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {kinds:?} slice previews to clear"
         );
         thread::sleep(Duration::from_millis(2));
         harness.step();

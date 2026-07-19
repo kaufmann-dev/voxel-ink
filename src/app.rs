@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -33,6 +33,7 @@ const TEAL: Color32 = Color32::from_rgb(36, 200, 219);
 const TEAL_HOVERED: Color32 = Color32::from_rgb(72, 218, 232);
 const TEAL_ACTIVE: Color32 = Color32::from_rgb(24, 176, 194);
 const YELLOW: Color32 = Color32::from_rgb(255, 193, 49);
+const SLICE_PREVIEW_OUTLINE_WIDTH: f32 = 1.35;
 const PAINT_GREEN: Color32 = Color32::from_rgb(0x42, 0xd6, 0x7c);
 const ERASE_RED: Color32 = Color32::from_rgb(0xff, 0x5b, 0x45);
 const BRIDGE_AMBER: Color32 = Color32::from_rgb(0xf4, 0xa6, 0x2a);
@@ -4549,10 +4550,58 @@ fn paint_crosshair(
     );
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct SlicePreviewCell {
+    u: u32,
+    v: u32,
+}
+
+impl SlicePreviewCell {
+    fn rect(self, image_rect: egui::Rect, width: u32, height: u32) -> egui::Rect {
+        egui::Rect::from_min_max(
+            egui::pos2(
+                image_rect.left() + self.u as f32 / width as f32 * image_rect.width(),
+                image_rect.top() + self.v as f32 / height as f32 * image_rect.height(),
+            ),
+            egui::pos2(
+                image_rect.left() + (self.u + 1) as f32 / width as f32 * image_rect.width(),
+                image_rect.top() + (self.v + 1) as f32 / height as f32 * image_rect.height(),
+            ),
+        )
+    }
+}
+
+fn slice_preview_cells(
+    axis: SliceAxis,
+    coordinate: u32,
+    width: u32,
+    height: u32,
+    voxels: &[[u32; 3]],
+) -> Vec<SlicePreviewCell> {
+    let normal_axis = axis.normal_axis();
+    let mut cells = voxels
+        .iter()
+        .filter_map(|&voxel| {
+            if voxel[normal_axis] != coordinate {
+                return None;
+            }
+            let [u, v] = match axis {
+                SliceAxis::Axial => [voxel[0], voxel[1]],
+                SliceAxis::Coronal => [voxel[0], voxel[2]],
+                SliceAxis::Sagittal => [voxel[1], voxel[2]],
+            };
+            (u < width && v < height).then_some(SlicePreviewCell { u, v })
+        })
+        .collect::<Vec<_>>();
+    cells.sort_unstable_by_key(|cell| (cell.v, cell.u));
+    cells.dedup();
+    cells
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_brush_preview(
     painter: &egui::Painter,
-    rect: egui::Rect,
+    image_rect: egui::Rect,
     axis: SliceAxis,
     coordinate: u32,
     width: u32,
@@ -4561,6 +4610,7 @@ fn paint_brush_preview(
     kind: VoxelHighlightKind,
     forced_colors: bool,
 ) {
+    let painter = painter.with_clip_rect(painter.clip_rect().intersect(image_rect));
     let color = if forced_colors {
         [u8::MAX; 3]
     } else {
@@ -4569,37 +4619,52 @@ fn paint_brush_preview(
     let fill = Color32::from_rgba_unmultiplied(color[0], color[1], color[2], kind.fill_alpha());
     let outline =
         Color32::from_rgba_unmultiplied(color[0], color[1], color[2], kind.outline_alpha());
-    let normal_axis = axis.normal_axis();
-    for &voxel in voxels {
-        if voxel[normal_axis] != coordinate {
-            continue;
-        }
-        let [u, v] = match axis {
-            SliceAxis::Axial => [voxel[0], voxel[1]],
-            SliceAxis::Coronal => [voxel[0], voxel[2]],
-            SliceAxis::Sagittal => [voxel[1], voxel[2]],
-        };
-        if u >= width || v >= height {
-            continue;
-        }
-        let voxel_rect = egui::Rect::from_min_max(
-            egui::pos2(
-                rect.left() + u as f32 / width as f32 * rect.width(),
-                rect.top() + v as f32 / height as f32 * rect.height(),
-            ),
-            egui::pos2(
-                rect.left() + (u + 1) as f32 / width as f32 * rect.width(),
-                rect.top() + (v + 1) as f32 / height as f32 * rect.height(),
-            ),
-        );
-        painter.rect_filled(voxel_rect, 0.0, fill);
-        painter.rect_stroke(
-            voxel_rect,
-            0.0,
-            egui::Stroke::new(1.0, outline),
-            egui::StrokeKind::Inside,
-        );
+    let cells = slice_preview_cells(axis, coordinate, width, height, voxels);
+    if cells.is_empty() {
+        return;
     }
+
+    let members = cells.iter().copied().collect::<HashSet<_>>();
+    let mut fill_mesh = egui::Mesh::default();
+    let mut outlines = Vec::with_capacity(cells.len().saturating_mul(4));
+    let stroke = egui::Stroke::new(SLICE_PREVIEW_OUTLINE_WIDTH, outline);
+    for cell in cells {
+        let cell_rect = cell.rect(image_rect, width, height);
+        fill_mesh.add_colored_rect(cell_rect, fill);
+
+        outlines.push(egui::Shape::line_segment(
+            [cell_rect.left_top(), cell_rect.right_top()],
+            stroke,
+        ));
+        outlines.push(egui::Shape::line_segment(
+            [cell_rect.left_top(), cell_rect.left_bottom()],
+            stroke,
+        ));
+        if cell.v + 1 >= height
+            || !members.contains(&SlicePreviewCell {
+                u: cell.u,
+                v: cell.v + 1,
+            })
+        {
+            outlines.push(egui::Shape::line_segment(
+                [cell_rect.left_bottom(), cell_rect.right_bottom()],
+                stroke,
+            ));
+        }
+        if cell.u + 1 >= width
+            || !members.contains(&SlicePreviewCell {
+                u: cell.u + 1,
+                v: cell.v,
+            })
+        {
+            outlines.push(egui::Shape::line_segment(
+                [cell_rect.right_top(), cell_rect.right_bottom()],
+                stroke,
+            ));
+        }
+    }
+    painter.add(fill_mesh);
+    painter.extend(outlines);
 }
 
 fn paint_fly_reticle(painter: &egui::Painter, content: egui::Rect, forced_colors: bool) {
@@ -4839,6 +4904,56 @@ mod tests {
                 [3, 7, 2],
             ),
             Some([15, 7, 5])
+        );
+    }
+
+    #[test]
+    fn slice_preview_projection_filters_planes_bounds_and_duplicates() {
+        let voxels = [
+            [2, 3, 4],
+            [2, 3, 4],
+            [5, 3, 4],
+            [2, 4, 4],
+            [2, 3, 5],
+            [20, 3, 4],
+        ];
+
+        assert_eq!(
+            slice_preview_cells(SliceAxis::Axial, 4, 10, 10, &voxels),
+            vec![
+                SlicePreviewCell { u: 2, v: 3 },
+                SlicePreviewCell { u: 5, v: 3 },
+                SlicePreviewCell { u: 2, v: 4 },
+            ]
+        );
+        assert_eq!(
+            slice_preview_cells(SliceAxis::Coronal, 3, 10, 10, &voxels),
+            vec![
+                SlicePreviewCell { u: 2, v: 4 },
+                SlicePreviewCell { u: 5, v: 4 },
+                SlicePreviewCell { u: 2, v: 5 },
+            ]
+        );
+        assert_eq!(
+            slice_preview_cells(SliceAxis::Sagittal, 2, 10, 10, &voxels),
+            vec![
+                SlicePreviewCell { u: 3, v: 4 },
+                SlicePreviewCell { u: 4, v: 4 },
+                SlicePreviewCell { u: 3, v: 5 },
+            ]
+        );
+    }
+
+    #[test]
+    fn slice_preview_cell_projection_tracks_the_zoomed_image_rect() {
+        let image_rect = egui::Rect::from_min_max(egui::pos2(-20.0, 10.0), egui::pos2(80.0, 60.0));
+        let projected = SlicePreviewCell { u: 2, v: 1 }.rect(image_rect, 10, 5);
+        let expected = egui::Rect::from_min_max(egui::pos2(0.0, 20.0), egui::pos2(10.0, 30.0));
+
+        assert!(
+            (projected.min - expected.min).length() < 0.001
+                && (projected.max - expected.max).length() < 0.001,
+            "projected preview cell {projected:?} did not match {expected:?}"
         );
     }
 
