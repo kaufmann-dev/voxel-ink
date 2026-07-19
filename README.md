@@ -92,6 +92,8 @@ Use **File → Open** to load a supported volume. Common shortcuts are `Ctrl+O` 
 
 Choose a tool from the toolbar or press `I` for Inspect, `B` for Paint, `E` for Erase, or `L` for Bridge. The slice views support wheel-based slice navigation, `Ctrl`+wheel zoom, drag-to-pan, and click/drag editing. Arrow keys plus Page Up/Page Down move through slices; Space or Enter applies Paint or Erase.
 
+Bridge adds one solid connection while you drag between two points. Very large bridges may be too expensive to preview exactly; in that case VoxelInk keeps the endpoints visible and shows a yellow notice instead of interrupting the drag. Shorten the bridge to restore the full preview, or release to let VoxelInk make a larger bounded attempt. If that final attempt is still too large, no voxels are changed and a nonmodal notice asks you to reduce the diameter or length.
+
 The 3D pane offers two navigation styles:
 
 - **Orbit** rotates around the volume, pans with the right mouse button, and zooms with the wheel.

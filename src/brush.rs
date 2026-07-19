@@ -206,7 +206,63 @@ pub(crate) fn brush_indices_cancellable(
     cancel: &CancellationToken,
     maximum_indices: Option<usize>,
 ) -> Result<Vec<u32>> {
-    cancel.check()?;
+    let mut examined = 0;
+    let mut output = Vec::new();
+    let mut traversal = BrushTraversal {
+        cancel,
+        examined: &mut examined,
+        maximum_examined: usize::MAX,
+    };
+    visit_brush_indices_cancellable(
+        geometry,
+        center,
+        normal_axis,
+        spec,
+        &mut traversal,
+        |index| {
+            if maximum_indices.is_some_and(|maximum| output.len() >= maximum) {
+                return Err(AppError::InvalidDimensions(format!(
+                    "brush footprint exceeds the {}-voxel preview safety limit",
+                    maximum_indices.expect("the limit was just matched")
+                )));
+            }
+            if output.len() == output.capacity() {
+                let additional = output.capacity().max(4_096);
+                output
+                    .try_reserve_exact(additional)
+                    .map_err(|_| AppError::Allocation {
+                        bytes: output
+                            .len()
+                            .saturating_add(additional)
+                            .saturating_mul(size_of::<u32>()),
+                    })?;
+            }
+            output.push(index);
+            Ok(())
+        },
+    )?;
+    Ok(output)
+}
+
+/// Streams a brush footprint without allocating an intermediate vector.
+///
+/// `examined` is shared by callers that walk several brush centers, so one
+/// work budget covers an entire path rather than restarting at every center.
+pub(crate) struct BrushTraversal<'a> {
+    pub cancel: &'a CancellationToken,
+    pub examined: &'a mut usize,
+    pub maximum_examined: usize,
+}
+
+pub(crate) fn visit_brush_indices_cancellable(
+    geometry: &VolumeGeometry,
+    center: [u32; 3],
+    normal_axis: usize,
+    spec: BrushSpec,
+    traversal: &mut BrushTraversal<'_>,
+    mut visit: impl FnMut(u32) -> Result<()>,
+) -> Result<()> {
+    traversal.cancel.check()?;
     if normal_axis >= 3 || linear_index(geometry.dimensions, center).is_none() {
         return Err(AppError::InvalidDimensions(
             "brush center or slice axis lies outside the volume".into(),
@@ -222,38 +278,21 @@ pub(crate) fn brush_indices_cancellable(
         let last = i64::from(geometry.dimensions[axis] - 1);
         (-bounds[axis].min(center), bounds[axis].min(last - center))
     });
-    let estimated = ranges
-        .into_iter()
-        .map(|(start, end)| usize::try_from(end - start + 1).unwrap_or(usize::MAX))
-        .try_fold(1_usize, usize::checked_mul)
-        .ok_or(AppError::Allocation { bytes: usize::MAX })?;
-    let initial_capacity = estimated
-        .min(maximum_indices.unwrap_or(usize::MAX))
-        .min(4_096);
-    let mut output = Vec::new();
-    output
-        .try_reserve_exact(initial_capacity)
-        .map_err(|_| AppError::Allocation {
-            bytes: initial_capacity.saturating_mul(size_of::<u32>()),
-        })?;
-
-    let mut examined = 0_usize;
     for z in ranges[2].0..=ranges[2].1 {
         for y in ranges[1].0..=ranges[1].1 {
             for x in ranges[0].0..=ranges[0].1 {
-                examined = examined.saturating_add(1);
-                if examined & 0x0fff == 0 {
-                    cancel.check()?;
+                if *traversal.examined >= traversal.maximum_examined {
+                    return Err(AppError::BridgeWorkLimit {
+                        limit: traversal.maximum_examined,
+                    });
+                }
+                *traversal.examined = traversal.examined.saturating_add(1);
+                if *traversal.examined & 0x0fff == 0 {
+                    traversal.cancel.check()?;
                 }
                 let delta = [x, y, z];
                 if !brush_contains_delta(geometry, delta, spec.shape, metric) {
                     continue;
-                }
-                if maximum_indices.is_some_and(|maximum| output.len() >= maximum) {
-                    return Err(AppError::InvalidDimensions(format!(
-                        "brush footprint exceeds the {}-voxel preview safety limit",
-                        maximum_indices.expect("the limit was just matched")
-                    )));
                 }
                 let voxel = [
                     i64::from(center[0]) + x,
@@ -265,26 +304,12 @@ pub(crate) fn brush_indices_cancellable(
                 });
                 let index = linear_index(geometry.dimensions, voxel)
                     .expect("brush ranges are clipped to the volume");
-                if output.len() == output.capacity() {
-                    let additional = output
-                        .capacity()
-                        .max(4_096)
-                        .min(estimated.saturating_sub(output.len()));
-                    output
-                        .try_reserve_exact(additional)
-                        .map_err(|_| AppError::Allocation {
-                            bytes: output
-                                .len()
-                                .saturating_add(additional)
-                                .saturating_mul(size_of::<u32>()),
-                        })?;
-                }
-                output.push(index);
+                visit(index)?;
             }
         }
     }
-    cancel.check()?;
-    Ok(output)
+    traversal.cancel.check()?;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]

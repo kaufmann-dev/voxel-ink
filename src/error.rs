@@ -24,6 +24,10 @@ pub enum AppError {
     Allocation { bytes: usize },
     #[error("edit needs {bytes} bytes of undo history; the limit is {limit} bytes")]
     UndoHistoryLimit { bytes: usize, limit: usize },
+    #[error("bridge footprint examination exceeds the {limit}-cell safety limit")]
+    BridgeWorkLimit { limit: usize },
+    #[error("bridge would change more than {limit} voxels")]
+    BridgeVoxelLimit { limit: usize },
     #[error("the affine transform is singular or non-finite")]
     InvalidAffine,
     #[error("the source file changed outside VoxelInk: {0}")]

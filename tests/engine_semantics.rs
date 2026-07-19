@@ -556,6 +556,7 @@ fn bridge_preview_and_release_share_one_undoable_voxel_footprint() {
             sample,
             spec,
             space: StrokeSpace::Slice(SliceAxis::Axial),
+            cancel: CancellationToken::default(),
         })
         .unwrap();
     let committed = wait_for_summary(&engine, epoch, 2);

@@ -1100,6 +1100,107 @@ fn fly_capture_releases_on_focus_loss_and_mode_switch() {
 }
 
 #[test]
+fn oversized_bridge_preview_is_nonmodal_recovers_and_commits_on_release() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("oversized-bridge-preview.binvox");
+    let dimensions = [2_000, 101, 1];
+    write_binvox(&path, dimensions, &vec![0; 2_000 * 101]);
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "0 occupied");
+    harness.key_press(egui::Key::L);
+    harness.step();
+    drag_slider_to_maximum(&mut harness, "Brush diameter in voxels");
+
+    let slice = harness
+        .get_by_role_and_label(Role::Image, "Axial slice editor")
+        .rect();
+    let start = egui::pos2(slice.left() + 1.0, slice.center().y);
+    let far = egui::pos2(slice.right() - 1.0, slice.center().y);
+    let near = egui::pos2(slice.left() + slice.width() * 0.2, slice.center().y);
+    queue_primary_button(&mut harness, start, true);
+    harness.step();
+    for _ in 0..8 {
+        thread::sleep(Duration::from_millis(2));
+        harness.step();
+    }
+
+    harness.hover_at(far);
+    wait_for_label_with_timeout(
+        &mut harness,
+        "Exact bridge preview unavailable",
+        Duration::from_secs(15),
+    );
+    assert!(
+        harness
+            .query_by_label_contains("VoxelInk could not complete the operation")
+            .is_none(),
+        "an expected preview limit must not open an error dialog"
+    );
+
+    harness.hover_at(near);
+    wait_for_label_absence_with_timeout(
+        &mut harness,
+        "Exact bridge preview unavailable",
+        Duration::from_secs(15),
+    );
+    queue_primary_button(&mut harness, near, false);
+    wait_for_occupied_count_above(&mut harness, 0, Duration::from_secs(20));
+    assert!(
+        harness
+            .query_by_label_contains("VoxelInk could not complete the operation")
+            .is_none(),
+        "a bounded bridge commit should finish without a modal error"
+    );
+}
+
+#[test]
+fn local_sinus_nifti_keeps_an_oversized_bridge_drag_nonmodal() {
+    let Some(source) = std::env::var_os("VOXEL_INK_CRANIOFACIAL_NIFTI") else {
+        return;
+    };
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("sinus-bridge-regression.nii.gz");
+    fs::copy(source, &path).unwrap();
+    let mut harness = app_harness(Some(path));
+    wait_for_label_with_timeout(&mut harness, "617 × 560 × 231", Duration::from_secs(15));
+    harness.key_press(egui::Key::L);
+    harness.step();
+    drag_slider_to_maximum(&mut harness, "Brush diameter in millimetres");
+
+    let slice = harness
+        .get_by_role_and_label(Role::Image, "Axial slice editor")
+        .rect();
+    let start = slice.left_top() + egui::vec2(2.0, 2.0);
+    let far = slice.right_bottom() - egui::vec2(2.0, 2.0);
+    queue_primary_button(&mut harness, start, true);
+    harness.step();
+    for _ in 0..8 {
+        thread::sleep(Duration::from_millis(2));
+        harness.step();
+    }
+    harness.hover_at(far);
+    wait_for_label_with_timeout(
+        &mut harness,
+        "Exact bridge preview unavailable",
+        Duration::from_secs(20),
+    );
+    assert!(
+        harness
+            .query_by_label_contains("VoxelInk could not complete the operation")
+            .is_none(),
+        "the supplied NIfTI must not turn an unfinished oversized bridge into a modal error"
+    );
+    harness.key_press(egui::Key::Escape);
+    harness.step();
+    assert!(
+        harness
+            .query_by_label_contains("Exact bridge preview unavailable")
+            .is_none(),
+        "Escape should cancel the oversized bridge gesture"
+    );
+}
+
+#[test]
 fn every_view_can_use_the_full_workspace_and_escape_restores_the_grid() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("maximize.binvox");
@@ -1547,7 +1648,15 @@ fn app_harness_with_size(
 }
 
 fn wait_for_label(harness: &mut Harness<'_, VoxelInkApp>, text: &str) {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    wait_for_label_with_timeout(harness, text, Duration::from_secs(3));
+}
+
+fn wait_for_label_with_timeout(
+    harness: &mut Harness<'_, VoxelInkApp>,
+    text: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
     loop {
         if harness.query_by_label_contains(text).is_some() {
             return;
@@ -1562,7 +1671,15 @@ fn wait_for_label(harness: &mut Harness<'_, VoxelInkApp>, text: &str) {
 }
 
 fn wait_for_label_absence(harness: &mut Harness<'_, VoxelInkApp>, text: &str) {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    wait_for_label_absence_with_timeout(harness, text, Duration::from_secs(3));
+}
+
+fn wait_for_label_absence_with_timeout(
+    harness: &mut Harness<'_, VoxelInkApp>,
+    text: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
     loop {
         if harness.query_by_label_contains(text).is_none() {
             return;
@@ -1598,6 +1715,25 @@ fn current_occupied_count(harness: &Harness<'_, VoxelInkApp>) -> Option<u64> {
             .find(|pair| pair[1] == "occupied")
             .and_then(|pair| pair[0].replace(',', "").parse().ok())
     })
+}
+
+fn wait_for_occupied_count_above(
+    harness: &mut Harness<'_, VoxelInkApp>,
+    minimum: u64,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if current_occupied_count(harness).is_some_and(|count| count > minimum) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for occupied count above {minimum}"
+        );
+        thread::sleep(Duration::from_millis(2));
+        harness.step();
+    }
 }
 
 fn root_viewport_commands<'h>(
@@ -1675,6 +1811,38 @@ fn drag_slider_to_minimum(harness: &mut Harness<'_, VoxelInkApp>, accessible_lab
     assert!(
         (selected - minimum).abs() <= f64::EPSILON,
         "the regression must first select the minimum {accessible_label}: {selected} != {minimum}"
+    );
+    selected
+}
+
+fn drag_slider_to_maximum(harness: &mut Harness<'_, VoxelInkApp>, accessible_label: &str) -> f64 {
+    harness
+        .get_by_role_and_label(Role::Slider, accessible_label)
+        .scroll_to_me();
+    for _ in 0..4 {
+        harness.step();
+    }
+    let slider = harness
+        .get_by_role_and_label(Role::Slider, accessible_label)
+        .rect();
+    let maximum_position = egui::pos2(slider.right() - 1.0, slider.center().y);
+    harness.hover_at(slider.center());
+    harness.step();
+    harness.drag_at(slider.center());
+    harness.step();
+    harness.hover_at(maximum_position);
+    harness.step();
+    harness.drop_at(maximum_position);
+    harness.step();
+
+    let node = harness
+        .get_by_role_and_label(Role::Slider, accessible_label)
+        .accesskit_node();
+    let maximum = node.max_numeric_value().unwrap();
+    let selected = node.numeric_value().unwrap();
+    assert!(
+        (selected - maximum).abs() <= f64::EPSILON,
+        "the regression must first select the maximum {accessible_label}: {selected} != {maximum}"
     );
     selected
 }

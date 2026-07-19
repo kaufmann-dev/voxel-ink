@@ -14,8 +14,8 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select_biased};
 use crate::{
     AppError, Result,
     brush::{
-        BrushDepth, BrushSpec, Ray, brush_indices_cancellable, ray_plane_voxel,
-        surface_edit_target_with_occupancy, walk_supercover,
+        BrushDepth, BrushSpec, BrushTraversal, Ray, brush_indices_cancellable, ray_plane_voxel,
+        surface_edit_target_with_occupancy, visit_brush_indices_cancellable, walk_supercover,
     },
     cancel::CancellationToken,
     io::{SaveMode, load_path, save_document},
@@ -35,6 +35,9 @@ const EVENT_CAPACITY: usize = 256;
 const MESH_EVENT_BACKLOG_LIMIT: usize = 8;
 const PATCH_TILE: u32 = 32;
 const MAX_PREVIEW_VOXELS: usize = 2_000_000;
+const MAX_BRIDGE_CHANGED_VOXELS: usize = 2_000_000;
+const MAX_BRIDGE_PREVIEW_WORK: usize = 16_000_000;
+const MAX_BRIDGE_COMMIT_WORK: usize = 64_000_000;
 const LIVE_FEEDBACK_GRACE: Duration = Duration::from_millis(10);
 
 pub type JobId = u64;
@@ -119,6 +122,7 @@ pub enum EngineCommand {
         sample: PointerSample,
         spec: BrushSpec,
         space: StrokeSpace,
+        cancel: CancellationToken,
     },
     EndStroke {
         edit_id: EditId,
@@ -206,6 +210,17 @@ pub enum EngineEvent {
         generation: u64,
         message: String,
     },
+    BrushPreviewLimited {
+        epoch: u64,
+        revision: u64,
+        generation: u64,
+        target: Option<[u32; 3]>,
+    },
+    BridgeCommitRejected {
+        epoch: u64,
+        edit_id: EditId,
+        message: String,
+    },
     Saved {
         job_id: JobId,
         mode: SaveMode,
@@ -254,6 +269,21 @@ pub struct EngineHandle {
 struct CancellableBrushPreview {
     request: BrushPreviewRequest,
     cancel: CancellationToken,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BridgeCommitRequest {
+    anchor: [u32; 3],
+    plane_normal: [f64; 3],
+    sample: PointerSample,
+    spec: BrushSpec,
+    space: StrokeSpace,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BridgeFootprintLimits {
+    maximum_examined: usize,
+    maximum_changed: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -748,7 +778,18 @@ impl EngineState {
                 sample,
                 spec,
                 space,
-            } => self.commit_bridge(edit_id, anchor, plane_normal, sample, spec, space),
+                cancel,
+            } => self.commit_bridge(
+                edit_id,
+                BridgeCommitRequest {
+                    anchor,
+                    plane_normal,
+                    sample,
+                    spec,
+                    space,
+                },
+                &cancel,
+            ),
             EngineCommand::EndStroke {
                 edit_id,
                 disposition,
@@ -1284,6 +1325,26 @@ impl EngineState {
                 }
             }
             Err(AppError::Cancelled) => {}
+            Err(AppError::BridgeWorkLimit { .. } | AppError::BridgeVoxelLimit { .. })
+                if matches!(pending.request, BrushPreviewRequest::Bridge { .. }) =>
+            {
+                let target = match pending.request {
+                    BrushPreviewRequest::Bridge {
+                        space,
+                        anchor,
+                        plane_normal,
+                        sample,
+                        ..
+                    } => bridge_endpoint(document, space, anchor, plane_normal, sample),
+                    BrushPreviewRequest::Brush { .. } => None,
+                };
+                self.emit(EngineEvent::BrushPreviewLimited {
+                    epoch: self.epoch,
+                    revision,
+                    generation,
+                    target,
+                });
+            }
             Err(error) => self.emit(EngineEvent::BrushPreviewFailed {
                 epoch: self.epoch,
                 revision,
@@ -1296,12 +1357,16 @@ impl EngineState {
     fn commit_bridge(
         &mut self,
         edit_id: EditId,
-        anchor: [u32; 3],
-        plane_normal: [f64; 3],
-        sample: PointerSample,
-        spec: BrushSpec,
-        space: StrokeSpace,
+        request: BridgeCommitRequest,
+        cancel: &CancellationToken,
     ) {
+        let BridgeCommitRequest {
+            anchor,
+            plane_normal,
+            sample,
+            spec,
+            space,
+        } = request;
         if self.stroke.is_some() || self.mesh_recovery_edit.is_some() {
             self.emit_error(
                 None,
@@ -1312,28 +1377,53 @@ impl EngineState {
             self.emit_edit_finished(edit_id, EditOutcome::Rejected);
             return;
         }
-        let (end, candidates) =
-            match self
-                .document
-                .as_ref()
-                .ok_or(AppError::NoDocument)
-                .and_then(|document| {
-                    let end = bridge_endpoint(document, space, anchor, plane_normal, sample)
-                        .ok_or_else(|| {
-                            AppError::InvalidDimensions(
-                                "bridge endpoint does not intersect the volume".into(),
-                            )
-                        })?;
-                    let candidates = bridge_footprint_indices(document, anchor, end, spec, space)?;
-                    Ok((end, candidates))
-                }) {
-                Ok(output) => output,
-                Err(error) => {
-                    self.emit_error(None, error);
-                    self.emit_edit_finished(edit_id, EditOutcome::Rejected);
-                    return;
-                }
-            };
+        let (end, candidates) = match self.document.as_ref().ok_or(AppError::NoDocument).and_then(
+            |document| {
+                let end = bridge_endpoint(document, space, anchor, plane_normal, sample)
+                    .ok_or_else(|| {
+                        AppError::InvalidDimensions(
+                            "bridge endpoint does not intersect the volume".into(),
+                        )
+                    })?;
+                let candidates = bridge_changed_indices_cancellable(
+                    document,
+                    anchor,
+                    end,
+                    spec,
+                    space,
+                    cancel,
+                    BridgeFootprintLimits {
+                        maximum_examined: MAX_BRIDGE_COMMIT_WORK,
+                        maximum_changed: MAX_BRIDGE_CHANGED_VOXELS,
+                    },
+                )?;
+                Ok((end, candidates))
+            },
+        ) {
+            Ok(output) => output,
+            Err(AppError::BridgeWorkLimit { .. } | AppError::BridgeVoxelLimit { .. }) => {
+                self.emit(EngineEvent::BridgeCommitRejected {
+                        epoch: self.epoch,
+                        edit_id,
+                        message: "Bridge is too large to apply safely; reduce the diameter or length. No voxels were changed.".into(),
+                    });
+                self.emit_edit_finished(edit_id, EditOutcome::Rejected);
+                return;
+            }
+            Err(AppError::Cancelled) => {
+                self.emit_edit_finished(edit_id, EditOutcome::Cancelled);
+                return;
+            }
+            Err(error) => {
+                self.emit_error(None, error);
+                self.emit_edit_finished(edit_id, EditOutcome::Rejected);
+                return;
+            }
+        };
+        if cancel.check().is_err() {
+            self.emit_edit_finished(edit_id, EditOutcome::Cancelled);
+            return;
+        }
         let Some(document) = self.document.as_mut() else {
             self.emit_edit_finished(edit_id, EditOutcome::Rejected);
             return;
@@ -2438,13 +2528,33 @@ fn calculate_brush_preview(
             ..
         } => {
             let target = bridge_endpoint(document, space, anchor, plane_normal, sample);
-            let candidates = match target {
-                Some(end) => {
-                    preview_path_footprint_indices(document, anchor, end, spec, space, cancel)?
-                }
+            let indices = match target {
+                Some(end) => bridge_changed_indices_cancellable(
+                    document,
+                    anchor,
+                    end,
+                    spec,
+                    space,
+                    cancel,
+                    BridgeFootprintLimits {
+                        maximum_examined: MAX_BRIDGE_PREVIEW_WORK,
+                        maximum_changed: MAX_BRIDGE_CHANGED_VOXELS,
+                    },
+                )?,
                 None => Vec::new(),
             };
-            (Tool::Bridge, target, candidates)
+            let dimensions = document.geometry().dimensions;
+            let voxels = indices
+                .into_iter()
+                .filter_map(|index| voxel_from_linear(dimensions, index))
+                .collect();
+            cancel.check()?;
+            return Ok(BrushPreviewComputation {
+                generation,
+                tool: Tool::Bridge,
+                target,
+                voxels,
+            });
         }
     };
     let voxels = changed_voxels_cancellable(
@@ -2498,78 +2608,14 @@ fn preview_footprint_indices(
     )
 }
 
-fn preview_path_footprint_indices(
+fn bridge_changed_indices_cancellable(
     document: &VolumeDocument,
     start: [u32; 3],
     end: [u32; 3],
     spec: BrushSpec,
     space: StrokeSpace,
     cancel: &CancellationToken,
-) -> Result<Vec<u32>> {
-    if linear_index(document.geometry().dimensions, start).is_none()
-        || linear_index(document.geometry().dimensions, end).is_none()
-    {
-        return Err(AppError::InvalidDimensions(
-            "brush path endpoint lies outside the volume".into(),
-        ));
-    }
-    let mut unique = HashSet::new();
-    let mut indices = Vec::new();
-    let mut candidate_visits = 0_usize;
-    walk_supercover(start, end, |center| {
-        cancel.check()?;
-        for index in preview_footprint_indices(document, center, spec, space, cancel)? {
-            if candidate_visits >= MAX_PREVIEW_VOXELS {
-                return Err(preview_voxel_limit_error());
-            }
-            candidate_visits += 1;
-            if unique.contains(&index) {
-                continue;
-            }
-            if unique.len() >= MAX_PREVIEW_VOXELS {
-                return Err(preview_voxel_limit_error());
-            }
-            if unique.len() == unique.capacity() {
-                unique
-                    .try_reserve(1_024.min(MAX_PREVIEW_VOXELS - unique.len()))
-                    .map_err(|_| AppError::Allocation {
-                        bytes: unique
-                            .len()
-                            .saturating_add(1_024)
-                            .saturating_mul(size_of::<u32>() + size_of::<usize>()),
-                    })?;
-            }
-            if indices.len() == indices.capacity() {
-                indices
-                    .try_reserve(1_024.min(MAX_PREVIEW_VOXELS - indices.len()))
-                    .map_err(|_| AppError::Allocation {
-                        bytes: indices
-                            .len()
-                            .saturating_add(1_024)
-                            .saturating_mul(size_of::<u32>()),
-                    })?;
-            }
-            unique.insert(index);
-            indices.push(index);
-        }
-        Ok(())
-    })?;
-    cancel.check()?;
-    Ok(indices)
-}
-
-fn preview_voxel_limit_error() -> AppError {
-    AppError::InvalidDimensions(format!(
-        "brush preview exceeds the {MAX_PREVIEW_VOXELS}-voxel safety limit; reduce the brush size or bridge length"
-    ))
-}
-
-fn bridge_footprint_indices(
-    document: &VolumeDocument,
-    start: [u32; 3],
-    end: [u32; 3],
-    spec: BrushSpec,
-    space: StrokeSpace,
+    limits: BridgeFootprintLimits,
 ) -> Result<Vec<u32>> {
     if linear_index(document.geometry().dimensions, start).is_none()
         || linear_index(document.geometry().dimensions, end).is_none()
@@ -2578,31 +2624,70 @@ fn bridge_footprint_indices(
             "bridge endpoint lies outside the volume".into(),
         ));
     }
+    cancel.check()?;
+    let (normal_axis, spec) = match space {
+        StrokeSpace::Slice(axis) => (axis.normal_axis(), spec),
+        StrokeSpace::Volume3D => (0, spec.with_depth(BrushDepth::Volume)),
+    };
+    let occupancy = document.view().occupancy;
     let mut unique = HashSet::new();
+    let mut indices = Vec::new();
+    let mut examined = 0;
+    let mut traversal = BrushTraversal {
+        cancel,
+        examined: &mut examined,
+        maximum_examined: limits.maximum_examined,
+    };
     walk_supercover(start, end, |center| {
-        for index in
-            footprint_indices(document, center, spec, space, &CancellationToken::default())?
-        {
-            if unique.contains(&index) {
-                continue;
-            }
-            if unique.len() == unique.capacity() {
-                unique
-                    .try_reserve(1_024)
-                    .map_err(|_| AppError::Allocation {
-                        bytes: unique
-                            .len()
-                            .saturating_add(1_024)
-                            .saturating_mul(size_of::<u32>() + size_of::<usize>()),
-                    })?;
-            }
-            unique.insert(index);
-        }
-        Ok(())
+        visit_brush_indices_cancellable(
+            document.geometry(),
+            center,
+            normal_axis,
+            spec,
+            &mut traversal,
+            |index| {
+                if occupancy.get(index as usize).copied() == Some(1) || unique.contains(&index) {
+                    return Ok(());
+                }
+                if unique.len() >= limits.maximum_changed {
+                    return Err(AppError::BridgeVoxelLimit {
+                        limit: limits.maximum_changed,
+                    });
+                }
+                if unique.len() == unique.capacity() {
+                    let additional = 4_096.min(limits.maximum_changed - unique.len());
+                    unique
+                        .try_reserve(additional)
+                        .map_err(|_| AppError::Allocation {
+                            bytes: unique
+                                .len()
+                                .saturating_add(additional)
+                                .saturating_mul(size_of::<u32>() + size_of::<usize>()),
+                        })?;
+                    indices
+                        .try_reserve(additional)
+                        .map_err(|_| AppError::Allocation {
+                            bytes: indices
+                                .len()
+                                .saturating_add(additional)
+                                .saturating_mul(size_of::<u32>()),
+                        })?;
+                }
+                unique.insert(index);
+                indices.push(index);
+                Ok(())
+            },
+        )
     })?;
-    let mut indices = unique.into_iter().collect::<Vec<_>>();
+    cancel.check()?;
     indices.sort_unstable();
     Ok(indices)
+}
+
+fn preview_voxel_limit_error() -> AppError {
+    AppError::InvalidDimensions(format!(
+        "brush preview exceeds the {MAX_PREVIEW_VOXELS}-voxel safety limit; reduce the brush size or bridge length"
+    ))
 }
 
 fn changed_voxels_cancellable(
@@ -3101,6 +3186,265 @@ mod tests {
             } if message.contains("2000000")
         ));
         assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn oversized_bridge_preview_emits_a_recoverable_limit_event() {
+        let dimensions = [201; 3];
+        let geometry = VolumeGeometry::new(
+            dimensions,
+            [
+                [0.1, 0.0, 0.0, 0.0],
+                [0.0, 0.1, 0.0, 0.0],
+                [0.0, 0.0, 0.1, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            SpatialUnits::Millimeter,
+        )
+        .unwrap();
+        let mut state = state_with_empty_geometry(geometry);
+        let (event_tx, event_rx) = bounded(2);
+        state.event_tx = event_tx;
+        state.compute_brush_preview(CancellableBrushPreview {
+            request: BrushPreviewRequest::Bridge {
+                generation: 100,
+                spec: BrushSpec {
+                    shape: BrushShape::Square,
+                    depth: BrushDepth::Volume,
+                    size: BrushSize::millimeters(50.0).unwrap(),
+                },
+                space: StrokeSpace::Slice(SliceAxis::Axial),
+                anchor: [100; 3],
+                plane_normal: [0.0, 0.0, 1.0],
+                sample: PointerSample::Slice {
+                    axis: SliceAxis::Axial,
+                    voxel: [100; 3],
+                },
+            },
+            cancel: CancellationToken::default(),
+        });
+
+        let event = event_rx.try_recv().unwrap();
+        assert!(matches!(
+            event,
+            EngineEvent::BrushPreviewLimited {
+                generation: 100,
+                target: Some([100, 100, 100]),
+                ..
+            }
+        ));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn bridge_work_limit_is_atomic_and_a_shorter_retry_recovers_exactly() {
+        let state = state_with_empty_document([12, 5, 1]);
+        let document = state.document.as_ref().unwrap();
+        let before = document.summary();
+        let spec = BrushSpec {
+            shape: BrushShape::Square,
+            depth: BrushDepth::Slice,
+            size: BrushSize::voxels(3).unwrap(),
+        };
+        let cancel = CancellationToken::default();
+
+        assert!(matches!(
+            bridge_changed_indices_cancellable(
+                document,
+                [1, 2, 0],
+                [10, 2, 0],
+                spec,
+                StrokeSpace::Slice(SliceAxis::Axial),
+                &cancel,
+                BridgeFootprintLimits {
+                    maximum_examined: 8,
+                    maximum_changed: 100,
+                },
+            ),
+            Err(AppError::BridgeWorkLimit { limit: 8 })
+        ));
+        assert_eq!(document.summary(), before);
+
+        let recovered = bridge_changed_indices_cancellable(
+            document,
+            [1, 2, 0],
+            [3, 2, 0],
+            spec,
+            StrokeSpace::Slice(SliceAxis::Axial),
+            &cancel,
+            BridgeFootprintLimits {
+                maximum_examined: 100,
+                maximum_changed: 100,
+            },
+        )
+        .unwrap();
+        let preview = calculate_brush_preview(
+            document,
+            BrushPreviewRequest::Bridge {
+                generation: 3,
+                spec,
+                space: StrokeSpace::Slice(SliceAxis::Axial),
+                anchor: [1, 2, 0],
+                plane_normal: [0.0, 0.0, 1.0],
+                sample: PointerSample::Slice {
+                    axis: SliceAxis::Axial,
+                    voxel: [3, 2, 0],
+                },
+            },
+            &cancel,
+        )
+        .unwrap();
+        let dimensions = document.geometry().dimensions;
+        assert_eq!(
+            preview.voxels,
+            recovered
+                .into_iter()
+                .filter_map(|index| voxel_from_linear(dimensions, index))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn bridge_collection_filters_occupied_voxels_before_the_change_limit() {
+        let mut state = state_with_empty_document([5, 1, 1]);
+        let document = state.document.as_mut().unwrap();
+        document.begin_stroke(1).unwrap();
+        document.apply_stroke_indices([0, 1, 2, 3]).unwrap();
+        document.finish_stroke();
+
+        let changes = bridge_changed_indices_cancellable(
+            document,
+            [0, 0, 0],
+            [4, 0, 0],
+            one_voxel_brush(),
+            StrokeSpace::Slice(SliceAxis::Axial),
+            &CancellationToken::default(),
+            BridgeFootprintLimits {
+                maximum_examined: 10,
+                maximum_changed: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(changes, vec![4]);
+    }
+
+    #[test]
+    fn cancelled_bridge_collection_does_not_change_the_document() {
+        let state = state_with_empty_document([20, 3, 1]);
+        let document = state.document.as_ref().unwrap();
+        let before = document.summary();
+        let cancel = CancellationToken::default();
+        cancel.cancel();
+
+        assert!(matches!(
+            bridge_changed_indices_cancellable(
+                document,
+                [0, 1, 0],
+                [19, 1, 0],
+                one_voxel_brush(),
+                StrokeSpace::Slice(SliceAxis::Axial),
+                &cancel,
+                BridgeFootprintLimits {
+                    maximum_examined: 100,
+                    maximum_changed: 100,
+                },
+            ),
+            Err(AppError::Cancelled)
+        ));
+        assert_eq!(document.summary(), before);
+    }
+
+    #[test]
+    fn oversized_bridge_commit_is_rejected_nonmodally_and_atomically() {
+        let dimensions = [201; 3];
+        let geometry = VolumeGeometry::new(
+            dimensions,
+            [
+                [0.1, 0.0, 0.0, 0.0],
+                [0.0, 0.1, 0.0, 0.0],
+                [0.0, 0.0, 0.1, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            SpatialUnits::Millimeter,
+        )
+        .unwrap();
+        let mut state = state_with_empty_geometry(geometry);
+        let before = state.document.as_ref().unwrap().summary();
+        let (event_tx, event_rx) = bounded(4);
+        state.event_tx = event_tx;
+
+        state.commit_bridge(
+            101,
+            BridgeCommitRequest {
+                anchor: [100; 3],
+                plane_normal: [0.0, 0.0, 1.0],
+                sample: PointerSample::Slice {
+                    axis: SliceAxis::Axial,
+                    voxel: [100; 3],
+                },
+                spec: BrushSpec {
+                    shape: BrushShape::Square,
+                    depth: BrushDepth::Volume,
+                    size: BrushSize::millimeters(50.0).unwrap(),
+                },
+                space: StrokeSpace::Slice(SliceAxis::Axial),
+            },
+            &CancellationToken::default(),
+        );
+
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            EngineEvent::BridgeCommitRejected {
+                edit_id: 101,
+                message,
+                ..
+            } if message.contains("No voxels were changed")
+        ));
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            EngineEvent::EditFinished {
+                edit_id: 101,
+                outcome: EditOutcome::Rejected,
+                ..
+            }
+        ));
+        assert_eq!(state.document.as_ref().unwrap().summary(), before);
+    }
+
+    #[test]
+    fn cancelled_bridge_commit_finishes_without_an_error_or_mutation() {
+        let mut state = state_with_empty_document([20, 1, 1]);
+        let before = state.document.as_ref().unwrap().summary();
+        let (event_tx, event_rx) = bounded(3);
+        state.event_tx = event_tx;
+        let cancel = CancellationToken::default();
+        cancel.cancel();
+
+        state.commit_bridge(
+            102,
+            BridgeCommitRequest {
+                anchor: [0, 0, 0],
+                plane_normal: [0.0, 0.0, 1.0],
+                sample: PointerSample::Slice {
+                    axis: SliceAxis::Axial,
+                    voxel: [19, 0, 0],
+                },
+                spec: one_voxel_brush(),
+                space: StrokeSpace::Slice(SliceAxis::Axial),
+            },
+            &cancel,
+        );
+
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            EngineEvent::EditFinished {
+                edit_id: 102,
+                outcome: EditOutcome::Cancelled,
+                ..
+            }
+        ));
+        assert!(event_rx.try_recv().is_err());
+        assert_eq!(state.document.as_ref().unwrap().summary(), before);
     }
 
     #[test]

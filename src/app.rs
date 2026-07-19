@@ -158,12 +158,13 @@ enum BridgeCommitPhase {
     AwaitingAcknowledgement,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 struct PendingBridgeCommit {
     edit_id: EditId,
     anchor: BridgeAnchor,
     release: DeferredBridgeRelease,
     phase: BridgeCommitPhase,
+    cancel: CancellationToken,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -301,6 +302,7 @@ pub struct VoxelInkApp {
     prompt: Option<Prompt>,
     error_message: Option<String>,
     preview_notice: Option<String>,
+    bridge_notice: Option<String>,
     mesh_preview_failed: bool,
     dialog: Option<(DialogPurpose, Receiver<Option<PathBuf>>)>,
     dialog_copy_request: Option<SaveRequest>,
@@ -395,6 +397,7 @@ impl VoxelInkApp {
             prompt: None,
             error_message: None,
             preview_notice: None,
+            bridge_notice: None,
             mesh_preview_failed: false,
             dialog: None,
             dialog_copy_request: None,
@@ -534,6 +537,7 @@ impl VoxelInkApp {
                     }
                     if self
                         .bridge_commit
+                        .as_ref()
                         .is_some_and(|commit| commit.edit_id == edit_id)
                     {
                         self.bridge_commit = None;
@@ -570,6 +574,7 @@ impl VoxelInkApp {
                     }
                     self.replace_slices(ctx, slices);
                     self.preview_notice = None;
+                    self.bridge_notice = None;
                     self.mesh_preview_failed = false;
                 }
                 EngineEvent::DocumentClosed { epoch } => {
@@ -596,6 +601,7 @@ impl VoxelInkApp {
                     }
                     self.scene.clear();
                     self.preview_notice = None;
+                    self.bridge_notice = None;
                     self.mesh_preview_failed = false;
                 }
                 EngineEvent::Summary { epoch, summary } if epoch == self.epoch => {
@@ -606,6 +612,7 @@ impl VoxelInkApp {
                     self.summary = Some(summary);
                     if revision_changed {
                         self.preview_notice = None;
+                        self.bridge_notice = None;
                         self.brush_preview_generation =
                             self.brush_preview_generation.saturating_add(1);
                         self.engine.cancel_preview();
@@ -687,6 +694,33 @@ impl VoxelInkApp {
                         .is_some_and(|summary| summary.revision == revision) =>
                 {
                     self.handle_brush_preview_failure(generation, message);
+                }
+                EngineEvent::BrushPreviewLimited {
+                    epoch,
+                    revision,
+                    generation,
+                    target,
+                } if epoch == self.epoch
+                    && generation == self.brush_preview_generation
+                    && self
+                        .summary
+                        .as_ref()
+                        .is_some_and(|summary| summary.revision == revision) =>
+                {
+                    self.handle_brush_preview_limited(epoch, revision, generation, target);
+                }
+                EngineEvent::BridgeCommitRejected {
+                    epoch,
+                    edit_id,
+                    message,
+                } if epoch == self.epoch
+                    && self
+                        .bridge_commit
+                        .as_ref()
+                        .is_some_and(|commit| commit.edit_id == edit_id) =>
+                {
+                    self.bridge_notice = Some(message);
+                    self.egui_ctx.request_repaint();
                 }
                 EngineEvent::Saved {
                     job_id,
@@ -1635,6 +1669,9 @@ impl VoxelInkApp {
                         ui.label("Open a NIfTI, BINVOX, or VOX volume to begin");
                     }
                     if let Some(notice) = &self.preview_notice {
+                        ui.colored_label(YELLOW, notice);
+                    }
+                    if let Some(notice) = &self.bridge_notice {
                         ui.colored_label(YELLOW, notice);
                     }
                     if self.mesh_preview_failed {
@@ -3048,6 +3085,9 @@ impl VoxelInkApp {
         if generation != self.brush_preview_generation {
             return;
         }
+        if tool == Tool::Bridge && self.bridge_anchor.is_some() {
+            self.bridge_notice = None;
+        }
         let Some(pending) = self
             .pending_preview
             .take()
@@ -3090,6 +3130,28 @@ impl VoxelInkApp {
             }
         }
         self.refresh_scene_brush_preview(epoch, revision);
+    }
+
+    fn handle_brush_preview_limited(
+        &mut self,
+        epoch: u64,
+        revision: u64,
+        generation: u64,
+        target: Option<[u32; 3]>,
+    ) {
+        if generation != self.brush_preview_generation || self.bridge_anchor.is_none() {
+            return;
+        }
+        self.last_preview_request = None;
+        self.brush_preview_kind = Some(VoxelHighlightKind::BridgePath);
+        self.brush_preview_target = target;
+        self.brush_preview_voxels = target.into_iter().collect();
+        self.bridge_notice = Some(
+            "Exact bridge preview unavailable; release to attempt safely, or shorten the bridge."
+                .into(),
+        );
+        self.refresh_scene_brush_preview(epoch, revision);
+        self.egui_ctx.request_repaint();
     }
 
     fn handle_brush_preview_failure(&mut self, generation: u64, message: String) {
@@ -3166,11 +3228,13 @@ impl VoxelInkApp {
             anchor,
             release,
             phase: BridgeCommitPhase::Pending,
+            cancel: CancellationToken::default(),
         });
         self.retry_pending_bridge_commit();
     }
 
     fn clear_brush_preview(&mut self) {
+        self.bridge_notice = None;
         if self.last_preview_request.is_none()
             && self.brush_preview_kind.is_none()
             && self.brush_preview_voxels.is_empty()
@@ -3188,16 +3252,18 @@ impl VoxelInkApp {
     }
 
     fn cancel_edit_interaction(&mut self) {
+        self.bridge_notice = None;
         self.brush_preview_generation = self.brush_preview_generation.saturating_add(1);
         self.engine.cancel_preview();
         self.last_preview_request = None;
         self.pending_preview = None;
         self.deferred_bridge_release = None;
         self.bridge_anchor = None;
-        if let Some(commit) = self.bridge_commit
-            && commit.phase == BridgeCommitPhase::Pending
-        {
-            self.bridge_commit = None;
+        if let Some(commit) = self.bridge_commit.as_ref() {
+            commit.cancel.cancel();
+            if commit.phase == BridgeCommitPhase::Pending {
+                self.bridge_commit = None;
+            }
         }
         if let Some(stroke) = self.stroke.as_mut()
             && stroke.phase != UiStrokePhase::AwaitingAcknowledgement
@@ -3338,7 +3404,9 @@ impl VoxelInkApp {
     fn retry_pending_bridge_commit(&mut self) {
         let Some(commit) = self
             .bridge_commit
+            .as_ref()
             .filter(|commit| commit.phase == BridgeCommitPhase::Pending)
+            .cloned()
         else {
             return;
         };
@@ -3349,6 +3417,7 @@ impl VoxelInkApp {
             sample: commit.release.sample,
             spec: commit.release.spec,
             space: commit.release.space,
+            cancel: commit.cancel.clone(),
         }) {
             Ok(()) => {
                 if let Some(queued) = self
