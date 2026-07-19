@@ -3633,7 +3633,7 @@ mod tests {
         assert!(state.mesh_recovery_edit.is_none());
         assert_eq!(
             state.mesh_budget.used_bytes(),
-            baseline_bytes.into_iter().sum()
+            baseline_bytes.into_iter().sum::<usize>()
         );
         for chunk in chunks {
             assert_eq!(state.mesh_budget.reserved_bytes(chunk), None);

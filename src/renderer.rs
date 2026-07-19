@@ -26,6 +26,8 @@ struct Uniforms {
     material_color: vec4<f32>,
     near_surface_depth: f32,
     inverse_scene_depth_span: f32,
+    fly_seams: u32,
+    _padding: f32,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -35,6 +37,8 @@ struct VertexOutput {
     @location(0) view_normal: vec3<f32>,
     @location(1) view_position: vec3<f32>,
     @location(2) corner_occlusion: f32,
+    @location(3) index_position: vec3<f32>,
+    @location(4) @interpolate(flat) face_axis: u32,
 };
 
 @vertex
@@ -101,7 +105,19 @@ fn vertex_main(
     );
     output.view_position = view_position.xyz;
     output.corner_occlusion = f32((packed >> (13u + corner * 2u)) & 3u);
+    output.index_position = index_position;
+    output.face_axis = axis;
     return output;
+}
+
+fn voxel_seam(coordinate: f32) -> f32 {
+    let coordinate_width = max(fwidth(coordinate), 1.0e-5);
+    let unit_coordinate = fract(coordinate + 0.5);
+    let boundary_distance = min(unit_coordinate, 1.0 - unit_coordinate);
+    let antialiased_line = 1.0 - smoothstep(0.0, coordinate_width * 0.85, boundary_distance);
+    let pixels_per_voxel = 1.0 / coordinate_width;
+    let subpixel_fade = smoothstep(0.75, 2.0, pixels_per_voxel);
+    return antialiased_line * subpixel_fade;
 }
 
 @fragment
@@ -136,7 +152,23 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let depth_factor = mix(1.0, 0.62, normalized_scene_depth);
     let voxel_ao_factor = mix(1.0, 0.76, clamp(input.corner_occlusion / 3.0, 0.0, 1.0));
     let lighting = base_lighting * depth_factor * surface_factor * voxel_ao_factor;
-    return vec4<f32>(uniforms.material_color.rgb * lighting, 1.0);
+    let lit_color = uniforms.material_color.rgb * lighting;
+    if (uniforms.fly_seams == 0u) {
+        return vec4<f32>(lit_color, 1.0);
+    }
+
+    var seam_coordinates = input.index_position.xy;
+    if (input.face_axis == 0u) {
+        seam_coordinates = input.index_position.yz;
+    } else if (input.face_axis == 1u) {
+        seam_coordinates = input.index_position.zx;
+    }
+    let seam_strength = max(
+        voxel_seam(seam_coordinates.x),
+        voxel_seam(seam_coordinates.y),
+    );
+    let seam_color = lit_color * 0.38;
+    return vec4<f32>(mix(lit_color, seam_color, seam_strength * 0.72), 1.0);
 }
 "#;
 
@@ -149,6 +181,8 @@ struct Uniforms {
     material_color: vec4<f32>,
     near_surface_depth: f32,
     inverse_scene_depth_span: f32,
+    fly_seams: u32,
+    _padding: f32,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -234,6 +268,18 @@ fn highlight_fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
 const MAX_GPU_UPDATES_PER_FRAME: usize = 4;
 pub const MSAA_SAMPLES: u32 = 4;
+const ORBIT_FIELD_OF_VIEW_RADIANS: f32 = 45_f32.to_radians();
+const FLY_FIELD_OF_VIEW_RADIANS: f32 = 70_f32.to_radians();
+const FLY_LOOK_SENSITIVITY: f32 = 0.0025;
+const MAX_FLY_PITCH: f32 = 1.5;
+const MAX_FLY_FRAME_DELTA_SECONDS: f32 = 0.1;
+const FLY_BOOST_MULTIPLIER: f32 = 4.0;
+const FLY_SPEED_SCROLL_SENSITIVITY: f32 = 0.002;
+const FLY_MIN_SPEED_RADIUS_FACTOR: f32 = 0.01;
+const FLY_INITIAL_SPEED_RADIUS_FACTOR: f32 = 0.5;
+const FLY_MAX_SPEED_RADIUS_FACTOR: f32 = 8.0;
+const FLY_CLIP_EPSILON_RADIUS_FACTOR: f32 = 1.0e-4;
+const FLY_CLIP_MARGIN_RADIUS_FACTOR: f32 = 0.01;
 // These independent caps keep CPU adjacency work and GPU boundary work bounded.
 // Four million 16-byte faces occupy 64 MB and invoke at most 24 million vertices;
 // the sample scan's 50 mm volume is about 1.64 M voxels but only 92,160 faces.
@@ -241,6 +287,38 @@ pub const MAX_VOXEL_HIGHLIGHT_VOXELS: usize = 2_000_000;
 pub const MAX_VOXEL_HIGHLIGHT_FACES: usize = 4_000_000;
 const HIGHLIGHT_ALLOCATION_CHUNK: usize = 65_536;
 const HIGHLIGHT_CANCELLATION_INTERVAL: usize = 1_024;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VolumeViewMode {
+    #[default]
+    Orbit,
+    Fly,
+}
+
+/// Signed movement axes for one Fly-mode frame.
+///
+/// `forward` follows the full view direction, `right` strafes horizontally,
+/// and `world_up` moves along world Z. Each axis is clamped to `-1.0..=1.0`;
+/// combined movement is normalized so diagonals are not faster.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FlyMovement {
+    pub forward: f32,
+    pub right: f32,
+    pub world_up: f32,
+    pub boost: bool,
+}
+
+impl FlyMovement {
+    #[must_use]
+    pub const fn new(forward: f32, right: f32, world_up: f32, boost: bool) -> Self {
+        Self {
+            forward,
+            right,
+            world_up,
+            boost,
+        }
+    }
+}
 
 fn highlight_color_target(format: wgpu::TextureFormat) -> wgpu::ColorTargetState {
     wgpu::ColorTargetState {
@@ -495,7 +573,8 @@ struct Uniforms {
     material_color: [f32; 4],
     near_surface_depth: f32,
     inverse_scene_depth_span: f32,
-    _padding: [f32; 2],
+    fly_seams: u32,
+    _padding: f32,
 }
 
 impl Default for Uniforms {
@@ -508,7 +587,8 @@ impl Default for Uniforms {
             material_color: [0.80, 0.81, 0.82, 1.0],
             near_surface_depth: 0.0,
             inverse_scene_depth_span: 1.0,
-            _padding: [0.0; 2],
+            fly_seams: 0,
+            _padding: 0.0,
         }
     }
 }
@@ -536,15 +616,59 @@ enum SceneUpdate {
     ClearHighlight,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OrbitCameraState {
+    yaw: f32,
+    pitch: f32,
+    zoom: f32,
+    pan_ndc: egui::Vec2,
+}
+
+impl Default for OrbitCameraState {
+    fn default() -> Self {
+        Self {
+            yaw: 0.65,
+            pitch: -0.45,
+            zoom: 1.0,
+            pan_ndc: egui::Vec2::ZERO,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FlyHomeState {
+    position: Vec3,
+    yaw: f32,
+    pitch: f32,
+    speed: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FlyCameraState {
+    position: Vec3,
+    yaw: f32,
+    pitch: f32,
+    speed: f32,
+    home: FlyHomeState,
+}
+
+impl FlyCameraState {
+    fn reset_to_home(&mut self) {
+        self.position = self.home.position;
+        self.yaw = self.home.yaw;
+        self.pitch = self.home.pitch;
+        self.speed = self.home.speed;
+    }
+}
+
 struct SceneState {
     epoch: u64,
     revision: u64,
     dimensions: [u32; 3],
     affine: Matrix4,
-    yaw: f32,
-    pitch: f32,
-    zoom: f32,
-    pan_ndc: egui::Vec2,
+    view_mode: VolumeViewMode,
+    orbit: OrbitCameraState,
+    fly: Option<FlyCameraState>,
     aspect: f32,
     updates: VecDeque<SceneUpdate>,
 }
@@ -561,10 +685,9 @@ impl Default for SceneState {
                 [0.0, 0.0, 1.0, 0.0],
                 [0.0, 0.0, 0.0, 1.0],
             ],
-            yaw: 0.65,
-            pitch: -0.45,
-            zoom: 1.0,
-            pan_ndc: egui::Vec2::ZERO,
+            view_mode: VolumeViewMode::Orbit,
+            orbit: OrbitCameraState::default(),
+            fly: None,
             aspect: 1.0,
             updates: VecDeque::new(),
         }
@@ -586,10 +709,21 @@ impl SceneBridge {
     }
 
     pub fn reset(&self, epoch: u64, revision: u64, dimensions: [u32; 3], affine: Matrix4) {
+        self.reset_scene(epoch, revision, dimensions, affine, false);
+    }
+
+    fn reset_scene(
+        &self,
+        epoch: u64,
+        revision: u64,
+        dimensions: [u32; 3],
+        affine: Matrix4,
+        force_navigation_reset: bool,
+    ) {
         let mut state = self.state.lock().expect("3D scene state poisoned");
         self.cancel_highlight_build_locked();
-        if state.epoch != epoch {
-            reset_navigation(&mut state);
+        if force_navigation_reset || state.epoch != epoch {
+            reset_document_navigation(&mut state);
         }
         state.epoch = epoch;
         state.revision = revision;
@@ -690,7 +824,7 @@ impl SceneBridge {
     }
 
     pub fn clear(&self) {
-        self.reset(0, 0, [1; 3], SceneState::default().affine);
+        self.reset_scene(0, 0, [1; 3], SceneState::default().affine, true);
     }
 
     /// Returns and clears the latest failure from a current highlight request.
@@ -702,10 +836,39 @@ impl SceneBridge {
             .take()
     }
 
-    pub fn orbit(&self, delta: egui::Vec2) {
+    #[must_use]
+    pub fn view_mode(&self) -> VolumeViewMode {
+        self.state
+            .lock()
+            .expect("3D scene state poisoned")
+            .view_mode
+    }
+
+    pub fn set_view_mode(&self, mode: VolumeViewMode) {
         let mut state = self.state.lock().expect("3D scene state poisoned");
-        state.yaw -= delta.x * 0.008;
-        state.pitch = (state.pitch + delta.y * 0.008).clamp(-1.5, 1.5);
+        if state.view_mode == mode {
+            return;
+        }
+        if mode == VolumeViewMode::Fly && state.fly.is_none() {
+            state.fly = Some(fly_camera_from_orbit(&state));
+        }
+        state.view_mode = mode;
+        drop(state);
+        self.request_repaint();
+    }
+
+    pub fn orbit(&self, delta: egui::Vec2) {
+        if !delta.x.is_finite() || !delta.y.is_finite() {
+            return;
+        }
+        let mut state = self.state.lock().expect("3D scene state poisoned");
+        if state.view_mode != VolumeViewMode::Orbit || delta == egui::Vec2::ZERO {
+            return;
+        }
+        state.orbit.yaw -= delta.x * 0.008;
+        state.orbit.pitch = (state.orbit.pitch + delta.y * 0.008).clamp(-1.5, 1.5);
+        drop(state);
+        self.request_repaint();
     }
 
     pub fn pan(&self, delta_pixels: egui::Vec2, viewport_size: egui::Vec2) {
@@ -719,38 +882,170 @@ impl SceneBridge {
             return;
         }
         let mut state = self.state.lock().expect("3D scene state poisoned");
-        state.pan_ndc += egui::vec2(
+        if state.view_mode != VolumeViewMode::Orbit || delta_pixels == egui::Vec2::ZERO {
+            return;
+        }
+        state.orbit.pan_ndc += egui::vec2(
             2.0 * delta_pixels.x / viewport_size.x,
             -2.0 * delta_pixels.y / viewport_size.y,
         );
+        drop(state);
+        self.request_repaint();
     }
 
     pub fn reset_view(&self) {
         let mut state = self.state.lock().expect("3D scene state poisoned");
-        reset_navigation(&mut state);
+        match state.view_mode {
+            VolumeViewMode::Orbit => state.orbit = OrbitCameraState::default(),
+            VolumeViewMode::Fly => {
+                if let Some(fly) = state.fly.as_mut() {
+                    fly.reset_to_home();
+                }
+            }
+        }
+        drop(state);
+        self.request_repaint();
     }
 
     pub fn zoom(&self, factor: f32) {
+        if !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
         let mut state = self.state.lock().expect("3D scene state poisoned");
-        state.zoom = (state.zoom * factor).clamp(0.2, 8.0);
+        if state.view_mode != VolumeViewMode::Orbit || (factor - 1.0).abs() <= f32::EPSILON {
+            return;
+        }
+        state.orbit.zoom = (state.orbit.zoom * factor).clamp(0.2, 8.0);
+        drop(state);
+        self.request_repaint();
     }
 
     pub fn set_aspect(&self, aspect: f32) {
-        self.state.lock().expect("3D scene state poisoned").aspect = aspect.max(0.1);
+        if !aspect.is_finite() {
+            return;
+        }
+        let aspect = aspect.max(0.1);
+        let mut state = self.state.lock().expect("3D scene state poisoned");
+        if state.aspect == aspect {
+            return;
+        }
+        state.aspect = aspect;
+        drop(state);
+        self.request_repaint();
+    }
+
+    pub fn fly_look(&self, delta: egui::Vec2) {
+        if !delta.x.is_finite() || !delta.y.is_finite() || delta == egui::Vec2::ZERO {
+            return;
+        }
+        let mut state = self.state.lock().expect("3D scene state poisoned");
+        if state.view_mode != VolumeViewMode::Fly {
+            return;
+        }
+        let Some(fly) = state.fly.as_mut() else {
+            return;
+        };
+        fly.yaw = wrap_angle(fly.yaw - delta.x * FLY_LOOK_SENSITIVITY);
+        fly.pitch =
+            (fly.pitch - delta.y * FLY_LOOK_SENSITIVITY).clamp(-MAX_FLY_PITCH, MAX_FLY_PITCH);
+        drop(state);
+        self.request_repaint();
+    }
+
+    pub fn fly_move(&self, movement: FlyMovement, delta_seconds: f32) {
+        if !delta_seconds.is_finite()
+            || delta_seconds <= 0.0
+            || !movement.forward.is_finite()
+            || !movement.right.is_finite()
+            || !movement.world_up.is_finite()
+        {
+            return;
+        }
+        let mut state = self.state.lock().expect("3D scene state poisoned");
+        if state.view_mode != VolumeViewMode::Fly {
+            return;
+        }
+        let Some(fly) = state.fly.as_mut() else {
+            return;
+        };
+        let forward_axis = movement.forward.clamp(-1.0, 1.0);
+        let right_axis = movement.right.clamp(-1.0, 1.0);
+        let world_up_axis = movement.world_up.clamp(-1.0, 1.0);
+        let forward = fly_forward(fly.yaw, fly.pitch);
+        let right = Vec3::new(fly.yaw.sin(), -fly.yaw.cos(), 0.0);
+        let direction = (forward * forward_axis + right * right_axis + Vec3::Z * world_up_axis)
+            .normalize_or_zero();
+        if direction == Vec3::ZERO {
+            return;
+        }
+        let boost = if movement.boost {
+            FLY_BOOST_MULTIPLIER
+        } else {
+            1.0
+        };
+        let delta_seconds = delta_seconds.min(MAX_FLY_FRAME_DELTA_SECONDS);
+        let position = fly.position + direction * fly.speed * boost * delta_seconds;
+        if !position.is_finite() {
+            return;
+        }
+        fly.position = position;
+        drop(state);
+        self.request_repaint();
+    }
+
+    pub fn adjust_fly_speed(&self, wheel_delta: f32) {
+        if !wheel_delta.is_finite() || wheel_delta.abs() <= f32::EPSILON {
+            return;
+        }
+        let mut state = self.state.lock().expect("3D scene state poisoned");
+        if state.view_mode != VolumeViewMode::Fly {
+            return;
+        }
+        let radius = scene_bounds(&state).radius;
+        let (minimum, maximum) = fly_speed_bounds(radius);
+        let Some(fly) = state.fly.as_mut() else {
+            return;
+        };
+        let factor = (wheel_delta * FLY_SPEED_SCROLL_SENSITIVITY).exp();
+        if !factor.is_finite() {
+            fly.speed = if wheel_delta.is_sign_positive() {
+                maximum
+            } else {
+                minimum
+            };
+        } else {
+            fly.speed = (fly.speed * factor).clamp(minimum, maximum);
+        }
+        drop(state);
+        self.request_repaint();
+    }
+
+    #[must_use]
+    pub fn fly_speed(&self) -> Option<f32> {
+        let state = self.state.lock().expect("3D scene state poisoned");
+        if state.view_mode == VolumeViewMode::Fly {
+            state.fly.map(|fly| fly.speed)
+        } else {
+            None
+        }
     }
 
     #[must_use]
     pub fn ray_for_pointer(&self, normalized: [f32; 2]) -> Ray {
         let state = self.state.lock().expect("3D scene state poisoned");
-        let (view, projection, _, _, _) = scene_camera(&state);
+        let (view, projection, _, _, _, eye, forward) = scene_camera(&state);
         let inverse = (projection * view).inverse();
-        let near = inverse.project_point3(Vec3::new(normalized[0], normalized[1], 0.0));
         let far = inverse.project_point3(Vec3::new(normalized[0], normalized[1], 1.0));
-        let direction = (far - near).normalize_or_zero();
+        let direction = (far - eye).try_normalize().unwrap_or(forward);
         Ray {
-            origin: near.as_dvec3().to_array(),
+            origin: eye.as_dvec3().to_array(),
             direction: direction.as_dvec3().to_array(),
         }
+    }
+
+    #[must_use]
+    pub fn center_ray(&self) -> Ray {
+        self.ray_for_pointer([0.0, 0.0])
     }
 
     #[must_use]
@@ -918,12 +1213,10 @@ fn queue_chunk_update(
     updates.insert(insertion_index, update);
 }
 
-fn reset_navigation(state: &mut SceneState) {
-    let defaults = SceneState::default();
-    state.yaw = defaults.yaw;
-    state.pitch = defaults.pitch;
-    state.zoom = defaults.zoom;
-    state.pan_ndc = defaults.pan_ndc;
+fn reset_document_navigation(state: &mut SceneState) {
+    state.view_mode = VolumeViewMode::Orbit;
+    state.orbit = OrbitCameraState::default();
+    state.fly = None;
 }
 
 pub struct VolumePaintCallback {
@@ -1266,7 +1559,7 @@ impl GpuVolumeRenderer {
 }
 
 fn scene_uniforms(state: &SceneState) -> Uniforms {
-    let (view, projection, affine, near_surface_depth, inverse_scene_depth_span) =
+    let (view, projection, affine, near_surface_depth, inverse_scene_depth_span, _, _) =
         scene_camera(state);
     let model_view = view * affine;
     Uniforms {
@@ -1276,6 +1569,7 @@ fn scene_uniforms(state: &SceneState) -> Uniforms {
         index_normal_to_view: normal_matrix(model_view).to_cols_array_2d(),
         near_surface_depth,
         inverse_scene_depth_span,
+        fly_seams: u32::from(state.view_mode == VolumeViewMode::Fly),
         ..Uniforms::default()
     }
 }
@@ -1291,7 +1585,15 @@ fn normal_matrix(model_view: Mat4) -> Mat4 {
     Mat4::IDENTITY
 }
 
-fn scene_camera(state: &SceneState) -> (Mat4, Mat4, Mat4, f32, f32) {
+#[derive(Clone, Copy)]
+struct SceneBounds {
+    affine: Mat4,
+    corners: [Vec3; 8],
+    center: Vec3,
+    radius: f32,
+}
+
+fn scene_bounds(state: &SceneState) -> SceneBounds {
     let affine = affine_mat4(state.affine);
     let corners: [Vec3; 8] = std::array::from_fn(|corner| {
         affine.transform_point3(Vec3::new(
@@ -1318,35 +1620,140 @@ fn scene_camera(state: &SceneState) -> (Mat4, Mat4, Mat4, f32, f32) {
         .map(|corner| corner.distance(center))
         .fold(1.0_f32, f32::max)
         .max(0.5);
-    let direction = Vec3::new(
-        state.yaw.cos() * state.pitch.cos(),
-        state.yaw.sin() * state.pitch.cos(),
-        state.pitch.sin(),
+    SceneBounds {
+        affine,
+        corners,
+        center,
+        radius,
+    }
+}
+
+fn orbit_camera(state: &SceneState, bounds: SceneBounds) -> (Vec3, Vec3, Mat4, Mat4) {
+    let outward = Vec3::new(
+        state.orbit.yaw.cos() * state.orbit.pitch.cos(),
+        state.orbit.yaw.sin() * state.orbit.pitch.cos(),
+        state.orbit.pitch.sin(),
     );
-    let eye = center + direction * radius * 2.6 / state.zoom;
-    let view = Mat4::look_at_rh(eye, center, Vec3::Z);
+    let eye = bounds.center + outward * bounds.radius * 2.6 / state.orbit.zoom;
+    let forward = -outward;
+    let view = Mat4::look_at_rh(eye, bounds.center, Vec3::Z);
+    let projection =
+        Mat4::from_translation(Vec3::new(state.orbit.pan_ndc.x, state.orbit.pan_ndc.y, 0.0))
+            * Mat4::perspective_rh(
+                ORBIT_FIELD_OF_VIEW_RADIANS,
+                state.aspect,
+                bounds.radius * 0.01,
+                bounds.radius * 12.0,
+            );
+    (eye, forward, view, projection)
+}
+
+fn fly_camera_from_orbit(state: &SceneState) -> FlyCameraState {
+    let bounds = scene_bounds(state);
+    let (position, fallback_forward, view, projection) = orbit_camera(state, bounds);
+    let inverse = (projection * view).inverse();
+    let far = inverse.project_point3(Vec3::new(0.0, 0.0, 1.0));
+    let forward = (far - position).try_normalize().unwrap_or(fallback_forward);
+    let yaw = forward.y.atan2(forward.x);
+    let pitch = forward
+        .z
+        .clamp(-1.0, 1.0)
+        .asin()
+        .clamp(-MAX_FLY_PITCH, MAX_FLY_PITCH);
+    let (minimum_speed, maximum_speed) = fly_speed_bounds(bounds.radius);
+    let speed =
+        (bounds.radius * FLY_INITIAL_SPEED_RADIUS_FACTOR).clamp(minimum_speed, maximum_speed);
+    let home = FlyHomeState {
+        position,
+        yaw,
+        pitch,
+        speed,
+    };
+    FlyCameraState {
+        position,
+        yaw,
+        pitch,
+        speed,
+        home,
+    }
+}
+
+fn fly_forward(yaw: f32, pitch: f32) -> Vec3 {
+    Vec3::new(
+        yaw.cos() * pitch.cos(),
+        yaw.sin() * pitch.cos(),
+        pitch.sin(),
+    )
+}
+
+fn fly_speed_bounds(radius: f32) -> (f32, f32) {
+    let minimum = (radius * FLY_MIN_SPEED_RADIUS_FACTOR).max(1.0e-4);
+    let maximum = (radius * FLY_MAX_SPEED_RADIUS_FACTOR).max(minimum);
+    (minimum, maximum)
+}
+
+fn wrap_angle(angle: f32) -> f32 {
+    (angle + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
+}
+
+fn fly_clip_planes(view: Mat4, bounds: SceneBounds) -> (f32, f32) {
+    let (minimum_depth, maximum_depth) = bounds.corners.iter().fold(
+        (f32::INFINITY, f32::NEG_INFINITY),
+        |(minimum, maximum), corner| {
+            let depth = -view.transform_point3(*corner).z;
+            (minimum.min(depth), maximum.max(depth))
+        },
+    );
+    let epsilon = (bounds.radius * FLY_CLIP_EPSILON_RADIUS_FACTOR).max(1.0e-4);
+    let margin = (bounds.radius * FLY_CLIP_MARGIN_RADIUS_FACTOR).max(epsilon * 2.0);
+    let near = if minimum_depth.is_finite() && minimum_depth > epsilon {
+        (minimum_depth - margin).max(epsilon)
+    } else {
+        epsilon
+    };
+    let bounds_far = if maximum_depth.is_finite() {
+        maximum_depth + margin
+    } else {
+        bounds.radius * 4.0
+    };
+    let far = bounds_far
+        .max(near + epsilon)
+        .max(near * 1.001)
+        .max(epsilon * 2.0);
+    (near, far)
+}
+
+fn scene_camera(state: &SceneState) -> (Mat4, Mat4, Mat4, f32, f32, Vec3, Vec3) {
+    let bounds = scene_bounds(state);
+    let (eye, forward, view, projection) = match (state.view_mode, state.fly) {
+        (VolumeViewMode::Fly, Some(fly)) => {
+            let forward = fly_forward(fly.yaw, fly.pitch);
+            let view = Mat4::look_at_rh(fly.position, fly.position + forward, Vec3::Z);
+            let (near, far) = fly_clip_planes(view, bounds);
+            let projection =
+                Mat4::perspective_rh(FLY_FIELD_OF_VIEW_RADIANS, state.aspect, near, far);
+            (fly.position, forward, view, projection)
+        }
+        _ => orbit_camera(state, bounds),
+    };
     let (near_surface_depth, far_surface_depth) =
-        corners
+        bounds
+            .corners
             .iter()
             .fold((f32::INFINITY, f32::NEG_INFINITY), |(near, far), corner| {
                 let depth = -view.transform_point3(*corner).z;
                 (near.min(depth), far.max(depth))
             });
     let inverse_scene_depth_span =
-        1.0 / (far_surface_depth - near_surface_depth).max(radius * 1.0e-6);
-    let projection = Mat4::from_translation(Vec3::new(state.pan_ndc.x, state.pan_ndc.y, 0.0))
-        * Mat4::perspective_rh(
-            45_f32.to_radians(),
-            state.aspect,
-            radius * 0.01,
-            radius * 12.0,
-        );
+        1.0 / (far_surface_depth - near_surface_depth).max(bounds.radius * 1.0e-6);
     (
         view,
         projection,
-        affine,
+        bounds.affine,
         near_surface_depth,
         inverse_scene_depth_span,
+        eye,
+        forward,
     )
 }
 
@@ -1422,6 +1829,40 @@ mod tests {
         assert_eq!(MSAA_SAMPLES, 4);
         assert!(MSAA_SAMPLES.is_power_of_two());
         assert_eq!(size_of::<Uniforms>(), 288);
+    }
+
+    #[test]
+    fn voxel_seams_are_shader_derived_and_enabled_only_for_fly() {
+        let orbit_state = SceneState::default();
+        assert_eq!(scene_uniforms(&orbit_state).fly_seams, 0);
+
+        let mut fly_state = SceneState::default();
+        fly_state.fly = Some(fly_camera_from_orbit(&fly_state));
+        fly_state.view_mode = VolumeViewMode::Fly;
+        assert_eq!(scene_uniforms(&fly_state).fly_seams, 1);
+
+        assert!(SHADER.contains("@location(3) index_position: vec3<f32>"));
+        assert!(SHADER.contains("@interpolate(flat) face_axis: u32"));
+        assert!(SHADER.contains("fwidth(coordinate)"));
+        assert!(SHADER.contains("fract(coordinate + 0.5)"));
+        assert!(SHADER.contains("subpixel_fade"));
+        assert!(SHADER.contains("if (uniforms.fly_seams == 0u)"));
+        assert!(SHADER.contains("return vec4<f32>(lit_color, 1.0);"));
+        assert_eq!(size_of::<CompactQuad>(), 16);
+    }
+
+    #[test]
+    fn orbit_and_fly_use_their_expected_fields_of_view() {
+        let mut state = SceneState::default();
+        let (_, orbit_projection, _, _, _, _, _) = scene_camera(&state);
+        let expected_orbit_scale = 1.0 / (22.5_f32.to_radians().tan());
+        assert!((orbit_projection.y_axis.y - expected_orbit_scale).abs() < 1.0e-6);
+
+        state.fly = Some(fly_camera_from_orbit(&state));
+        state.view_mode = VolumeViewMode::Fly;
+        let (_, fly_projection, _, _, _, _, _) = scene_camera(&state);
+        let expected_fly_scale = 1.0 / (35_f32.to_radians().tan());
+        assert!((fly_projection.y_axis.y - expected_fly_scale).abs() < 1.0e-6);
     }
 
     #[test]
@@ -1959,6 +2400,312 @@ mod tests {
         }
     }
 
+    fn assert_vec3_close(actual: Vec3, expected: Vec3, tolerance: f32) {
+        assert!(
+            actual.distance(expected) <= tolerance,
+            "expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    fn ray_origin(ray: Ray) -> Vec3 {
+        Vec3::new(
+            ray.origin[0] as f32,
+            ray.origin[1] as f32,
+            ray.origin[2] as f32,
+        )
+    }
+
+    fn ray_direction(ray: Ray) -> Vec3 {
+        Vec3::new(
+            ray.direction[0] as f32,
+            ray.direction[1] as f32,
+            ray.direction[2] as f32,
+        )
+    }
+
+    #[test]
+    fn first_fly_entry_preserves_the_pan_aware_orbit_viewpoint() {
+        let bridge = SceneBridge::default();
+        bridge.reset(
+            3,
+            7,
+            [31, 17, 9],
+            [
+                [0.0, -2.0, 0.25, 10.0],
+                [3.0, 0.0, 0.5, -5.0],
+                [0.0, 0.0, 4.0, 2.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        );
+        bridge.set_aspect(16.0 / 9.0);
+        bridge.orbit(egui::vec2(31.0, -19.0));
+        bridge.pan(egui::vec2(73.0, -41.0), egui::vec2(900.0, 600.0));
+
+        let (expected_eye, expected_forward) = {
+            let state = bridge.state.lock().unwrap();
+            let (view, projection, _, _, _, eye, fallback_forward) = scene_camera(&state);
+            let far = (projection * view)
+                .inverse()
+                .project_point3(Vec3::new(0.0, 0.0, 1.0));
+            (eye, (far - eye).try_normalize().unwrap_or(fallback_forward))
+        };
+        let orbit_ray = bridge.center_ray();
+        assert_vec3_close(ray_origin(orbit_ray), expected_eye, 1.0e-4);
+        assert_vec3_close(ray_direction(orbit_ray), expected_forward, 1.0e-5);
+
+        bridge.set_view_mode(VolumeViewMode::Fly);
+
+        let fly = bridge.state.lock().unwrap().fly.unwrap();
+        assert_vec3_close(fly.position, expected_eye, 1.0e-4);
+        assert_vec3_close(fly_forward(fly.yaw, fly.pitch), expected_forward, 1.0e-5);
+        let fly_ray = bridge.center_ray();
+        assert_vec3_close(ray_origin(fly_ray), expected_eye, 1.0e-4);
+        assert_vec3_close(ray_direction(fly_ray), expected_forward, 1.0e-5);
+    }
+
+    #[test]
+    fn unpanned_affine_fly_center_ray_points_at_the_transformed_volume_center() {
+        let bridge = SceneBridge::default();
+        bridge.reset(
+            2,
+            1,
+            [13, 9, 7],
+            [
+                [0.0, -1.5, 0.2, 40.0],
+                [2.5, 0.0, 0.4, -12.0],
+                [0.1, 0.0, 3.0, 8.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        );
+        let center = {
+            let state = bridge.state.lock().unwrap();
+            scene_bounds(&state).center
+        };
+        bridge.set_view_mode(VolumeViewMode::Fly);
+
+        let ray = bridge.center_ray();
+        let expected = (center - ray_origin(ray)).normalize();
+        assert_vec3_close(ray_direction(ray), expected, 5.0e-5);
+    }
+
+    #[test]
+    fn mode_switches_and_revision_resets_preserve_both_cameras() {
+        let bridge = SceneBridge::default();
+        let affine = SceneState::default().affine;
+        bridge.reset(4, 1, [32; 3], affine);
+        bridge.orbit(egui::vec2(25.0, -14.0));
+        bridge.pan(egui::vec2(30.0, -20.0), egui::vec2(800.0, 600.0));
+        bridge.set_view_mode(VolumeViewMode::Fly);
+        bridge.fly_look(egui::vec2(18.0, -11.0));
+        bridge.fly_move(FlyMovement::new(1.0, 0.5, 0.25, true), 0.04);
+        bridge.adjust_fly_speed(120.0);
+        let remembered_fly = bridge.state.lock().unwrap().fly.unwrap();
+
+        bridge.set_view_mode(VolumeViewMode::Orbit);
+        bridge.orbit(egui::vec2(-12.0, 7.0));
+        bridge.zoom(1.4);
+        let remembered_orbit = bridge.state.lock().unwrap().orbit;
+
+        bridge.set_view_mode(VolumeViewMode::Fly);
+        assert_eq!(bridge.state.lock().unwrap().fly, Some(remembered_fly));
+        bridge.reset(4, 2, [32; 3], affine);
+        {
+            let state = bridge.state.lock().unwrap();
+            assert_eq!(state.view_mode, VolumeViewMode::Fly);
+            assert_eq!(state.fly, Some(remembered_fly));
+            assert_eq!(state.orbit, remembered_orbit);
+        }
+
+        bridge.reset(5, 1, [32; 3], affine);
+        {
+            let state = bridge.state.lock().unwrap();
+            assert_eq!(state.view_mode, VolumeViewMode::Orbit);
+            assert_eq!(state.orbit, OrbitCameraState::default());
+            assert_eq!(state.fly, None);
+        }
+
+        bridge.set_view_mode(VolumeViewMode::Fly);
+        bridge.clear();
+        let state = bridge.state.lock().unwrap();
+        assert_eq!(state.view_mode, VolumeViewMode::Orbit);
+        assert_eq!(state.orbit, OrbitCameraState::default());
+        assert_eq!(state.fly, None);
+
+        drop(state);
+        let epoch_zero_bridge = SceneBridge::default();
+        epoch_zero_bridge.set_view_mode(VolumeViewMode::Fly);
+        epoch_zero_bridge.clear();
+        let state = epoch_zero_bridge.state.lock().unwrap();
+        assert_eq!(state.view_mode, VolumeViewMode::Orbit);
+        assert_eq!(state.fly, None);
+    }
+
+    #[test]
+    fn reset_view_only_restores_the_active_camera() {
+        let bridge = SceneBridge::default();
+        bridge.reset(8, 1, [24, 18, 12], SceneState::default().affine);
+        bridge.orbit(egui::vec2(42.0, -17.0));
+        bridge.pan(egui::vec2(55.0, 21.0), egui::vec2(800.0, 600.0));
+        let orbit_at_fly_entry = bridge.state.lock().unwrap().orbit;
+        bridge.set_view_mode(VolumeViewMode::Fly);
+        let fly_home = bridge.state.lock().unwrap().fly.unwrap().home;
+        bridge.fly_look(egui::vec2(90.0, -35.0));
+        bridge.fly_move(FlyMovement::new(1.0, 1.0, -1.0, true), 0.08);
+        bridge.adjust_fly_speed(400.0);
+
+        bridge.reset_view();
+        let reset_fly = bridge.state.lock().unwrap().fly.unwrap();
+        assert_eq!(reset_fly.position, fly_home.position);
+        assert_eq!(reset_fly.yaw, fly_home.yaw);
+        assert_eq!(reset_fly.pitch, fly_home.pitch);
+        assert_eq!(reset_fly.speed, fly_home.speed);
+        assert_eq!(bridge.state.lock().unwrap().orbit, orbit_at_fly_entry);
+
+        bridge.set_view_mode(VolumeViewMode::Orbit);
+        let remembered_fly = bridge.state.lock().unwrap().fly;
+        bridge.orbit(egui::vec2(12.0, 8.0));
+        bridge.zoom(1.5);
+        bridge.reset_view();
+        let state = bridge.state.lock().unwrap();
+        assert_eq!(state.orbit, OrbitCameraState::default());
+        assert_eq!(state.fly, remembered_fly);
+    }
+
+    #[test]
+    fn fly_look_and_speed_are_bounded_and_reject_non_finite_input() {
+        let bridge = SceneBridge::default();
+        bridge.reset(6, 1, [40, 30, 20], SceneState::default().affine);
+        bridge.set_view_mode(VolumeViewMode::Fly);
+        bridge.fly_look(egui::vec2(f32::MAX, f32::MAX));
+        {
+            let fly = bridge.state.lock().unwrap().fly.unwrap();
+            assert!((-std::f32::consts::PI..=std::f32::consts::PI).contains(&fly.yaw));
+            assert_eq!(fly.pitch, -MAX_FLY_PITCH);
+        }
+        bridge.fly_look(egui::vec2(0.0, -f32::MAX));
+        assert_eq!(
+            bridge.state.lock().unwrap().fly.unwrap().pitch,
+            MAX_FLY_PITCH
+        );
+
+        let before_invalid = bridge.state.lock().unwrap().fly.unwrap();
+        bridge.fly_look(egui::vec2(f32::NAN, 1.0));
+        bridge.adjust_fly_speed(f32::NAN);
+        assert_eq!(bridge.state.lock().unwrap().fly, Some(before_invalid));
+
+        let radius = {
+            let state = bridge.state.lock().unwrap();
+            scene_bounds(&state).radius
+        };
+        let (minimum, maximum) = fly_speed_bounds(radius);
+        bridge.adjust_fly_speed(f32::MAX);
+        assert_eq!(bridge.fly_speed(), Some(maximum));
+        bridge.adjust_fly_speed(-f32::MAX);
+        assert_eq!(bridge.fly_speed(), Some(minimum));
+    }
+
+    #[test]
+    fn fly_movement_uses_view_strafe_world_z_boost_and_clamped_delta() {
+        let bridge = SceneBridge::default();
+        bridge.reset(9, 1, [20; 3], SceneState::default().affine);
+        bridge.set_view_mode(VolumeViewMode::Fly);
+        let start = Vec3::new(11.0, -7.0, 3.0);
+        let yaw = 0.4;
+        let pitch = 0.3;
+        let speed = 10.0;
+        let set_pose = || {
+            let mut state = bridge.state.lock().unwrap();
+            let fly = state.fly.as_mut().unwrap();
+            fly.position = start;
+            fly.yaw = yaw;
+            fly.pitch = pitch;
+            fly.speed = speed;
+        };
+        let position = || bridge.state.lock().unwrap().fly.unwrap().position;
+
+        set_pose();
+        bridge.fly_move(FlyMovement::new(1.0, 0.0, 0.0, false), 0.05);
+        assert_vec3_close(position() - start, fly_forward(yaw, pitch) * 0.5, 1.0e-5);
+
+        set_pose();
+        bridge.fly_move(FlyMovement::new(-1.0, 0.0, 0.0, false), 0.05);
+        assert_vec3_close(position() - start, fly_forward(yaw, pitch) * -0.5, 1.0e-5);
+
+        set_pose();
+        bridge.fly_move(FlyMovement::new(0.0, 1.0, 0.0, false), 0.05);
+        let right = Vec3::new(yaw.sin(), -yaw.cos(), 0.0);
+        assert_vec3_close(position() - start, right * 0.5, 1.0e-5);
+
+        set_pose();
+        bridge.fly_move(FlyMovement::new(0.0, 0.0, 1.0, false), 0.05);
+        assert_vec3_close(position() - start, Vec3::Z * 0.5, 1.0e-5);
+
+        set_pose();
+        bridge.fly_move(FlyMovement::new(1.0, 1.0, 1.0, false), 0.05);
+        assert!(((position() - start).length() - 0.5).abs() < 1.0e-5);
+
+        set_pose();
+        bridge.fly_move(FlyMovement::new(1.0, 0.0, 0.0, true), 10.0);
+        assert!(
+            ((position() - start).length()
+                - speed * FLY_BOOST_MULTIPLIER * MAX_FLY_FRAME_DELTA_SECONDS)
+                .abs()
+                < 1.0e-5
+        );
+
+        let before_invalid = position();
+        bridge.fly_move(FlyMovement::new(f32::NAN, 0.0, 0.0, false), 0.05);
+        bridge.fly_move(FlyMovement::new(1.0, 0.0, 0.0, false), f32::NAN);
+        assert_eq!(position(), before_invalid);
+    }
+
+    #[test]
+    fn fly_projection_is_finite_inside_outside_and_behind_the_volume() {
+        let mut state = SceneState {
+            dimensions: [73, 41, 19],
+            affine: [
+                [0.0, -1.8, 0.2, 12.0],
+                [2.1, 0.0, 0.35, -9.0],
+                [0.1, 0.0, 3.2, 4.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            aspect: 1.0,
+            ..Default::default()
+        };
+        state.fly = Some(fly_camera_from_orbit(&state));
+        state.view_mode = VolumeViewMode::Fly;
+        let bounds = scene_bounds(&state);
+        let positions_and_directions = [
+            (bounds.center, Vec3::X),
+            (
+                bounds.center + Vec3::new(3.0, -2.0, 1.0).normalize() * bounds.radius * 80.0,
+                Vec3::new(-3.0, 2.0, -1.0).normalize(),
+            ),
+            (
+                bounds.center + Vec3::new(-2.0, 1.0, 0.5).normalize() * bounds.radius * 20.0,
+                Vec3::new(-2.0, 1.0, 0.5).normalize(),
+            ),
+        ];
+
+        for (position, direction) in positions_and_directions {
+            let fly = state.fly.as_mut().unwrap();
+            fly.position = position;
+            fly.yaw = direction.y.atan2(direction.x);
+            fly.pitch = direction.z.clamp(-1.0, 1.0).asin();
+            let (view, projection, _, near_depth, inverse_span, eye, forward) =
+                scene_camera(&state);
+            let (near, far) = fly_clip_planes(view, bounds);
+            assert!(near.is_finite() && far.is_finite() && 0.0 < near && near < far);
+            assert!(view.is_finite());
+            assert!(projection.is_finite());
+            assert!((projection * view).is_finite());
+            assert!(near_depth.is_finite());
+            assert!(inverse_span.is_finite() && inverse_span > 0.0);
+            assert!(eye.is_finite() && forward.is_finite());
+            assert!((projection.y_axis.y - 1.0 / (35_f32.to_radians().tan())).abs() < 1.0e-5);
+        }
+    }
+
     #[test]
     fn singleton_camera_frames_affine_transformed_voxel_surfaces() {
         let state = SceneState {
@@ -1971,7 +2718,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (view, _, _, _, _) = scene_camera(&state);
+        let (view, _, _, _, _, _, _) = scene_camera(&state);
         let eye = view.inverse().transform_point3(Vec3::ZERO);
         assert!(eye.length() > 200.0);
     }
@@ -1986,7 +2733,10 @@ mod tests {
                 [0.0, 0.0, 0.8, 0.0],
                 [0.0, 0.0, 0.0, 1.0],
             ],
-            pitch: 0.0,
+            orbit: OrbitCameraState {
+                pitch: 0.0,
+                ..Default::default()
+            },
             ..Default::default()
         };
         for (yaw, expected_span) in [
@@ -1996,14 +2746,14 @@ mod tests {
                 state.dimensions[1] as f32 * 0.315,
             ),
         ] {
-            state.yaw = yaw;
-            let (_, _, _, _, inverse_span) = scene_camera(&state);
+            state.orbit.yaw = yaw;
+            let (_, _, _, _, inverse_span, _, _) = scene_camera(&state);
             assert!((inverse_span.recip() - expected_span).abs() < 1.0e-3);
         }
 
-        state.yaw = 0.65;
-        state.pitch = -0.45;
-        let (view, _, affine, near, inverse_span) = scene_camera(&state);
+        state.orbit.yaw = 0.65;
+        state.orbit.pitch = -0.45;
+        let (view, _, affine, near, inverse_span, _, _) = scene_camera(&state);
         let corners: [Vec3; 8] = std::array::from_fn(|corner| {
             affine.transform_point3(Vec3::new(
                 if corner & 1 == 0 {
@@ -2088,25 +2838,19 @@ mod tests {
         bridge.zoom(1.5);
         let navigation = {
             let state = bridge.state.lock().unwrap();
-            (state.pan_ndc, state.yaw, state.pitch, state.zoom)
+            state.orbit
         };
 
         bridge.reset(4, 2, [32; 3], affine);
         {
             let state = bridge.state.lock().unwrap();
-            assert_eq!(
-                (state.pan_ndc, state.yaw, state.pitch, state.zoom),
-                navigation
-            );
+            assert_eq!(state.orbit, navigation);
         }
 
         bridge.reset(5, 1, [32; 3], affine);
         let state = bridge.state.lock().unwrap();
         let defaults = SceneState::default();
-        assert_eq!(state.pan_ndc, defaults.pan_ndc);
-        assert_eq!(state.yaw, defaults.yaw);
-        assert_eq!(state.pitch, defaults.pitch);
-        assert_eq!(state.zoom, defaults.zoom);
+        assert_eq!(state.orbit, defaults.orbit);
     }
 
     #[test]
@@ -2125,10 +2869,7 @@ mod tests {
         assert_eq!(state.epoch, 7);
         assert_eq!(state.revision, 12);
         assert_eq!(state.dimensions, [32; 3]);
-        assert_eq!(state.yaw, defaults.yaw);
-        assert_eq!(state.pitch, defaults.pitch);
-        assert_eq!(state.zoom, defaults.zoom);
-        assert_eq!(state.pan_ndc, defaults.pan_ndc);
+        assert_eq!(state.orbit, defaults.orbit);
     }
 
     fn project_to_viewport(
@@ -2136,7 +2877,7 @@ mod tests {
         world_position: Vec3,
         viewport: egui::Vec2,
     ) -> egui::Vec2 {
-        let (view, projection, _, _, _) = scene_camera(state);
+        let (view, projection, _, _, _, _, _) = scene_camera(state);
         let ndc = (projection * view).project_point3(world_position);
         egui::vec2(
             (ndc.x + 1.0) * 0.5 * viewport.x,

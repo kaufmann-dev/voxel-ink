@@ -16,7 +16,7 @@ use crate::{
         StrokeSpace,
     },
     io::SaveMode,
-    renderer::{SceneBridge, VolumePaintCallback, VoxelHighlightKind},
+    renderer::{FlyMovement, SceneBridge, VolumePaintCallback, VolumeViewMode, VoxelHighlightKind},
     volume::{DocumentSummary, SliceAxis, SliceImage, SpatialUnits, Tool},
 };
 
@@ -308,6 +308,8 @@ pub struct VoxelInkApp {
     bridge_commit: Option<PendingBridgeCommit>,
     next_edit_id: EditId,
     pane_keyboard_focus: bool,
+    fly_captured: bool,
+    fly_primary_suppressed: bool,
     maximized_pane: Option<WorkspacePane>,
     workspace_column_ratio: f32,
     workspace_row_ratio: f32,
@@ -400,6 +402,8 @@ impl VoxelInkApp {
             bridge_commit: None,
             next_edit_id: 1,
             pane_keyboard_focus: false,
+            fly_captured: false,
+            fly_primary_suppressed: false,
             maximized_pane: None,
             workspace_column_ratio: 0.5,
             workspace_row_ratio: 0.5,
@@ -413,6 +417,67 @@ impl VoxelInkApp {
             }
         }
         app
+    }
+
+    fn capture_fly_cursor(&mut self, ctx: &egui::Context) {
+        if self.fly_captured {
+            return;
+        }
+        self.fly_captured = true;
+        self.fly_primary_suppressed = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+            egui::viewport::CursorGrab::Locked,
+        ));
+        ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
+        ctx.set_cursor_icon(egui::CursorIcon::None);
+        ctx.request_repaint();
+    }
+
+    fn release_fly_cursor(&mut self, ctx: &egui::Context) {
+        if !self.fly_captured {
+            return;
+        }
+        self.fly_captured = false;
+        self.fly_primary_suppressed = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+            egui::viewport::CursorGrab::None,
+        ));
+        ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+        ctx.request_repaint();
+    }
+
+    fn cancel_edit_and_release_fly(&mut self, ctx: &egui::Context) {
+        if self.has_edit_interaction() {
+            self.cancel_edit_interaction();
+        }
+        self.release_fly_cursor(ctx);
+    }
+
+    fn enforce_fly_capture_invariants(&mut self, ctx: &egui::Context) {
+        let focused = ctx.input(|input| input.focused);
+        let must_release = self.fly_captured
+            && (!focused
+                || self.dialog.is_some()
+                || self.prompt.is_some()
+                || self.error_message.is_some()
+                || self.summary.is_none()
+                || self.scene.view_mode() != VolumeViewMode::Fly
+                || self.allow_exit);
+        if must_release {
+            self.cancel_edit_and_release_fly(ctx);
+        } else if self.fly_captured {
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+        }
+    }
+
+    fn select_volume_view_mode(&mut self, ctx: &egui::Context, mode: VolumeViewMode) {
+        if self.scene.view_mode() == mode {
+            return;
+        }
+        self.cancel_edit_interaction();
+        self.release_fly_cursor(ctx);
+        self.scene.set_view_mode(mode);
+        ctx.request_repaint();
     }
 
     fn process_engine_events(&mut self, ctx: &egui::Context) {
@@ -454,6 +519,7 @@ impl VoxelInkApp {
                         self.restore_save_prompt(request);
                     }
                     self.error_message = Some(message);
+                    self.cancel_edit_and_release_fly(ctx);
                 }
                 EngineEvent::EditFinished { epoch, edit_id, .. } if epoch == self.epoch => {
                     if self
@@ -475,6 +541,7 @@ impl VoxelInkApp {
                     summary,
                     slices,
                 } => {
+                    self.release_fly_cursor(ctx);
                     self.brush_size_unit = if summary.units == SpatialUnits::Unknown {
                         BrushSizeUnit::Voxels
                     } else {
@@ -503,6 +570,7 @@ impl VoxelInkApp {
                     self.mesh_preview_failed = false;
                 }
                 EngineEvent::DocumentClosed { epoch } => {
+                    self.release_fly_cursor(ctx);
                     self.epoch = epoch;
                     self.summary = None;
                     self.slices.clear();
@@ -757,6 +825,10 @@ impl VoxelInkApp {
         {
             return;
         }
+        if self.fly_captured && consume_fly_key(ctx, egui::Key::Escape) {
+            self.cancel_edit_and_release_fly(ctx);
+            return;
+        }
         let has_edit_interaction = self.has_edit_interaction();
         if (has_edit_interaction || self.maximized_pane.is_some())
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
@@ -768,8 +840,36 @@ impl VoxelInkApp {
             }
             ctx.request_repaint();
         }
+        if self.fly_captured {
+            for (modifiers, key) in [
+                (egui::Modifiers::CTRL, egui::Key::O),
+                (
+                    egui::Modifiers {
+                        ctrl: true,
+                        shift: true,
+                        ..Default::default()
+                    },
+                    egui::Key::S,
+                ),
+                (egui::Modifiers::CTRL, egui::Key::S),
+                (egui::Modifiers::CTRL, egui::Key::W),
+                (
+                    egui::Modifiers {
+                        ctrl: true,
+                        shift: true,
+                        ..Default::default()
+                    },
+                    egui::Key::Z,
+                ),
+                (egui::Modifiers::CTRL, egui::Key::Z),
+                (egui::Modifiers::CTRL, egui::Key::Y),
+            ] {
+                let _ = consume_shortcut(ctx, modifiers, key);
+            }
+            self.handle_tool_shortcuts(ctx);
+            return;
+        }
         let open = consume_shortcut(ctx, egui::Modifiers::CTRL, egui::Key::O);
-        let save = consume_shortcut(ctx, egui::Modifiers::CTRL, egui::Key::S);
         let save_as = consume_shortcut(
             ctx,
             egui::Modifiers {
@@ -779,8 +879,8 @@ impl VoxelInkApp {
             },
             egui::Key::S,
         );
+        let save = consume_shortcut(ctx, egui::Modifiers::CTRL, egui::Key::S);
         let close = consume_shortcut(ctx, egui::Modifiers::CTRL, egui::Key::W);
-        let undo = consume_shortcut(ctx, egui::Modifiers::CTRL, egui::Key::Z);
         let redo_shift = consume_shortcut(
             ctx,
             egui::Modifiers {
@@ -790,6 +890,7 @@ impl VoxelInkApp {
             },
             egui::Key::Z,
         );
+        let undo = consume_shortcut(ctx, egui::Modifiers::CTRL, egui::Key::Z);
         let redo_y = consume_shortcut(ctx, egui::Modifiers::CTRL, egui::Key::Y);
         let edit_commands_ready = !self.has_edit_interaction();
         if open && edit_commands_ready {
@@ -810,26 +911,38 @@ impl VoxelInkApp {
             self.clear_brush_preview();
             let _ = self.send_command(EngineCommand::Undo);
         }
-        let previous_tool = self.tool;
-        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::I)) {
-            self.tool = Tool::Inspect;
-        }
-        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::B)) {
-            self.tool = Tool::Paint;
-        }
-        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::E)) {
-            self.tool = Tool::Erase;
-        }
-        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::L)) {
-            self.tool = Tool::Bridge;
-        }
-        if self.tool != previous_tool {
-            self.cancel_edit_interaction();
-        }
+        self.handle_tool_shortcuts(ctx);
         if !self.has_edit_interaction()
             && (self.pane_keyboard_focus || !ctx.egui_wants_keyboard_input())
         {
             self.handle_cursor_keys(ctx);
+        }
+    }
+
+    fn handle_tool_shortcuts(&mut self, ctx: &egui::Context) {
+        let previous_tool = self.tool;
+        let fly_captured = self.fly_captured;
+        let consume_tool = |key| {
+            if fly_captured {
+                consume_fly_key(ctx, key)
+            } else {
+                ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, key))
+            }
+        };
+        if consume_tool(egui::Key::I) {
+            self.tool = Tool::Inspect;
+        }
+        if consume_tool(egui::Key::B) {
+            self.tool = Tool::Paint;
+        }
+        if consume_tool(egui::Key::E) {
+            self.tool = Tool::Erase;
+        }
+        if consume_tool(egui::Key::L) {
+            self.tool = Tool::Bridge;
+        }
+        if self.tool != previous_tool {
+            self.cancel_edit_interaction();
         }
     }
 
@@ -2106,13 +2219,6 @@ impl VoxelInkApp {
         let header_controls = header_rect.shrink(PANE_HEADER_CONTROL_INSET);
         ui.painter()
             .rect_filled(header_rect, CARD_RADIUS, self.background_color());
-        ui.painter().text(
-            egui::pos2(pane_rect.left() + 9.0, header_rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            "3D View",
-            egui::FontId::proportional(14.0),
-            TEXT,
-        );
         let pane = WorkspacePane::Volume3D;
         let maximized = self.maximized_pane == Some(pane);
         let maximize_label = if maximized { "Restore" } else { "Expand" };
@@ -2156,13 +2262,82 @@ impl VoxelInkApp {
         );
         let reset_response = ui
             .put(reset_rect, egui::Button::new("Reset"))
-            .on_hover_text("Center the volume and restore the default rotation and zoom");
+            .on_hover_text(match self.scene.view_mode() {
+                VolumeViewMode::Orbit => {
+                    "Center the volume and restore the default rotation and zoom"
+                }
+                VolumeViewMode::Fly => "Return to the initial Fly viewpoint and movement speed",
+            });
         reset_response.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Reset view")
         });
         if reset_response.clicked() {
             self.scene.reset_view();
         }
+        let selector_gap = 2.0;
+        let fly_width = 38.0;
+        let orbit_width = 48.0;
+        let selector_right = reset_rect.left() - 5.0;
+        let fly_rect = egui::Rect::from_min_size(
+            egui::pos2(selector_right - fly_width, header_controls.top()),
+            egui::vec2(fly_width, header_controls.height()),
+        );
+        let orbit_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                fly_rect.left() - selector_gap - orbit_width,
+                header_controls.top(),
+            ),
+            egui::vec2(orbit_width, header_controls.height()),
+        );
+        let current_mode = self.scene.view_mode();
+        let orbit_response = ui.put(
+            orbit_rect,
+            egui::Button::new("Orbit").selected(current_mode == VolumeViewMode::Orbit),
+        );
+        orbit_response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::Button,
+                true,
+                current_mode == VolumeViewMode::Orbit,
+                "Orbit view",
+            )
+        });
+        let mut fly_builder = egui::UiBuilder::new().max_rect(fly_rect);
+        if self.summary.is_none() {
+            fly_builder = fly_builder.disabled();
+        }
+        let fly_response = ui
+            .scope_builder(fly_builder, |ui| {
+                ui.put(
+                    fly_rect,
+                    egui::Button::new("Fly").selected(current_mode == VolumeViewMode::Fly),
+                )
+            })
+            .inner;
+        fly_response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::Button,
+                self.summary.is_some(),
+                current_mode == VolumeViewMode::Fly,
+                "Fly view",
+            )
+        });
+        if orbit_response.clicked() {
+            self.select_volume_view_mode(ui.ctx(), VolumeViewMode::Orbit);
+        } else if fly_response.clicked() && self.summary.is_some() {
+            self.select_volume_view_mode(ui.ctx(), VolumeViewMode::Fly);
+        }
+        ui.painter().text(
+            egui::pos2(pane_rect.left() + 9.0, header_rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            if orbit_rect.left() - pane_rect.left() < 70.0 {
+                "3D"
+            } else {
+                "3D View"
+            },
+            egui::FontId::proportional(14.0),
+            TEXT,
+        );
         let content = egui::Rect::from_min_max(
             egui::pos2(
                 pane_rect.left() + PANE_CONTENT_INSET,
@@ -2190,19 +2365,49 @@ impl VoxelInkApp {
                 "Interactive 3D volume editor",
             )
         });
-        let controls = match self.tool {
-            Tool::Inspect => "Left / middle drag: rotate   Right drag: move   Wheel: zoom",
-            Tool::Bridge => {
+        let view_mode = self.scene.view_mode();
+        let (primary_press_position, primary_release_position) =
+            ui.input(|input| primary_pointer_event_positions(&input.events));
+        let (raw_primary_pressed, raw_primary_released, raw_primary_down) = ui.input(|input| {
+            (
+                input.pointer.primary_pressed(),
+                input.pointer.button_released(egui::PointerButton::Primary),
+                input.pointer.primary_down(),
+            )
+        });
+        let mut captured_this_frame = false;
+        if view_mode == VolumeViewMode::Fly
+            && !self.fly_captured
+            && raw_primary_pressed
+            && primary_press_position
+                .is_some_and(|position| rect_contains_half_open(content, position))
+            && !self.edit_input_blocked()
+        {
+            response.request_focus();
+            self.capture_fly_cursor(ui.ctx());
+            captured_this_frame = true;
+        }
+        let controls = match (view_mode, self.fly_captured, self.tool) {
+            (VolumeViewMode::Fly, false, _) => "Click viewport to fly",
+            (VolumeViewMode::Fly, true, _) => {
+                "WASD move · Space/Shift height · Ctrl boost · Wheel speed · Esc release"
+            }
+            (VolumeViewMode::Orbit, _, Tool::Inspect) => {
+                "Left / middle drag: rotate   Right drag: move   Wheel: zoom"
+            }
+            (VolumeViewMode::Orbit, _, Tool::Bridge) => {
                 "Left drag: bridge   Middle drag: rotate   Right drag: move   Wheel: zoom"
             }
-            Tool::Paint | Tool::Erase => {
+            (VolumeViewMode::Orbit, _, Tool::Paint | Tool::Erase) => {
                 "Left drag: edit   Middle drag: rotate   Right drag: move   Wheel: zoom"
             }
         };
-        let compact_controls = match self.tool {
-            Tool::Inspect => "Rotate · Move · Zoom",
-            Tool::Bridge => "Bridge · Rotate · Move · Zoom",
-            Tool::Paint | Tool::Erase => "Edit · Rotate · Move · Zoom",
+        let compact_controls = match (view_mode, self.fly_captured, self.tool) {
+            (VolumeViewMode::Fly, false, _) => "Click to fly",
+            (VolumeViewMode::Fly, true, _) => "WASD · Space/Shift · Ctrl · Wheel · Esc",
+            (VolumeViewMode::Orbit, _, Tool::Inspect) => "Rotate · Move · Zoom",
+            (VolumeViewMode::Orbit, _, Tool::Bridge) => "Bridge · Rotate · Move · Zoom",
+            (VolumeViewMode::Orbit, _, Tool::Paint | Tool::Erase) => "Edit · Rotate · Move · Zoom",
         };
         paint_interaction_hint(
             ui.painter(),
@@ -2214,6 +2419,34 @@ impl VoxelInkApp {
             },
             self.forced_colors,
         );
+        if view_mode == VolumeViewMode::Fly {
+            paint_fly_reticle(ui.painter(), content, self.forced_colors);
+            let capture_text = if self.fly_captured {
+                "Mouse captured; press Escape to release"
+            } else {
+                "Click the 3D view to capture the mouse"
+            };
+            let capture_rect = egui::Rect::from_center_size(
+                egui::pos2(content.center().x, content.top() + 16.0),
+                egui::vec2((content.width() - 16.0).max(1.0), 22.0),
+            );
+            ui.painter().rect_filled(
+                capture_rect,
+                CONTROL_RADIUS,
+                if self.forced_colors {
+                    Color32::BLACK
+                } else {
+                    Color32::from_black_alpha(196)
+                },
+            );
+            let capture_response = ui.put(
+                capture_rect,
+                egui::Label::new(egui::RichText::new(capture_text).color(TEXT).small()).truncate(),
+            );
+            capture_response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Label, true, capture_text)
+            });
+        }
         if response.has_focus() {
             self.pane_keyboard_focus = true;
             ui.painter().rect_stroke(
@@ -2230,18 +2463,71 @@ impl VoxelInkApp {
                 egui::StrokeKind::Inside,
             );
         }
-        if response.hovered() {
-            let scroll = ui.input(|input| input.smooth_scroll_delta.y);
-            if scroll.abs() > f32::EPSILON {
-                self.scene.zoom((scroll * 0.002).exp());
+        let mut fly_camera_changed = false;
+        match view_mode {
+            VolumeViewMode::Orbit => {
+                if response.hovered() {
+                    let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+                    if scroll.abs() > f32::EPSILON {
+                        self.scene.zoom((scroll * 0.002).exp());
+                    }
+                }
+                if response.dragged_by(egui::PointerButton::Secondary) {
+                    self.scene.pan(response.drag_delta(), content.size());
+                } else if response.dragged_by(egui::PointerButton::Middle)
+                    || (self.tool == Tool::Inspect
+                        && response.dragged_by(egui::PointerButton::Primary))
+                {
+                    self.scene.orbit(response.drag_delta());
+                }
             }
+            VolumeViewMode::Fly if self.fly_captured => {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+                ui.ctx().request_repaint();
+                if !captured_this_frame {
+                    let (motion, movement, delta_seconds, speed_wheel) = ui.input(|input| {
+                        let motion = input
+                            .pointer
+                            .motion()
+                            .unwrap_or_else(|| input.pointer.delta());
+                        let movement = FlyMovement::new(
+                            f32::from(u8::from(input.key_down(egui::Key::W)))
+                                - f32::from(u8::from(input.key_down(egui::Key::S))),
+                            f32::from(u8::from(input.key_down(egui::Key::D)))
+                                - f32::from(u8::from(input.key_down(egui::Key::A))),
+                            f32::from(u8::from(input.key_down(egui::Key::Space)))
+                                - f32::from(u8::from(input.modifiers.shift)),
+                            input.modifiers.ctrl,
+                        );
+                        (
+                            motion,
+                            movement,
+                            input.stable_dt,
+                            fly_speed_wheel_delta(&input.events),
+                        )
+                    });
+                    if motion != egui::Vec2::ZERO {
+                        self.scene.fly_look(motion);
+                        fly_camera_changed = true;
+                    }
+                    if movement.forward != 0.0 || movement.right != 0.0 || movement.world_up != 0.0
+                    {
+                        self.scene.fly_move(movement, delta_seconds);
+                        fly_camera_changed = true;
+                    }
+                    if speed_wheel != 0.0 {
+                        self.scene.adjust_fly_speed(speed_wheel);
+                    }
+                }
+            }
+            VolumeViewMode::Fly => {}
         }
-        if response.dragged_by(egui::PointerButton::Secondary) {
-            self.scene.pan(response.drag_delta(), content.size());
-        } else if response.dragged_by(egui::PointerButton::Middle)
-            || (self.tool == Tool::Inspect && response.dragged_by(egui::PointerButton::Primary))
+        let fly_primary_was_suppressed = self.fly_primary_suppressed;
+        if view_mode == VolumeViewMode::Fly
+            && fly_primary_was_suppressed
+            && (raw_primary_released || !raw_primary_down)
         {
-            self.scene.orbit(response.drag_delta());
+            self.fly_primary_suppressed = false;
         }
         if self.tool == Tool::Inspect || self.summary.is_none() {
             return;
@@ -2249,25 +2535,58 @@ impl VoxelInkApp {
         if self.edit_input_blocked() {
             return;
         }
-        let pointer_to_ray = |position| {
-            rect_contains_half_open(content, position).then(|| {
-                let normalized = [
-                    ((position.x - content.left()) / content.width()) * 2.0 - 1.0,
-                    1.0 - ((position.y - content.top()) / content.height()) * 2.0,
-                ];
-                self.scene.ray_for_pointer(normalized)
-            })
+        let (
+            hovered_ray,
+            interaction_ray,
+            pressed_ray,
+            released_ray,
+            primary_pressed,
+            primary_released,
+            submit_held_sample,
+        ) = match view_mode {
+            VolumeViewMode::Orbit => {
+                let pointer_to_ray = |position| {
+                    rect_contains_half_open(content, position).then(|| {
+                        let normalized = [
+                            ((position.x - content.left()) / content.width()) * 2.0 - 1.0,
+                            1.0 - ((position.y - content.top()) / content.height()) * 2.0,
+                        ];
+                        self.scene.ray_for_pointer(normalized)
+                    })
+                };
+                let hovered_ray = persistent_hover_position(&response).and_then(pointer_to_ray);
+                let interaction_ray = response.interact_pointer_pos().and_then(pointer_to_ray);
+                let pressed_ray = primary_press_position.and_then(pointer_to_ray);
+                let released_ray = primary_release_position.and_then(pointer_to_ray);
+                (
+                    hovered_ray,
+                    interaction_ray,
+                    pressed_ray,
+                    released_ray,
+                    pressed_ray.is_some(),
+                    primary_release_position.is_some(),
+                    response.dragged_by(egui::PointerButton::Primary),
+                )
+            }
+            VolumeViewMode::Fly => {
+                let edit_click_enabled =
+                    self.fly_captured && !captured_this_frame && !fly_primary_was_suppressed;
+                let center_ray = self.scene.center_ray();
+                (
+                    Some(center_ray),
+                    edit_click_enabled.then_some(center_ray),
+                    (edit_click_enabled && raw_primary_pressed).then_some(center_ray),
+                    (edit_click_enabled && raw_primary_released).then_some(center_ray),
+                    edit_click_enabled && raw_primary_pressed,
+                    edit_click_enabled && raw_primary_released,
+                    edit_click_enabled && raw_primary_down && fly_camera_changed,
+                )
+            }
         };
-        let hovered_ray = persistent_hover_position(&response).and_then(pointer_to_ray);
-        let interaction_ray = response.interact_pointer_pos().and_then(pointer_to_ray);
-        let (primary_press_position, primary_release_position) =
-            ui.input(|input| primary_pointer_event_positions(&input.events));
-        let pressed_ray = primary_press_position.and_then(pointer_to_ray);
-        let released_ray = primary_release_position.and_then(pointer_to_ray);
-        let primary_pressed = pressed_ray.is_some();
-        let primary_released = primary_release_position.is_some();
         let space = StrokeSpace::Volume3D;
-        if (response.hovered() || response.dragged_by(egui::PointerButton::Primary))
+        if (view_mode == VolumeViewMode::Fly
+            || response.hovered()
+            || response.dragged_by(egui::PointerButton::Primary))
             && self.stroke.is_none()
             && self.bridge_commit.is_none()
             && let Some(ray) = hovered_ray
@@ -2303,7 +2622,7 @@ impl VoxelInkApp {
                     space,
                     PointerSample::Ray { ray },
                 );
-            } else if response.dragged_by(egui::PointerButton::Primary)
+            } else if submit_held_sample
                 && let Some(edit_id) = self.open_stroke_id(space)
                 && let Some(ray) = interaction_ray
                 && let Err(error) = self.send_stroke_sample(edit_id, PointerSample::Ray { ray })
@@ -2998,6 +3317,8 @@ impl VoxelInkApp {
         if self.dialog.is_some() || self.has_edit_interaction() || !self.busy.is_empty() {
             return;
         }
+        let ctx = self.egui_ctx.clone();
+        self.release_fly_cursor(&ctx);
         let (sender, receiver) = bounded(1);
         let repaint = self.egui_ctx.clone();
         std::thread::spawn(move || {
@@ -3021,6 +3342,8 @@ impl VoxelInkApp {
         if self.dialog.is_some() || self.summary.is_none() {
             return;
         }
+        let ctx = self.egui_ctx.clone();
+        self.release_fly_cursor(&ctx);
         let summary = self.summary.as_ref().expect("checked above").clone();
         let (sender, receiver) = bounded(1);
         let repaint = self.egui_ctx.clone();
@@ -3166,15 +3489,25 @@ impl eframe::App for VoxelInkApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.process_engine_events(&ctx);
+        self.enforce_fly_capture_invariants(&ctx);
         let close_requested = ctx.input(|input| input.viewport().close_requested());
         let had_edit_interaction = self.has_edit_interaction();
-        let escape_requested = had_edit_interaction
+        let captured_escape = self.fly_captured && consume_fly_key(&ctx, egui::Key::Escape);
+        if captured_escape {
+            self.cancel_edit_and_release_fly(&ctx);
+        }
+        let escape_requested = !captured_escape
+            && had_edit_interaction
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let focus_lost = had_edit_interaction && ctx.input(|input| !input.focused);
         if escape_requested || focus_lost || (close_requested && had_edit_interaction) {
             self.cancel_edit_interaction();
         }
+        if close_requested {
+            self.release_fly_cursor(&ctx);
+        }
         self.process_dialog();
+        self.enforce_fly_capture_invariants(&ctx);
         self.retry_pending_edit_commands();
         if close_requested {
             if self.allow_exit {
@@ -3188,6 +3521,7 @@ impl eframe::App for VoxelInkApp {
             }
         }
         if self.allow_exit {
+            self.cancel_edit_and_release_fly(&ctx);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
@@ -3198,8 +3532,10 @@ impl eframe::App for VoxelInkApp {
         self.status_bar(ui);
         self.repair_panel(ui);
         self.workspace(ui);
+        self.enforce_fly_capture_invariants(&ctx);
         self.handle_shortcuts(&ctx);
         self.show_prompts(&ctx);
+        self.enforce_fly_capture_invariants(&ctx);
     }
 }
 
@@ -3433,6 +3769,13 @@ fn consume_shortcut(ctx: &egui::Context, modifiers: egui::Modifiers, key: egui::
     ctx.input_mut(|input| input.consume_shortcut(&egui::KeyboardShortcut::new(modifiers, key)))
 }
 
+fn consume_fly_key(ctx: &egui::Context, key: egui::Key) -> bool {
+    ctx.input_mut(|input| {
+        input.consume_key(egui::Modifiers::CTRL, key)
+            || input.consume_key(egui::Modifiers::NONE, key)
+    })
+}
+
 fn primary_pointer_event_positions(
     events: &[egui::Event],
 ) -> (Option<egui::Pos2>, Option<egui::Pos2>) {
@@ -3455,6 +3798,33 @@ fn primary_pointer_event_positions(
         }
     }
     (pressed, released)
+}
+
+fn fly_speed_wheel_delta(events: &[egui::Event]) -> f32 {
+    events
+        .iter()
+        .filter_map(|event| {
+            let egui::Event::MouseWheel {
+                unit, delta, phase, ..
+            } = event
+            else {
+                return None;
+            };
+            if matches!(phase, egui::TouchPhase::End | egui::TouchPhase::Cancel) {
+                return None;
+            }
+            let dominant = if delta.y.abs() >= delta.x.abs() {
+                delta.y
+            } else {
+                delta.x
+            };
+            Some(match unit {
+                egui::MouseWheelUnit::Point => dominant,
+                egui::MouseWheelUnit::Line => dominant * 40.0,
+                egui::MouseWheelUnit::Page => dominant * 240.0,
+            })
+        })
+        .sum()
 }
 
 fn preview_with_generation(request: BrushPreviewRequest, generation: u64) -> BrushPreviewRequest {
@@ -3696,6 +4066,38 @@ fn paint_brush_preview(
     }
 }
 
+fn paint_fly_reticle(painter: &egui::Painter, content: egui::Rect, forced_colors: bool) {
+    let painter = painter.with_clip_rect(content);
+    let center = content.center();
+    let gap = 3.0;
+    let radius = 10.0;
+    let segments = [
+        [
+            center - egui::vec2(radius, 0.0),
+            center - egui::vec2(gap, 0.0),
+        ],
+        [
+            center + egui::vec2(gap, 0.0),
+            center + egui::vec2(radius, 0.0),
+        ],
+        [
+            center - egui::vec2(0.0, radius),
+            center - egui::vec2(0.0, gap),
+        ],
+        [
+            center + egui::vec2(0.0, gap),
+            center + egui::vec2(0.0, radius),
+        ],
+    ];
+    for segment in segments {
+        painter.line_segment(segment, egui::Stroke::new(3.5, Color32::BLACK));
+        painter.line_segment(
+            segment,
+            egui::Stroke::new(1.5, if forced_colors { Color32::WHITE } else { TEAL }),
+        );
+    }
+}
+
 fn paint_interaction_hint(
     painter: &egui::Painter,
     content: egui::Rect,
@@ -3866,6 +4268,25 @@ mod tests {
 
         assert_eq!(view.wheel_steps(&[event]), 1);
         assert_eq!(view.wheel_steps(&[]), 0);
+    }
+
+    #[test]
+    fn fly_speed_uses_raw_wheel_units_without_replaying_empty_frames() {
+        let line = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, 2.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let point = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(-12.0, 4.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        assert_eq!(fly_speed_wheel_delta(&[line, point]), 68.0);
+        assert_eq!(fly_speed_wheel_delta(&[]), 0.0);
     }
 
     #[test]

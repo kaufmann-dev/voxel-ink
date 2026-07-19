@@ -457,6 +457,378 @@ fn a_same_frame_slice_drag_keeps_distinct_press_and_release_samples() {
 }
 
 #[test]
+fn fly_selector_is_accessible_without_resizing_and_expand_stays_independent() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("fly-selector.binvox");
+    write_binvox(&path, [4, 3, 2], &[0; 24]);
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "4 × 3 × 2");
+
+    let orbit = harness.get_by_label("Orbit view");
+    let fly = harness.get_by_label("Fly view");
+    assert_eq!(orbit.accesskit_node().toggled(), Some(Toggled::True));
+    assert_eq!(fly.accesskit_node().toggled(), Some(Toggled::False));
+
+    let initial_editor = harness.get_by_label("Interactive 3D volume editor").rect();
+    fly.click_accesskit();
+    harness.step();
+    harness.step();
+
+    assert_eq!(
+        harness
+            .get_by_label("Orbit view")
+            .accesskit_node()
+            .toggled(),
+        Some(Toggled::False)
+    );
+    assert_eq!(
+        harness.get_by_label("Fly view").accesskit_node().toggled(),
+        Some(Toggled::True)
+    );
+    assert_rect_near(
+        harness.get_by_label("Interactive 3D volume editor").rect(),
+        initial_editor,
+    );
+    assert!(
+        harness
+            .query_by_label("Click the 3D view to capture the mouse")
+            .is_some()
+    );
+
+    harness.get_by_label("Full screen 3D").click_accesskit();
+    harness.step();
+    harness.step();
+
+    let expanded_editor = harness.get_by_label("Interactive 3D volume editor").rect();
+    assert!(
+        expanded_editor.width() > initial_editor.width()
+            && expanded_editor.height() > initial_editor.height(),
+        "Expand did not remain independent of Fly mode: {initial_editor:?} -> {expanded_editor:?}"
+    );
+    assert!(harness.query_by_label("Restore four views").is_some());
+    assert_eq!(
+        harness.get_by_label("Fly view").accesskit_node().toggled(),
+        Some(Toggled::True)
+    );
+}
+
+#[test]
+fn fly_capture_is_first_click_safe_edits_with_erase_and_suppresses_shortcuts() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("fly-edit.binvox");
+    let dimensions = [9, 9, 9];
+    let initial_occupied = u64::from(dimensions.into_iter().product::<u32>());
+    write_binvox(
+        &path,
+        dimensions,
+        &vec![1; usize::try_from(initial_occupied).unwrap()],
+    );
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "729 occupied");
+
+    harness.key_press(egui::Key::E);
+    harness.step();
+    assert_eq!(tool_toggled(&harness, "Erase (E)"), Some(Toggled::True));
+    harness.get_by_label("Fly view").click_accesskit();
+    harness.step();
+    harness.get_by_label("Full screen 3D").click_accesskit();
+    harness.step();
+    harness.step();
+
+    let capture_position = harness
+        .get_by_label("Interactive 3D volume editor")
+        .rect()
+        .center();
+    queue_same_frame_primary_click(&mut harness, capture_position);
+    harness.step();
+
+    assert_root_viewport_commands(
+        &harness,
+        &[
+            egui::ViewportCommand::CursorGrab(egui::viewport::CursorGrab::Locked),
+            egui::ViewportCommand::CursorVisible(false),
+        ],
+    );
+    assert!(
+        harness
+            .query_by_label("Mouse captured; press Escape to release")
+            .is_some()
+    );
+    assert!(
+        harness
+            .query_by_label("Click the 3D view to capture the mouse")
+            .is_none()
+    );
+    for _ in 0..8 {
+        thread::sleep(Duration::from_millis(2));
+        harness.step();
+    }
+    assert_eq!(
+        current_occupied_count(&harness),
+        Some(initial_occupied),
+        "the click that captured the cursor must never edit"
+    );
+
+    queue_same_frame_primary_click(&mut harness, capture_position);
+    harness.step();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if current_occupied_count(&harness).is_some_and(|count| count < initial_occupied) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a captured Erase click did not edit the center-ray surface: {:?}",
+            current_occupied_count(&harness)
+        );
+        thread::sleep(Duration::from_millis(2));
+        harness.step();
+    }
+    wait_for_label(&mut harness, "modified");
+
+    harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::W);
+    harness.step();
+    assert!(
+        harness.query_by_label("Save changes?").is_none(),
+        "Ctrl+W must be suppressed while Ctrl is the Fly boost modifier"
+    );
+    assert!(
+        harness
+            .query_by_label("Mouse captured; press Escape to release")
+            .is_some()
+    );
+
+    harness.key_press(egui::Key::B);
+    harness.step();
+    assert_eq!(tool_toggled(&harness, "Paint (B)"), Some(Toggled::True));
+
+    harness.key_down(egui::Key::Escape);
+    harness.step();
+    assert_root_viewport_commands(
+        &harness,
+        &[
+            egui::ViewportCommand::CursorGrab(egui::viewport::CursorGrab::None),
+            egui::ViewportCommand::CursorVisible(true),
+        ],
+    );
+    assert!(
+        harness
+            .query_by_label("Click the 3D view to capture the mouse")
+            .is_some()
+    );
+    assert!(
+        harness.query_by_label("Restore four views").is_some(),
+        "the Escape that releases Fly capture must not also restore the grid"
+    );
+    harness.key_up(egui::Key::Escape);
+    harness.step();
+
+    harness.key_down(egui::Key::Escape);
+    harness.step();
+    harness.key_up(egui::Key::Escape);
+    harness.step();
+    harness.step();
+    for editor in [
+        "Axial slice editor",
+        "Coronal slice editor",
+        "Sagittal slice editor",
+        "Interactive 3D volume editor",
+    ] {
+        assert!(
+            harness.query_by_label(editor).is_some(),
+            "the second, uncaptured Escape did not restore {editor}"
+        );
+    }
+}
+
+#[test]
+fn fly_held_erase_stroke_updates_center_rays_and_completes() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("fly-held-erase.binvox");
+    let dimensions = [15, 15, 15];
+    let initial_occupied = u64::from(dimensions.into_iter().product::<u32>());
+    write_binvox(
+        &path,
+        dimensions,
+        &vec![1; usize::try_from(initial_occupied).unwrap()],
+    );
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "3,375 occupied");
+
+    harness.key_press(egui::Key::E);
+    harness.step();
+    harness.get_by_label("Fly view").click_accesskit();
+    harness.step();
+
+    let viewport_center = harness
+        .get_by_label("Interactive 3D volume editor")
+        .rect()
+        .center();
+    queue_same_frame_primary_click(&mut harness, viewport_center);
+    harness.step();
+    assert_root_viewport_commands(
+        &harness,
+        &[
+            egui::ViewportCommand::CursorGrab(egui::viewport::CursorGrab::Locked),
+            egui::ViewportCommand::CursorVisible(false),
+        ],
+    );
+
+    queue_primary_button(&mut harness, viewport_center, true);
+    harness.step();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let count_after_press = loop {
+        if let Some(count) = current_occupied_count(&harness)
+            && count < initial_occupied
+        {
+            break count;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the held Erase stroke did not apply its initial center ray: {:?}",
+            current_occupied_count(&harness)
+        );
+        thread::sleep(Duration::from_millis(2));
+        harness.step();
+    };
+    assert!(
+        harness.get_by_label("Undo").accesskit_node().is_disabled(),
+        "Undo must remain unavailable until the held stroke is released"
+    );
+
+    harness.key_down(egui::Key::W);
+    harness.step();
+    for _ in 0..4 {
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::MouseMoved(egui::vec2(20.0, 0.0)));
+        harness.step();
+        thread::sleep(Duration::from_millis(2));
+    }
+    harness.key_up(egui::Key::W);
+    harness.step();
+    queue_primary_button(&mut harness, viewport_center, false);
+    harness.step();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let occupied = current_occupied_count(&harness);
+        let undo_ready = !harness.get_by_label("Undo").accesskit_node().is_disabled();
+        let modified = harness.query_by_label_contains("modified").is_some();
+        if occupied.is_some_and(|count| count < count_after_press) && undo_ready && modified {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the moved held stroke did not add another footprint and complete: initial {initial_occupied}, after press {count_after_press}, current {occupied:?}, undo ready {undo_ready}, modified {modified}"
+        );
+        thread::sleep(Duration::from_millis(2));
+        harness.step();
+    }
+
+    harness.key_down(egui::Key::Escape);
+    harness.step();
+    assert_root_viewport_commands(
+        &harness,
+        &[
+            egui::ViewportCommand::CursorGrab(egui::viewport::CursorGrab::None),
+            egui::ViewportCommand::CursorVisible(true),
+        ],
+    );
+    harness.key_up(egui::Key::Escape);
+    harness.step();
+}
+
+#[test]
+fn fly_capture_releases_on_focus_loss_and_mode_switch() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("fly-release.binvox");
+    write_binvox(&path, [5, 5, 5], &[1; 125]);
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "125 occupied");
+
+    harness.get_by_label("Fly view").click_accesskit();
+    harness.step();
+    let capture_position = harness
+        .get_by_label("Interactive 3D volume editor")
+        .rect()
+        .center();
+    queue_same_frame_primary_click(&mut harness, capture_position);
+    harness.step();
+    assert_root_viewport_commands(
+        &harness,
+        &[
+            egui::ViewportCommand::CursorGrab(egui::viewport::CursorGrab::Locked),
+            egui::ViewportCommand::CursorVisible(false),
+        ],
+    );
+
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::WindowFocused(false));
+    harness.input_mut().focused = false;
+    harness.step();
+    assert_root_viewport_commands(
+        &harness,
+        &[
+            egui::ViewportCommand::CursorGrab(egui::viewport::CursorGrab::None),
+            egui::ViewportCommand::CursorVisible(true),
+        ],
+    );
+    assert!(
+        harness
+            .query_by_label("Click the 3D view to capture the mouse")
+            .is_some()
+    );
+
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::WindowFocused(true));
+    harness.input_mut().focused = true;
+    harness.step();
+    queue_same_frame_primary_click(&mut harness, capture_position);
+    harness.step();
+    assert_root_viewport_commands(
+        &harness,
+        &[
+            egui::ViewportCommand::CursorGrab(egui::viewport::CursorGrab::Locked),
+            egui::ViewportCommand::CursorVisible(false),
+        ],
+    );
+
+    harness.get_by_label("Orbit view").click_accesskit();
+    harness.step();
+    assert_root_viewport_commands(
+        &harness,
+        &[
+            egui::ViewportCommand::CursorGrab(egui::viewport::CursorGrab::None),
+            egui::ViewportCommand::CursorVisible(true),
+        ],
+    );
+    harness.step();
+    assert_eq!(
+        harness
+            .get_by_label("Orbit view")
+            .accesskit_node()
+            .toggled(),
+        Some(Toggled::True)
+    );
+    assert!(
+        harness
+            .query_by_label("Mouse captured; press Escape to release")
+            .is_none()
+    );
+    assert!(
+        harness
+            .query_by_label("Click the 3D view to capture the mouse")
+            .is_none()
+    );
+}
+
+#[test]
 fn every_view_can_use_the_full_workspace_and_escape_restores_the_grid() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("maximize.binvox");
@@ -943,6 +1315,61 @@ fn current_occupied_count(harness: &Harness<'_, VoxelInkApp>) -> Option<u64> {
             .find(|pair| pair[1] == "occupied")
             .and_then(|pair| pair[0].replace(',', "").parse().ok())
     })
+}
+
+fn root_viewport_commands<'h>(
+    harness: &'h Harness<'_, VoxelInkApp>,
+) -> &'h [egui::ViewportCommand] {
+    &harness
+        .output()
+        .viewport_output
+        .get(&egui::ViewportId::ROOT)
+        .expect("the app should always render the root viewport")
+        .commands
+}
+
+fn assert_root_viewport_commands(
+    harness: &Harness<'_, VoxelInkApp>,
+    expected: &[egui::ViewportCommand],
+) {
+    let actual = root_viewport_commands(harness);
+    for command in expected {
+        assert!(
+            actual.contains(command),
+            "root viewport commands {actual:?} did not include {command:?}"
+        );
+    }
+}
+
+fn queue_same_frame_primary_click(harness: &mut Harness<'_, VoxelInkApp>, position: egui::Pos2) {
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::PointerMoved(position));
+    for pressed in [true, false] {
+        queue_primary_button(harness, position, pressed);
+    }
+}
+
+fn queue_primary_button(
+    harness: &mut Harness<'_, VoxelInkApp>,
+    position: egui::Pos2,
+    pressed: bool,
+) {
+    harness.input_mut().events.push(egui::Event::PointerButton {
+        pos: position,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    });
+}
+
+fn assert_rect_near(actual: egui::Rect, expected: egui::Rect) {
+    let delta = (actual.min - expected.min).length() + (actual.max - expected.max).length();
+    assert!(
+        delta <= 0.1,
+        "rect changed unexpectedly: {expected:?} -> {actual:?}"
+    );
 }
 
 fn contrast_ratio(foreground: egui::Color32, background: egui::Color32) -> f32 {
