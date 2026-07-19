@@ -26,7 +26,7 @@ struct Uniforms {
     material_color: vec4<f32>,
     near_surface_depth: f32,
     inverse_scene_depth_span: f32,
-    fly_seams: u32,
+    voxel_seams: u32,
     _padding: f32,
 };
 
@@ -153,7 +153,7 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let voxel_ao_factor = mix(1.0, 0.76, clamp(input.corner_occlusion / 3.0, 0.0, 1.0));
     let lighting = base_lighting * depth_factor * surface_factor * voxel_ao_factor;
     let lit_color = uniforms.material_color.rgb * lighting;
-    if (uniforms.fly_seams == 0u) {
+    if (uniforms.voxel_seams == 0u) {
         return vec4<f32>(lit_color, 1.0);
     }
 
@@ -181,7 +181,7 @@ struct Uniforms {
     material_color: vec4<f32>,
     near_surface_depth: f32,
     inverse_scene_depth_span: f32,
-    fly_seams: u32,
+    voxel_seams: u32,
     _padding: f32,
 };
 
@@ -275,9 +275,9 @@ const MAX_FLY_PITCH: f32 = 1.5;
 const MAX_FLY_FRAME_DELTA_SECONDS: f32 = 0.1;
 const FLY_BOOST_MULTIPLIER: f32 = 4.0;
 const FLY_SPEED_SCROLL_SENSITIVITY: f32 = 0.002;
-const FLY_MIN_SPEED_RADIUS_FACTOR: f32 = 0.01;
-const FLY_INITIAL_SPEED_RADIUS_FACTOR: f32 = 0.5;
-const FLY_MAX_SPEED_RADIUS_FACTOR: f32 = 8.0;
+const FLY_MIN_SPEED_RADIUS_FACTOR: f32 = 0.001;
+const FLY_INITIAL_SPEED_RADIUS_FACTOR: f32 = 0.1;
+const FLY_MAX_SPEED_RADIUS_FACTOR: f32 = 2.0;
 const FLY_CLIP_EPSILON_RADIUS_FACTOR: f32 = 1.0e-4;
 const FLY_CLIP_MARGIN_RADIUS_FACTOR: f32 = 0.01;
 // These independent caps keep CPU adjacency work and GPU boundary work bounded.
@@ -573,7 +573,7 @@ struct Uniforms {
     material_color: [f32; 4],
     near_surface_depth: f32,
     inverse_scene_depth_span: f32,
-    fly_seams: u32,
+    voxel_seams: u32,
     _padding: f32,
 }
 
@@ -587,7 +587,7 @@ impl Default for Uniforms {
             material_color: [0.80, 0.81, 0.82, 1.0],
             near_surface_depth: 0.0,
             inverse_scene_depth_span: 1.0,
-            fly_seams: 0,
+            voxel_seams: 0,
             _padding: 0.0,
         }
     }
@@ -669,6 +669,7 @@ struct SceneState {
     view_mode: VolumeViewMode,
     orbit: OrbitCameraState,
     fly: Option<FlyCameraState>,
+    voxel_seams: bool,
     aspect: f32,
     updates: VecDeque<SceneUpdate>,
 }
@@ -688,6 +689,7 @@ impl Default for SceneState {
             view_mode: VolumeViewMode::Orbit,
             orbit: OrbitCameraState::default(),
             fly: None,
+            voxel_seams: true,
             aspect: 1.0,
             updates: VecDeque::new(),
         }
@@ -857,6 +859,24 @@ impl SceneBridge {
         self.request_repaint();
     }
 
+    #[must_use]
+    pub fn voxel_seams(&self) -> bool {
+        self.state
+            .lock()
+            .expect("3D scene state poisoned")
+            .voxel_seams
+    }
+
+    pub fn set_voxel_seams(&self, enabled: bool) {
+        let mut state = self.state.lock().expect("3D scene state poisoned");
+        if state.voxel_seams == enabled {
+            return;
+        }
+        state.voxel_seams = enabled;
+        drop(state);
+        self.request_repaint();
+    }
+
     pub fn orbit(&self, delta: egui::Vec2) {
         if !delta.x.is_finite() || !delta.y.is_finite() {
             return;
@@ -1020,14 +1040,36 @@ impl SceneBridge {
         self.request_repaint();
     }
 
+    pub fn set_fly_speed(&self, speed: f32) {
+        if !speed.is_finite() || speed <= 0.0 {
+            return;
+        }
+        let mut state = self.state.lock().expect("3D scene state poisoned");
+        let radius = scene_bounds(&state).radius;
+        let (minimum, maximum) = fly_speed_bounds(radius);
+        let Some(fly) = state.fly.as_mut() else {
+            return;
+        };
+        let speed = speed.clamp(minimum, maximum);
+        if fly.speed == speed {
+            return;
+        }
+        fly.speed = speed;
+        drop(state);
+        self.request_repaint();
+    }
+
+    #[must_use]
+    pub fn fly_speed_range(&self) -> [f32; 2] {
+        let state = self.state.lock().expect("3D scene state poisoned");
+        let (minimum, maximum) = fly_speed_bounds(scene_bounds(&state).radius);
+        [minimum, maximum]
+    }
+
     #[must_use]
     pub fn fly_speed(&self) -> Option<f32> {
         let state = self.state.lock().expect("3D scene state poisoned");
-        if state.view_mode == VolumeViewMode::Fly {
-            state.fly.map(|fly| fly.speed)
-        } else {
-            None
-        }
+        state.fly.map(|fly| fly.speed)
     }
 
     #[must_use]
@@ -1569,7 +1611,7 @@ fn scene_uniforms(state: &SceneState) -> Uniforms {
         index_normal_to_view: normal_matrix(model_view).to_cols_array_2d(),
         near_surface_depth,
         inverse_scene_depth_span,
-        fly_seams: u32::from(state.view_mode == VolumeViewMode::Fly),
+        voxel_seams: u32::from(state.voxel_seams),
         ..Uniforms::default()
     }
 }
@@ -1832,21 +1874,27 @@ mod tests {
     }
 
     #[test]
-    fn voxel_seams_are_shader_derived_and_enabled_only_for_fly() {
-        let orbit_state = SceneState::default();
-        assert_eq!(scene_uniforms(&orbit_state).fly_seams, 0);
+    fn voxel_seams_are_shader_derived_and_shared_by_orbit_and_fly() {
+        let mut orbit_state = SceneState::default();
+        assert_eq!(scene_uniforms(&orbit_state).voxel_seams, 1);
+
+        orbit_state.voxel_seams = false;
+        assert_eq!(scene_uniforms(&orbit_state).voxel_seams, 0);
 
         let mut fly_state = SceneState::default();
         fly_state.fly = Some(fly_camera_from_orbit(&fly_state));
         fly_state.view_mode = VolumeViewMode::Fly;
-        assert_eq!(scene_uniforms(&fly_state).fly_seams, 1);
+        assert_eq!(scene_uniforms(&fly_state).voxel_seams, 1);
+
+        fly_state.voxel_seams = false;
+        assert_eq!(scene_uniforms(&fly_state).voxel_seams, 0);
 
         assert!(SHADER.contains("@location(3) index_position: vec3<f32>"));
         assert!(SHADER.contains("@interpolate(flat) face_axis: u32"));
         assert!(SHADER.contains("fwidth(coordinate)"));
         assert!(SHADER.contains("fract(coordinate + 0.5)"));
         assert!(SHADER.contains("subpixel_fade"));
-        assert!(SHADER.contains("if (uniforms.fly_seams == 0u)"));
+        assert!(SHADER.contains("if (uniforms.voxel_seams == 0u)"));
         assert!(SHADER.contains("return vec4<f32>(lit_color, 1.0);"));
         assert_eq!(size_of::<CompactQuad>(), 16);
     }
@@ -2598,10 +2646,42 @@ mod tests {
             scene_bounds(&state).radius
         };
         let (minimum, maximum) = fly_speed_bounds(radius);
+        let initial = bridge.fly_speed().unwrap();
+        assert!((initial - radius * FLY_INITIAL_SPEED_RADIUS_FACTOR).abs() < 1.0e-5);
+        assert_eq!(bridge.fly_speed_range(), [minimum, maximum]);
+
+        bridge.set_fly_speed(minimum * 0.5);
+        assert_eq!(bridge.fly_speed(), Some(minimum));
+        bridge.set_fly_speed(maximum * 2.0);
+        assert_eq!(bridge.fly_speed(), Some(maximum));
+        bridge.set_fly_speed(f32::NAN);
+        assert_eq!(bridge.fly_speed(), Some(maximum));
+
+        bridge.set_view_mode(VolumeViewMode::Orbit);
+        bridge.set_fly_speed(initial);
+        assert_eq!(bridge.fly_speed(), Some(initial));
+        bridge.set_view_mode(VolumeViewMode::Fly);
         bridge.adjust_fly_speed(f32::MAX);
         assert_eq!(bridge.fly_speed(), Some(maximum));
         bridge.adjust_fly_speed(-f32::MAX);
         assert_eq!(bridge.fly_speed(), Some(minimum));
+    }
+
+    #[test]
+    fn voxel_seam_setting_is_shared_and_survives_navigation_resets() {
+        let bridge = SceneBridge::default();
+        assert!(bridge.voxel_seams());
+
+        bridge.set_voxel_seams(false);
+        bridge.reset(12, 1, [8; 3], SceneState::default().affine);
+        bridge.set_view_mode(VolumeViewMode::Fly);
+        bridge.reset_view();
+        bridge.set_view_mode(VolumeViewMode::Orbit);
+        bridge.reset_view();
+        assert!(!bridge.voxel_seams());
+
+        bridge.set_voxel_seams(true);
+        assert!(bridge.voxel_seams());
     }
 
     #[test]

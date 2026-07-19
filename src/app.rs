@@ -853,21 +853,9 @@ impl VoxelInkApp {
                 ),
                 (egui::Modifiers::CTRL, egui::Key::S),
                 (egui::Modifiers::CTRL, egui::Key::W),
-                (
-                    egui::Modifiers {
-                        ctrl: true,
-                        shift: true,
-                        ..Default::default()
-                    },
-                    egui::Key::Z,
-                ),
-                (egui::Modifiers::CTRL, egui::Key::Z),
-                (egui::Modifiers::CTRL, egui::Key::Y),
             ] {
                 let _ = consume_shortcut(ctx, modifiers, key);
             }
-            self.handle_tool_shortcuts(ctx);
-            return;
         }
         let open = consume_shortcut(ctx, egui::Modifiers::CTRL, egui::Key::O);
         let save_as = consume_shortcut(
@@ -912,6 +900,9 @@ impl VoxelInkApp {
             let _ = self.send_command(EngineCommand::Undo);
         }
         self.handle_tool_shortcuts(ctx);
+        if self.fly_captured {
+            return;
+        }
         if !self.has_edit_interaction()
             && (self.pane_keyboard_focus || !ctx.egui_wants_keyboard_input())
         {
@@ -1438,6 +1429,90 @@ impl VoxelInkApp {
                                 egui::WidgetType::Other,
                                 true,
                                 "Seal openings workflow",
+                            )
+                        });
+
+                        ui.add_space(10.0);
+                        let card_width = ui.available_width();
+                        let view_card = card.show(ui, |ui| {
+                            ui.set_width(
+                                (card_width - card.total_margin().sum().x).max(1.0),
+                            );
+                            ui.strong("3D view");
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(
+                                        "Adjust flight movement and voxel surface detail.",
+                                    )
+                                    .color(MUTED),
+                                )
+                                .wrap(),
+                            );
+                            ui.add_space(10.0);
+
+                            let speed_label = ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new("Flight speed").small().strong(),
+                                )
+                                .wrap(),
+                            );
+                            let remembered_speed = self.scene.fly_speed();
+                            ui.add_enabled_ui(
+                                ready && remembered_speed.is_some(),
+                                |ui| {
+                                    let mut speed = remembered_speed.unwrap_or(1.0);
+                                    let [minimum, maximum] = self.scene.fly_speed_range();
+                                    ui.spacing_mut().slider_width = ui.available_width().max(1.0);
+                                    let response = ui
+                                        .add(
+                                            egui::Slider::new(&mut speed, minimum..=maximum)
+                                                .logarithmic(true)
+                                                .show_value(false),
+                                        )
+                                        .labelled_by(speed_label.id)
+                                        .on_hover_text(
+                                            "Movement speed in volume world units per second. The mouse wheel changes the same value while flying.",
+                                        );
+                                    if response.changed() {
+                                        self.scene.set_fly_speed(speed);
+                                    }
+                                },
+                            );
+                            if remembered_speed.is_none() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Enter Fly once to initialize its viewpoint and speed.",
+                                    )
+                                    .small()
+                                    .color(MUTED),
+                                );
+                            } else {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "The mouse wheel adjusts the same value while flying.",
+                                    )
+                                    .small()
+                                    .color(MUTED),
+                                );
+                            }
+                            ui.add_space(8.0);
+
+                            let mut voxel_seams = self.scene.voxel_seams();
+                            if ui
+                                .checkbox(&mut voxel_seams, "Show voxel outlines")
+                                .on_hover_text(
+                                    "Show antialiased voxel boundaries in both Orbit and Fly views",
+                                )
+                                .changed()
+                            {
+                                self.scene.set_voxel_seams(voxel_seams);
+                            }
+                        });
+                        view_card.response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Other,
+                                true,
+                                "3D view settings",
                             )
                         });
 
@@ -2275,8 +2350,8 @@ impl VoxelInkApp {
             self.scene.reset_view();
         }
         let selector_gap = 2.0;
-        let fly_width = 38.0;
-        let orbit_width = 48.0;
+        let fly_width = 42.0;
+        let orbit_width = 58.0;
         let selector_right = reset_rect.left() - 5.0;
         let fly_rect = egui::Rect::from_min_size(
             egui::pos2(selector_right - fly_width, header_controls.top()),
@@ -2290,9 +2365,17 @@ impl VoxelInkApp {
             egui::vec2(orbit_width, header_controls.height()),
         );
         let current_mode = self.scene.view_mode();
+        let orbit_selected = current_mode == VolumeViewMode::Orbit;
+        let orbit_text = if orbit_selected {
+            egui::RichText::new("Orbit").color(Color32::BLACK)
+        } else {
+            egui::RichText::new("Orbit")
+        };
         let orbit_response = ui.put(
             orbit_rect,
-            egui::Button::new("Orbit").selected(current_mode == VolumeViewMode::Orbit),
+            egui::Button::new(orbit_text)
+                .selected(orbit_selected)
+                .truncate(),
         );
         orbit_response.widget_info(|| {
             egui::WidgetInfo::selected(
@@ -2306,11 +2389,19 @@ impl VoxelInkApp {
         if self.summary.is_none() {
             fly_builder = fly_builder.disabled();
         }
+        let fly_selected = current_mode == VolumeViewMode::Fly;
+        let fly_text = if fly_selected {
+            egui::RichText::new("Fly").color(Color32::BLACK)
+        } else {
+            egui::RichText::new("Fly")
+        };
         let fly_response = ui
             .scope_builder(fly_builder, |ui| {
                 ui.put(
                     fly_rect,
-                    egui::Button::new("Fly").selected(current_mode == VolumeViewMode::Fly),
+                    egui::Button::new(fly_text)
+                        .selected(fly_selected)
+                        .truncate(),
                 )
             })
             .inner;

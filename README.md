@@ -95,9 +95,9 @@ Choose a tool from the toolbar or press `I` for Inspect, `B` for Paint, `E` for 
 The 3D pane offers two navigation styles:
 
 - **Orbit** rotates around the volume, pans with the right mouse button, and zooms with the wheel.
-- **Fly** uses a fixed center reticle. Click once to capture the mouse; that first click never edits. Look with the mouse, move with `W/A/S/D`, change world-Z height with Space/Shift, hold `Ctrl` to boost, and use the wheel to adjust speed. Left-click or hold to use Paint, Erase, or Bridge through the reticle. Press Escape to cancel the active stroke and release the mouse.
+- **Fly** uses a fixed center reticle. Click once to capture the mouse; that first click never edits. Look with the mouse, move with `W/A/S/D`, change world-Z height with Space/Shift, hold `Ctrl` to boost, and use the wheel to adjust speed. Left-click or hold to use Paint, Erase, or Bridge through the reticle. Undo and redo remain available with `Ctrl+Z`, `Ctrl+Shift+Z`, or `Ctrl+Y`; file shortcuts stay suppressed during capture. Press Escape to cancel the active stroke and release the mouse.
 
-Orbit and Fly remember separate viewpoints. Reset affects only the active camera, and opening or closing a document returns navigation to Orbit.
+Orbit and Fly remember separate viewpoints. Reset affects only the active camera, and opening or closing a document returns navigation to Orbit. The **3D view** card in the repair panel provides a flight-speed slider and a shared voxel-outline toggle that affects both navigation modes.
 
 ## Build and test
 

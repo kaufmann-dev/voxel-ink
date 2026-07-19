@@ -102,6 +102,8 @@ fn repair_panel_guidance_and_controls_stay_inside_the_panel() {
     for label in [
         "Choose the repair workflow that fits the volume.",
         "Paint missing voxels or bridge gaps.",
+        "Adjust flight movement and voxel surface detail.",
+        "Show voxel outlines",
         "Fill empty regions that cannot reach a volume boundary.",
         "Fill enclosed cavities",
     ] {
@@ -150,7 +152,11 @@ fn loaded_repair_cards_keep_their_gutter_when_the_scrollbar_appears() {
         (paint_card.height() - inspect_card.height()).abs() < 1.0,
         "switching tools changed the repair card height: {inspect_card:?} -> {paint_card:?}"
     );
-    for label in ["Seal openings workflow", "Fill interior workflow"] {
+    for label in [
+        "Seal openings workflow",
+        "3D view settings",
+        "Fill interior workflow",
+    ] {
         let card = harness.get_by_label(label).rect();
         let left_margin = card.left() - panel.left();
         let right_margin = panel.right() - card.right();
@@ -208,12 +214,17 @@ fn expanded_workspace_keeps_repair_cards_inside_the_parent_gutter() {
     let panel = harness
         .get_by_role_and_label(Role::Pane, "Repair volume controls")
         .rect();
-    for label in ["Seal openings workflow", "Fill interior workflow"] {
+    let scroll_bar_width = egui::style::ScrollStyle::solid().allocated_width();
+    for label in [
+        "Seal openings workflow",
+        "3D view settings",
+        "Fill interior workflow",
+    ] {
         let card = harness.get_by_label(label).rect();
         let left_margin = card.left() - panel.left();
         let right_margin = panel.right() - card.right();
         assert!(
-            left_margin >= 11.0 && right_margin >= 11.0 && (left_margin - right_margin).abs() < 1.0,
+            left_margin >= 11.0 && right_margin >= left_margin + scroll_bar_width - 1.0,
             "{label:?} escaped the repair panel gutter in the expanded workspace: panel {panel:?}, card {card:?}"
         );
     }
@@ -468,6 +479,20 @@ fn fly_selector_is_accessible_without_resizing_and_expand_stays_independent() {
     let fly = harness.get_by_label("Fly view");
     assert_eq!(orbit.accesskit_node().toggled(), Some(Toggled::True));
     assert_eq!(fly.accesskit_node().toggled(), Some(Toggled::False));
+    assert_selected_view_button_text(&harness, "Orbit view", "Orbit");
+
+    let fly_speed = harness.get_by_role_and_label(Role::Slider, "Flight speed");
+    assert!(
+        fly_speed.accesskit_node().is_disabled(),
+        "flight speed must wait until the first Fly viewpoint is initialized"
+    );
+    assert_eq!(
+        harness
+            .get_by_label("Show voxel outlines")
+            .accesskit_node()
+            .toggled(),
+        Some(Toggled::True)
+    );
 
     let initial_editor = harness.get_by_label("Interactive 3D volume editor").rect();
     fly.click_accesskit();
@@ -484,6 +509,27 @@ fn fly_selector_is_accessible_without_resizing_and_expand_stays_independent() {
     assert_eq!(
         harness.get_by_label("Fly view").accesskit_node().toggled(),
         Some(Toggled::True)
+    );
+    assert_selected_view_button_text(&harness, "Fly view", "Fly");
+    let fly_speed = harness.get_by_role_and_label(Role::Slider, "Flight speed");
+    assert!(!fly_speed.accesskit_node().is_disabled());
+    let speed = fly_speed.accesskit_node().numeric_value().unwrap();
+    let maximum = fly_speed.accesskit_node().max_numeric_value().unwrap();
+    assert!(
+        speed <= maximum * 0.051,
+        "the initial Fly speed should be much slower than the available maximum: {speed} / {maximum}"
+    );
+
+    harness
+        .get_by_label("Show voxel outlines")
+        .click_accesskit();
+    harness.step();
+    assert_eq!(
+        harness
+            .get_by_label("Show voxel outlines")
+            .accesskit_node()
+            .toggled(),
+        Some(Toggled::False)
     );
     assert_rect_near(
         harness.get_by_label("Interactive 3D volume editor").rect(),
@@ -585,6 +631,45 @@ fn fly_capture_is_first_click_safe_edits_with_erase_and_suppresses_shortcuts() {
         harness.step();
     }
     wait_for_label(&mut harness, "modified");
+    let erased_occupied = current_occupied_count(&harness).unwrap();
+
+    harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::Z);
+    harness.step();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if current_occupied_count(&harness) == Some(initial_occupied) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Ctrl+Z did not undo while Fly capture remained active: {:?}",
+            current_occupied_count(&harness)
+        );
+        thread::sleep(Duration::from_millis(2));
+        harness.step();
+    }
+    assert!(
+        harness
+            .query_by_label("Mouse captured; press Escape to release")
+            .is_some(),
+        "undo must not release Fly capture"
+    );
+
+    harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::Y);
+    harness.step();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if current_occupied_count(&harness) == Some(erased_occupied) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Ctrl+Y did not redo while Fly capture remained active: {:?}",
+            current_occupied_count(&harness)
+        );
+        thread::sleep(Duration::from_millis(2));
+        harness.step();
+    }
 
     harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::W);
     harness.step();
@@ -975,9 +1060,21 @@ fn fill_enclosed_cavities_is_a_single_clear_action_with_visible_feedback() {
     let mut harness = app_harness(Some(path));
     wait_for_label(&mut harness, "6 occupied");
 
-    let action = harness.get_by_label("Fill enclosed cavities");
-    assert!(!action.accesskit_node().is_disabled());
-    action.click();
+    assert!(
+        !harness
+            .get_by_label("Fill enclosed cavities")
+            .accesskit_node()
+            .is_disabled()
+    );
+    harness
+        .get_by_label("Fill enclosed cavities")
+        .scroll_to_me();
+    for _ in 0..4 {
+        harness.step();
+    }
+    harness
+        .get_by_label("Fill enclosed cavities")
+        .click_accesskit();
     harness.step();
 
     wait_for_label(&mut harness, "7 occupied");
@@ -1369,6 +1466,58 @@ fn assert_rect_near(actual: egui::Rect, expected: egui::Rect) {
     assert!(
         delta <= 0.1,
         "rect changed unexpectedly: {expected:?} -> {actual:?}"
+    );
+}
+
+fn assert_selected_view_button_text(
+    harness: &Harness<'_, VoxelInkApp>,
+    accessible_label: &str,
+    visible_text: &str,
+) {
+    fn collect_text_shapes<'a>(
+        shape: &'a egui::epaint::Shape,
+        text_shapes: &mut Vec<&'a egui::epaint::TextShape>,
+    ) {
+        match shape {
+            egui::epaint::Shape::Text(text) => text_shapes.push(text),
+            egui::epaint::Shape::Vec(children) => {
+                for child in children {
+                    collect_text_shapes(child, text_shapes);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let button_rect = harness.get_by_label(accessible_label).rect();
+    let mut text_shapes = Vec::new();
+    for clipped in &harness.output().shapes {
+        collect_text_shapes(&clipped.shape, &mut text_shapes);
+    }
+    let text = text_shapes
+        .into_iter()
+        .find(|text| {
+            text.galley.text() == visible_text
+                && text.visual_bounding_rect().intersects(button_rect)
+        })
+        .unwrap_or_else(|| panic!("{accessible_label} did not paint {visible_text:?}"));
+    assert_eq!(
+        text.galley.rows.len(),
+        1,
+        "{visible_text} wrapped inside {button_rect:?}"
+    );
+    assert!(
+        !text.galley.elided,
+        "{visible_text} was truncated inside {button_rect:?}"
+    );
+    assert!(
+        text.galley
+            .job
+            .sections
+            .iter()
+            .all(|section| section.format.color == egui::Color32::BLACK),
+        "selected {visible_text} text was not explicitly black: {:?}",
+        text.galley.job.sections
     );
 }
 
