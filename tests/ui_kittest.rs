@@ -67,7 +67,7 @@ fn toolbar_exposes_names_disabled_state_focus_order_and_tool_state() {
     assert_eq!(tool_toggled(&harness, "Paint (B)"), Some(Toggled::True));
     assert!(
         harness
-            .get_by_role_and_label(Role::Slider, "Brush diameter in voxels")
+            .get_by_role_and_label(Role::Slider, "Brush diameter in voxels (- / +)")
             .accesskit_node()
             .is_disabled(),
         "brush settings should stay disabled until a volume is loaded"
@@ -78,7 +78,7 @@ fn toolbar_exposes_names_disabled_state_focus_order_and_tool_state() {
     assert_eq!(tool_toggled(&harness, "Erase (E)"), Some(Toggled::True));
     assert!(
         harness
-            .query_by_role_and_label(Role::Slider, "Brush diameter in voxels")
+            .query_by_role_and_label(Role::Slider, "Brush diameter in voxels (- / +)")
             .is_some(),
         "Erase should expose brush settings"
     );
@@ -87,7 +87,7 @@ fn toolbar_exposes_names_disabled_state_focus_order_and_tool_state() {
     assert_eq!(tool_toggled(&harness, "Bridge (L)"), Some(Toggled::True));
     assert!(
         harness
-            .query_by_role_and_label(Role::Slider, "Brush diameter in voxels")
+            .query_by_role_and_label(Role::Slider, "Brush diameter in voxels (- / +)")
             .is_some(),
         "Bridge should expose brush settings"
     );
@@ -96,7 +96,7 @@ fn toolbar_exposes_names_disabled_state_focus_order_and_tool_state() {
     assert_eq!(tool_toggled(&harness, "Inspect (I)"), Some(Toggled::True));
     assert!(
         harness
-            .query_by_role_and_label(Role::Slider, "Brush diameter in voxels")
+            .query_by_role_and_label(Role::Slider, "Brush diameter in voxels (- / +)")
             .is_none(),
         "Inspect should hide brush-only settings"
     );
@@ -114,7 +114,7 @@ fn repair_panel_guidance_and_controls_stay_inside_the_panel() {
         "Choose the repair workflow that fits the volume.",
         "Paint missing voxels or bridge gaps.",
         "Adjust flight movement and voxel surface detail.",
-        "Show voxel outlines",
+        "Show voxel outlines (V)",
         "Fill empty regions that cannot reach a volume boundary.",
         "Fill enclosed cavities",
     ] {
@@ -499,7 +499,7 @@ fn fly_selector_is_accessible_without_resizing_and_expand_stays_independent() {
     );
     assert_eq!(
         harness
-            .get_by_label("Show voxel outlines")
+            .get_by_label("Show voxel outlines (V)")
             .accesskit_node()
             .toggled(),
         Some(Toggled::True)
@@ -537,12 +537,12 @@ fn fly_selector_is_accessible_without_resizing_and_expand_stays_independent() {
     );
 
     harness
-        .get_by_label("Show voxel outlines")
+        .get_by_label("Show voxel outlines (V)")
         .click_accesskit();
     harness.step();
     assert_eq!(
         harness
-            .get_by_label("Show voxel outlines")
+            .get_by_label("Show voxel outlines (V)")
             .accesskit_node()
             .toggled(),
         Some(Toggled::False)
@@ -641,7 +641,7 @@ fn brush_diameter_sliders_keep_their_minimum_when_fly_captures() {
     assert_brush_minimum_survives_fly_capture(
         binvox_path,
         "125 occupied",
-        "Brush diameter in voxels",
+        "Brush diameter in voxels (- / +)",
     );
 
     let nifti_path = directory.path().join("brush-capture.nii");
@@ -649,7 +649,196 @@ fn brush_diameter_sliders_keep_their_minimum_when_fly_captures() {
     assert_brush_minimum_survives_fly_capture(
         nifti_path,
         "125 occupied",
-        "Brush diameter in millimetres",
+        "Brush diameter in millimetres (- / +)",
+    );
+}
+
+#[test]
+fn captured_fly_shortcuts_change_editing_and_view_settings_without_releasing() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("fly-settings-shortcuts.nii");
+    write_nifti_u8(&path, [9, 9, 9], &[1; 729]);
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "729 occupied");
+    harness.key_press(egui::Key::B);
+    harness.step();
+    harness.get_by_label("Fly view").click_accesskit();
+    harness.step();
+
+    let viewport_center = harness
+        .get_by_label("Interactive 3D volume editor")
+        .rect()
+        .center();
+    queue_same_frame_primary_click(&mut harness, viewport_center);
+    harness.step();
+    assert!(
+        harness
+            .query_by_label("Mouse captured; press Escape to release")
+            .is_some()
+    );
+
+    let millimetre_label = "Brush diameter in millimetres (- / +)";
+    let initial_diameter = harness
+        .get_by_role_and_label(Role::Slider, millimetre_label)
+        .accesskit_node()
+        .numeric_value()
+        .unwrap();
+    harness.key_press(egui::Key::Plus);
+    harness.step();
+    assert_eq!(
+        harness
+            .get_by_role_and_label(Role::Slider, millimetre_label)
+            .accesskit_node()
+            .numeric_value(),
+        Some(initial_diameter + 0.5)
+    );
+    harness.key_press(egui::Key::Minus);
+    harness.step();
+    assert_eq!(
+        harness
+            .get_by_role_and_label(Role::Slider, millimetre_label)
+            .accesskit_node()
+            .numeric_value(),
+        Some(initial_diameter)
+    );
+
+    harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::Q);
+    harness.step();
+    assert_eq!(tool_toggled(&harness, "Square (Q)"), Some(Toggled::True));
+    harness.key_press(egui::Key::R);
+    harness.step();
+    assert_eq!(tool_toggled(&harness, "Round (R)"), Some(Toggled::True));
+    harness.key_press(egui::Key::Num3);
+    harness.step();
+    assert_eq!(tool_toggled(&harness, "3D volume (3)"), Some(Toggled::True));
+    harness.key_press(egui::Key::Num1);
+    harness.step();
+    assert_eq!(tool_toggled(&harness, "One slice (1)"), Some(Toggled::True));
+
+    harness.key_press(egui::Key::U);
+    harness.step();
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Slider, "Brush diameter in voxels (- / +)")
+            .is_some()
+    );
+    harness.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Plus);
+    harness.step();
+    assert_eq!(
+        harness
+            .get_by_role_and_label(Role::Slider, "Brush diameter in voxels (- / +)")
+            .accesskit_node()
+            .numeric_value(),
+        Some(7.0),
+        "Shift+Plus should adjust the brush on layouts that require Shift for +"
+    );
+    let outlines_before = harness
+        .get_by_label("Show voxel outlines (V)")
+        .accesskit_node()
+        .toggled();
+    harness.key_press(egui::Key::V);
+    harness.step();
+    assert_ne!(
+        harness
+            .get_by_label("Show voxel outlines (V)")
+            .accesskit_node()
+            .toggled(),
+        outlines_before
+    );
+
+    harness.key_press(egui::Key::Home);
+    harness.step();
+    assert!(
+        harness
+            .query_by_label("Mouse captured; press Escape to release")
+            .is_some(),
+        "settings shortcuts and Home must retain Fly capture"
+    );
+}
+
+#[test]
+fn bridge_keeps_its_starting_brush_when_a_shortcut_changes_the_next_stroke() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("bridge-frozen-shortcut.binvox");
+    write_binvox(&path, [15, 5, 1], &[0; 75]);
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "0 occupied");
+    harness.key_press(egui::Key::L);
+    harness.step();
+    harness.key_press(egui::Key::U);
+    harness.step();
+    assert!(
+        harness
+            .query_by_label_contains("no physical units")
+            .is_some(),
+        "U should explain why millimetre sizing is unavailable"
+    );
+
+    let slice = harness
+        .get_by_role_and_label(Role::Image, "Axial slice editor")
+        .rect();
+    let start = egui::pos2(slice.left() + slice.width() * 0.15, slice.center().y);
+    let end = egui::pos2(slice.left() + slice.width() * 0.85, slice.center().y);
+    queue_primary_button(&mut harness, start, true);
+    harness.step();
+    for _ in 0..8 {
+        thread::sleep(Duration::from_millis(2));
+        harness.step();
+    }
+    harness.key_press(egui::Key::Plus);
+    harness.step();
+    assert!(
+        harness
+            .query_by_label_contains("updated for the next stroke")
+            .is_some()
+    );
+    assert_eq!(
+        harness
+            .get_by_role_and_label(Role::Slider, "Brush diameter in voxels (- / +)")
+            .accesskit_node()
+            .numeric_value(),
+        Some(7.0)
+    );
+    harness.hover_at(end);
+    harness.step();
+    queue_primary_button(&mut harness, end, false);
+    wait_for_occupied_count_above(&mut harness, 0, Duration::from_secs(3));
+    assert_eq!(
+        current_occupied_count(&harness),
+        Some(63),
+        "the in-progress bridge should retain its starting five-voxel brush"
+    );
+}
+
+#[test]
+fn paint_keeps_its_starting_brush_when_diameter_changes_while_held() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("paint-frozen-shortcut.binvox");
+    write_binvox(&path, [15, 15, 1], &[0; 225]);
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "0 occupied");
+    harness.key_press(egui::Key::B);
+    harness.step();
+
+    let center = harness
+        .get_by_role_and_label(Role::Image, "Axial slice editor")
+        .rect()
+        .center();
+    queue_primary_button(&mut harness, center, true);
+    harness.step();
+    harness.key_press(egui::Key::Plus);
+    harness.step();
+    assert!(
+        harness
+            .query_by_label_contains("updated for the next stroke")
+            .is_some()
+    );
+    queue_primary_button(&mut harness, center, false);
+    wait_for_occupied_count_above(&mut harness, 0, Duration::from_secs(3));
+    assert_eq!(
+        current_occupied_count(&harness),
+        Some(13),
+        "the active Paint stroke should retain its starting five-voxel round brush"
     );
 }
 
@@ -1109,7 +1298,7 @@ fn oversized_bridge_preview_is_nonmodal_recovers_and_commits_on_release() {
     wait_for_label(&mut harness, "0 occupied");
     harness.key_press(egui::Key::L);
     harness.step();
-    drag_slider_to_maximum(&mut harness, "Brush diameter in voxels");
+    drag_slider_to_maximum(&mut harness, "Brush diameter in voxels (- / +)");
 
     let slice = harness
         .get_by_role_and_label(Role::Image, "Axial slice editor")
@@ -1165,7 +1354,7 @@ fn local_sinus_nifti_keeps_an_oversized_bridge_drag_nonmodal() {
     wait_for_label_with_timeout(&mut harness, "617 × 560 × 231", Duration::from_secs(15));
     harness.key_press(egui::Key::L);
     harness.step();
-    drag_slider_to_maximum(&mut harness, "Brush diameter in millimetres");
+    drag_slider_to_maximum(&mut harness, "Brush diameter in millimetres (- / +)");
 
     let slice = harness
         .get_by_role_and_label(Role::Image, "Axial slice editor")
@@ -1243,7 +1432,7 @@ fn every_view_can_use_the_full_workspace_and_escape_restores_the_grid() {
             assert!(harness.query_by_label(editor).is_some());
         }
     }
-    assert!(harness.query_by_label("Reset view").is_some());
+    assert!(harness.query_by_label("Reset view (Home)").is_some());
 }
 
 #[test]

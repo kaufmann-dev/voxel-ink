@@ -134,6 +134,15 @@ struct BridgeAnchor {
     voxel: [u32; 3],
     space: StrokeSpace,
     plane_normal: [f64; 3],
+    spec: BrushSpec,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BrushSettingShortcut {
+    Shape(BrushShape),
+    Depth(BrushDepth),
+    ToggleSizeUnit,
+    AdjustDiameter(i8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -315,6 +324,7 @@ pub struct VoxelInkApp {
     pane_keyboard_focus: bool,
     fly_captured: bool,
     fly_primary_suppressed: bool,
+    suppress_fly_vertical_this_frame: bool,
     maximized_pane: Option<WorkspacePane>,
     workspace_column_ratio: f32,
     workspace_row_ratio: f32,
@@ -410,6 +420,7 @@ impl VoxelInkApp {
             pane_keyboard_focus: false,
             fly_captured: false,
             fly_primary_suppressed: false,
+            suppress_fly_vertical_this_frame: false,
             maximized_pane: None,
             workspace_column_ratio: 0.5,
             workspace_row_ratio: 0.5,
@@ -976,6 +987,115 @@ impl VoxelInkApp {
         }
     }
 
+    fn handle_setting_shortcuts(&mut self, ctx: &egui::Context) {
+        let fly_captured = self.fly_captured;
+        if consume_setting_key(ctx, egui::Key::V, fly_captured, false) {
+            self.scene.set_voxel_seams(!self.scene.voxel_seams());
+        }
+        if fly_captured && consume_setting_key(ctx, egui::Key::Home, true, false) {
+            self.scene.reset_view();
+        }
+        if self.summary.is_none() || self.tool == Tool::Inspect {
+            return;
+        }
+
+        for (key, shortcut) in [
+            (egui::Key::R, BrushSettingShortcut::Shape(BrushShape::Round)),
+            (
+                egui::Key::Q,
+                BrushSettingShortcut::Shape(BrushShape::Square),
+            ),
+            (
+                egui::Key::Num1,
+                BrushSettingShortcut::Depth(BrushDepth::Slice),
+            ),
+            (
+                egui::Key::Num3,
+                BrushSettingShortcut::Depth(BrushDepth::Volume),
+            ),
+            (egui::Key::U, BrushSettingShortcut::ToggleSizeUnit),
+            (egui::Key::Minus, BrushSettingShortcut::AdjustDiameter(-1)),
+        ] {
+            if consume_setting_key(ctx, key, fly_captured, false) {
+                self.apply_brush_setting_shortcut(shortcut);
+            }
+        }
+        if consume_setting_key(ctx, egui::Key::Plus, fly_captured, true) {
+            self.suppress_fly_vertical_this_frame = ctx.input(|input| input.modifiers.shift);
+            self.apply_brush_setting_shortcut(BrushSettingShortcut::AdjustDiameter(1));
+        }
+    }
+
+    fn apply_brush_setting_shortcut(&mut self, shortcut: BrushSettingShortcut) {
+        let changed = match shortcut {
+            BrushSettingShortcut::Shape(shape) => {
+                if self.brush_shape == shape {
+                    false
+                } else {
+                    self.brush_shape = shape;
+                    true
+                }
+            }
+            BrushSettingShortcut::Depth(depth) => {
+                if self.brush_depth == depth {
+                    false
+                } else {
+                    self.brush_depth = depth;
+                    true
+                }
+            }
+            BrushSettingShortcut::ToggleSizeUnit => {
+                let has_physical_units = self
+                    .summary
+                    .as_ref()
+                    .is_some_and(|summary| summary.units != SpatialUnits::Unknown);
+                if !has_physical_units {
+                    self.brush_size_unit = BrushSizeUnit::Voxels;
+                    self.preview_notice = Some(
+                        "Millimetre brush sizing is unavailable because this volume has no physical units."
+                            .into(),
+                    );
+                    self.egui_ctx.request_repaint();
+                    return;
+                }
+                self.brush_size_unit = match self.brush_size_unit {
+                    BrushSizeUnit::Voxels => BrushSizeUnit::Millimeters,
+                    BrushSizeUnit::Millimeters => BrushSizeUnit::Voxels,
+                };
+                true
+            }
+            BrushSettingShortcut::AdjustDiameter(direction) => match self.brush_size_unit {
+                BrushSizeUnit::Voxels => {
+                    let next = adjusted_voxel_diameter(self.brush_voxel_diameter, direction);
+                    if next == self.brush_voxel_diameter {
+                        false
+                    } else {
+                        self.brush_voxel_diameter = next;
+                        true
+                    }
+                }
+                BrushSizeUnit::Millimeters => {
+                    let next = adjusted_millimetre_diameter(self.brush_millimeters, direction);
+                    if (next - self.brush_millimeters).abs() <= f32::EPSILON {
+                        false
+                    } else {
+                        self.brush_millimeters = next;
+                        true
+                    }
+                }
+            },
+        };
+        if !changed {
+            return;
+        }
+        if self.has_edit_interaction() {
+            self.preview_notice = Some("Brush setting updated for the next stroke.".into());
+        } else {
+            self.clear_brush_preview();
+        }
+        self.egui_ctx.request_repaint();
+    }
+
     fn handle_cursor_keys(&mut self, ctx: &egui::Context) {
         let Some(summary) = self.summary.as_ref() else {
             return;
@@ -1276,7 +1396,7 @@ impl VoxelInkApp {
                                     ui.columns(2, |columns| {
                                         if selection_button(
                                             &mut columns[0],
-                                            "Round",
+                                            "Round (R)",
                                             self.brush_shape == BrushShape::Round,
                                             brush_accent,
                                             self.forced_colors,
@@ -1287,7 +1407,7 @@ impl VoxelInkApp {
                                         }
                                         if selection_button(
                                             &mut columns[1],
-                                            "Square",
+                                            "Square (Q)",
                                             self.brush_shape == BrushShape::Square,
                                             brush_accent,
                                             self.forced_colors,
@@ -1302,7 +1422,7 @@ impl VoxelInkApp {
                                     ui.columns(2, |columns| {
                                         if selection_button(
                                             &mut columns[0],
-                                            "One slice",
+                                            "One slice (1)",
                                             self.brush_depth == BrushDepth::Slice,
                                             brush_accent,
                                             self.forced_colors,
@@ -1313,7 +1433,7 @@ impl VoxelInkApp {
                                         }
                                         if selection_button(
                                             &mut columns[1],
-                                            "3D volume",
+                                            "3D volume (3)",
                                             self.brush_depth == BrushDepth::Volume,
                                             brush_accent,
                                             self.forced_colors,
@@ -1340,7 +1460,7 @@ impl VoxelInkApp {
                                         self.brush_size_unit = BrushSizeUnit::Voxels;
                                     }
                                     ui.horizontal(|ui| {
-                                        ui.label(egui::RichText::new("Size").small().strong());
+                                        ui.label(egui::RichText::new("Size (U)").small().strong());
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
@@ -1376,7 +1496,10 @@ impl VoxelInkApp {
                                     match self.brush_size_unit {
                                         BrushSizeUnit::Voxels => {
                                             let label = ui.add(
-                                                egui::Label::new("Brush diameter in voxels").wrap(),
+                                                egui::Label::new(
+                                                    "Brush diameter in voxels (- / +)",
+                                                )
+                                                .wrap(),
                                             );
                                             let mut changed = false;
                                             ui.allocate_ui_with_layout(
@@ -1427,7 +1550,7 @@ impl VoxelInkApp {
                                         BrushSizeUnit::Millimeters => {
                                             let label = ui.add(
                                                 egui::Label::new(
-                                                    "Brush diameter in millimetres",
+                                                    "Brush diameter in millimetres (- / +)",
                                                 )
                                                 .wrap(),
                                             );
@@ -1545,7 +1668,7 @@ impl VoxelInkApp {
 
                             let mut voxel_seams = self.scene.voxel_seams();
                             if ui
-                                .checkbox(&mut voxel_seams, "Show voxel outlines")
+                                .checkbox(&mut voxel_seams, "Show voxel outlines (V)")
                                 .on_hover_text(
                                     "Show antialiased voxel boundaries in both Orbit and Fly views",
                                 )
@@ -2238,7 +2361,7 @@ impl VoxelInkApp {
                 Some(anchor) if self.tool == Tool::Bridge && anchor.space == space => {
                     BrushPreviewRequest::Bridge {
                         generation: 0,
-                        spec: self.brush_spec(),
+                        spec: anchor.spec,
                         space,
                         anchor: anchor.voxel,
                         plane_normal: anchor.plane_normal,
@@ -2311,7 +2434,7 @@ impl VoxelInkApp {
                 if let Some(voxel) = released_voxel {
                     let release = DeferredBridgeRelease {
                         sample: PointerSample::Slice { axis, voxel },
-                        spec: self.brush_spec(),
+                        spec: self.bridge_gesture_spec(space),
                         space,
                     };
                     if self.bridge_anchor.is_some() {
@@ -2388,12 +2511,14 @@ impl VoxelInkApp {
             .put(reset_rect, egui::Button::new("Reset"))
             .on_hover_text(match self.scene.view_mode() {
                 VolumeViewMode::Orbit => {
-                    "Center the volume and restore the default rotation and zoom"
+                    "Center the volume and restore the default rotation and zoom (Home in captured Fly)"
                 }
-                VolumeViewMode::Fly => "Return to the initial Fly viewpoint and movement speed",
+                VolumeViewMode::Fly => {
+                    "Return to the initial Fly viewpoint and movement speed (Home)"
+                }
             });
         reset_response.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Reset view")
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Reset view (Home)")
         });
         if reset_response.clicked() {
             self.scene.reset_view();
@@ -2530,7 +2655,7 @@ impl VoxelInkApp {
         let controls = match (view_mode, self.fly_captured, self.tool) {
             (VolumeViewMode::Fly, false, _) => "Click viewport to fly",
             (VolumeViewMode::Fly, true, _) => {
-                "WASD move · Space/Shift height · Ctrl boost · Wheel speed · Esc release"
+                "WASD move · Space/Shift height · Ctrl boost · Wheel speed · -/+ brush · V outlines · Home reset · Esc release"
             }
             (VolumeViewMode::Orbit, _, Tool::Inspect) => {
                 "Left / middle drag: rotate   Right drag: move   Wheel: zoom"
@@ -2544,7 +2669,7 @@ impl VoxelInkApp {
         };
         let compact_controls = match (view_mode, self.fly_captured, self.tool) {
             (VolumeViewMode::Fly, false, _) => "Click to fly",
-            (VolumeViewMode::Fly, true, _) => "WASD · Space/Shift · Ctrl · Wheel · Esc",
+            (VolumeViewMode::Fly, true, _) => "WASD · Wheel · -/+ brush · V · Home · Esc",
             (VolumeViewMode::Orbit, _, Tool::Inspect) => "Rotate · Move · Zoom",
             (VolumeViewMode::Orbit, _, Tool::Bridge) => "Bridge · Rotate · Move · Zoom",
             (VolumeViewMode::Orbit, _, Tool::Paint | Tool::Erase) => "Edit · Rotate · Move · Zoom",
@@ -2635,8 +2760,12 @@ impl VoxelInkApp {
                                 - f32::from(u8::from(input.key_down(egui::Key::S))),
                             f32::from(u8::from(input.key_down(egui::Key::D)))
                                 - f32::from(u8::from(input.key_down(egui::Key::A))),
-                            f32::from(u8::from(input.key_down(egui::Key::Space)))
-                                - f32::from(u8::from(input.modifiers.shift)),
+                            if self.suppress_fly_vertical_this_frame {
+                                0.0
+                            } else {
+                                f32::from(u8::from(input.key_down(egui::Key::Space)))
+                                    - f32::from(u8::from(input.modifiers.shift))
+                            },
                             input.modifiers.ctrl,
                         );
                         (
@@ -2737,7 +2866,7 @@ impl VoxelInkApp {
                 Some(anchor) if self.tool == Tool::Bridge && anchor.space == space => {
                     BrushPreviewRequest::Bridge {
                         generation: 0,
-                        spec: self.brush_spec(),
+                        spec: anchor.spec,
                         space,
                         anchor: anchor.voxel,
                         plane_normal: anchor.plane_normal,
@@ -2807,7 +2936,7 @@ impl VoxelInkApp {
                 if let Some(ray) = released_ray {
                     let release = DeferredBridgeRelease {
                         sample: PointerSample::Ray { ray },
-                        spec: self.brush_spec(),
+                        spec: self.bridge_gesture_spec(space),
                         space,
                     };
                     if self.bridge_anchor.is_some() {
@@ -3018,6 +3147,23 @@ impl VoxelInkApp {
         }
     }
 
+    fn bridge_gesture_spec(&self, space: StrokeSpace) -> BrushSpec {
+        if let Some(anchor) = self.bridge_anchor.filter(|anchor| anchor.space == space) {
+            return anchor.spec;
+        }
+        self.pending_preview
+            .and_then(|pending| match pending.request {
+                BrushPreviewRequest::Brush {
+                    tool: Tool::Bridge,
+                    spec,
+                    space: pending_space,
+                    ..
+                } if pending_space == space => Some(spec),
+                BrushPreviewRequest::Brush { .. } | BrushPreviewRequest::Bridge { .. } => None,
+            })
+            .unwrap_or_else(|| self.brush_spec())
+    }
+
     fn request_brush_preview(&mut self, request: BrushPreviewRequest) {
         if self.pending_preview.is_some() || self.edit_input_blocked() {
             return;
@@ -3111,7 +3257,7 @@ impl VoxelInkApp {
         self.brush_preview_voxels.clear();
         if let (
             PreviewAction::BridgeAnchor { plane_normal },
-            BrushPreviewRequest::Brush { space, .. },
+            BrushPreviewRequest::Brush { spec, space, .. },
         ) = (pending.action, pending.request)
         {
             if let Some(voxel) = target {
@@ -3119,6 +3265,7 @@ impl VoxelInkApp {
                     voxel,
                     space,
                     plane_normal,
+                    spec,
                 });
                 if let Some(release) = self.deferred_bridge_release.take()
                     && release.space == space
@@ -3203,7 +3350,7 @@ impl VoxelInkApp {
         let _ = self.scene.set_voxel_highlight(epoch, revision, highlights);
     }
 
-    fn request_bridge_commit(&mut self, release: DeferredBridgeRelease) {
+    fn request_bridge_commit(&mut self, mut release: DeferredBridgeRelease) {
         if self.edit_input_blocked() {
             self.cancel_edit_interaction();
             return;
@@ -3212,6 +3359,7 @@ impl VoxelInkApp {
             self.deferred_bridge_release = Some(release);
             return;
         };
+        release.spec = anchor.spec;
         if self.bridge_commit.is_some() || self.stroke.is_some() {
             return;
         }
@@ -3669,6 +3817,7 @@ impl VoxelInkApp {
 impl eframe::App for VoxelInkApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.suppress_fly_vertical_this_frame = false;
         self.process_engine_events(&ctx);
         self.enforce_fly_capture_invariants(&ctx);
         let close_requested = ctx.input(|input| input.viewport().close_requested());
@@ -3710,6 +3859,7 @@ impl eframe::App for VoxelInkApp {
         // delivered in one frame cannot start a stroke with the previous tool.
         if !self.shortcuts_blocked() {
             self.handle_tool_shortcuts(&ctx);
+            self.handle_setting_shortcuts(&ctx);
         }
         if self.dialog.is_some() {
             ui.disable();
@@ -3967,6 +4117,22 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
 }
 
+fn adjusted_voxel_diameter(current: u8, direction: i8) -> u8 {
+    if direction < 0 {
+        current.saturating_sub(2)
+    } else if direction > 0 {
+        current.saturating_add(2)
+    } else {
+        current
+    }
+    .clamp(BrushSize::MIN_VOXELS, BrushSize::MAX_VOXELS)
+}
+
+fn adjusted_millimetre_diameter(current: f32, direction: i8) -> f32 {
+    (current + f32::from(direction.signum()) * 0.5)
+        .clamp(BrushSize::MIN_MILLIMETERS, BrushSize::MAX_MILLIMETERS)
+}
+
 fn consume_shortcut(ctx: &egui::Context, modifiers: egui::Modifiers, key: egui::Key) -> bool {
     ctx.input_mut(|input| input.consume_shortcut(&egui::KeyboardShortcut::new(modifiers, key)))
 }
@@ -3975,6 +4141,34 @@ fn consume_fly_key(ctx: &egui::Context, key: egui::Key) -> bool {
     ctx.input_mut(|input| {
         input.consume_key(egui::Modifiers::CTRL, key)
             || input.consume_key(egui::Modifiers::NONE, key)
+    })
+}
+
+fn consume_setting_key(
+    ctx: &egui::Context,
+    key: egui::Key,
+    fly_captured: bool,
+    allow_shift: bool,
+) -> bool {
+    ctx.input_mut(|input| {
+        if allow_shift
+            && (input.consume_key(egui::Modifiers::SHIFT, key)
+                || (fly_captured
+                    && input.consume_key(
+                        egui::Modifiers {
+                            ctrl: true,
+                            shift: true,
+                            ..Default::default()
+                        },
+                        key,
+                    )))
+        {
+            return true;
+        }
+        if fly_captured && input.consume_key(egui::Modifiers::CTRL, key) {
+            return true;
+        }
+        input.consume_key(egui::Modifiers::NONE, key)
     })
 }
 
@@ -4755,5 +4949,23 @@ mod tests {
         assert_eq!(cavity_fill_action_text_color(false, false), None);
         assert_eq!(cavity_fill_action_text_color(true, true), None);
         assert_eq!(cavity_fill_action_text_color(false, true), None);
+    }
+
+    #[test]
+    fn keyboard_diameter_steps_preserve_units_and_bounds() {
+        assert_eq!(adjusted_voxel_diameter(5, -1), 3);
+        assert_eq!(adjusted_voxel_diameter(5, 1), 7);
+        assert_eq!(adjusted_voxel_diameter(BrushSize::MIN_VOXELS, -1), 1);
+        assert_eq!(adjusted_voxel_diameter(BrushSize::MAX_VOXELS, 1), 101);
+        assert_eq!(adjusted_millimetre_diameter(3.0, -1), 2.5);
+        assert_eq!(adjusted_millimetre_diameter(3.0, 1), 3.5);
+        assert_eq!(
+            adjusted_millimetre_diameter(BrushSize::MIN_MILLIMETERS, -1),
+            BrushSize::MIN_MILLIMETERS
+        );
+        assert_eq!(
+            adjusted_millimetre_diameter(BrushSize::MAX_MILLIMETERS, 1),
+            BrushSize::MAX_MILLIMETERS
+        );
     }
 }

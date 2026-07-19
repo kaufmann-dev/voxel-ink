@@ -92,12 +92,14 @@ Use **File → Open** to load a supported volume. Common shortcuts are `Ctrl+O` 
 
 Choose a tool from the toolbar or press `I` for Inspect, `B` for Paint, `E` for Erase, or `L` for Bridge. The slice views support wheel-based slice navigation, `Ctrl`+wheel zoom, drag-to-pan, and click/drag editing. Arrow keys plus Page Up/Page Down move through slices; Space or Enter applies Paint or Erase.
 
+With Paint, Erase, or Bridge selected, press `-` or `+` to change brush diameter, `R` or `Q` for Round or Square, `1` or `3` for One slice or 3D volume, and `U` to switch between voxel and millimetre sizing when physical units are available. Press `V` to toggle voxel outlines. A brush setting changed during an active stroke applies to the next stroke; the current stroke keeps the brush it started with.
+
 Bridge adds one solid connection while you drag between two points. Very large bridges may be too expensive to preview exactly; in that case VoxelInk keeps the endpoints visible and shows a yellow notice instead of interrupting the drag. Shorten the bridge to restore the full preview, or release to let VoxelInk make a larger bounded attempt. If that final attempt is still too large, no voxels are changed and a nonmodal notice asks you to reduce the diameter or length.
 
 The 3D pane offers two navigation styles:
 
 - **Orbit** rotates around the volume, pans with the right mouse button, and zooms with the wheel.
-- **Fly** uses a fixed center reticle. Click once to capture the mouse; that first click never edits. Look with the mouse, move with `W/A/S/D`, change world-Z height with Space/Shift, hold `Ctrl` to boost, and use the wheel to adjust speed. Left-click or hold to use Paint, Erase, or Bridge through the reticle. Undo and redo remain available with `Ctrl+Z`, `Ctrl+Shift+Z`, or `Ctrl+Y`; file shortcuts stay suppressed during capture. Press Escape to cancel the active stroke and release the mouse.
+- **Fly** uses a fixed center reticle. Click once to capture the mouse; that first click never edits. Look with the mouse, move with `W/A/S/D`, change world-Z height with Space/Shift, hold `Ctrl` to boost, and use the wheel to adjust speed. Left-click or hold to use Paint, Erase, or Bridge through the reticle. Tool, brush, outline, undo, redo, and Home camera-reset shortcuts remain available without releasing capture; file shortcuts stay suppressed. Press Escape to cancel the active stroke and release the mouse.
 
 Orbit and Fly remember separate viewpoints. Reset affects only the active camera, and opening or closing a document returns navigation to Orbit. The **3D view** card in the repair panel provides a flight-speed slider and a shared voxel-outline toggle that affects both navigation modes.
 
