@@ -103,6 +103,90 @@ fn toolbar_exposes_names_disabled_state_focus_order_and_tool_state() {
 }
 
 #[test]
+fn enabled_button_families_have_visible_hover_fill_and_stable_borders() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("button-hover.binvox");
+    write_binvox(&path, [5, 5, 5], &[0; 125]);
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "5 × 5 × 5");
+
+    for label in [
+        "Open…",
+        "Inspect (I)",
+        "Paint (B)",
+        "Orbit view",
+        "Fill enclosed cavities",
+    ] {
+        harness.get_by_label(label).scroll_to_me();
+        harness.hover_at(egui::pos2(1.0, 1.0));
+        harness.step();
+        harness.step();
+        let idle = painted_button_frame(&harness, label);
+
+        let center = harness.get_by_label(label).rect().center();
+        harness.hover_at(center);
+        harness.step();
+        harness.step();
+        let hovered = painted_button_frame(&harness, label);
+
+        assert_ne!(
+            idle.fill, hovered.fill,
+            "{label} should visibly change fill on hover"
+        );
+        assert_eq!(
+            idle.stroke.width, hovered.stroke.width,
+            "{label} should not gain a thicker hover border"
+        );
+        assert!(
+            (idle.rect.min - hovered.rect.min).length() < 0.1
+                && (idle.rect.max - hovered.rect.max).length() < 0.1,
+            "{label} should not expand on hover: {:?} -> {:?}",
+            idle.rect,
+            hovered.rect
+        );
+    }
+}
+
+fn painted_button_frame(
+    harness: &Harness<'_, VoxelInkApp>,
+    label: &str,
+) -> egui::epaint::RectShape {
+    fn collect_rects(shape: &egui::epaint::Shape, rects: &mut Vec<egui::epaint::RectShape>) {
+        match shape {
+            egui::epaint::Shape::Rect(rect) => rects.push(rect.clone()),
+            egui::epaint::Shape::Vec(children) => {
+                for child in children {
+                    collect_rects(child, rects);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let target = harness.get_by_label(label).rect();
+    let mut rects = Vec::new();
+    for clipped in &harness.output().shapes {
+        collect_rects(&clipped.shape, &mut rects);
+    }
+    rects
+        .into_iter()
+        .filter(|shape| {
+            shape.fill != egui::Color32::TRANSPARENT
+                && shape.rect.contains(target.center())
+                && (shape.rect.width() - target.width()).abs() < 4.0
+                && (shape.rect.height() - target.height()).abs() < 4.0
+        })
+        .min_by(|left, right| {
+            let left_delta = (left.rect.width() - target.width()).abs()
+                + (left.rect.height() - target.height()).abs();
+            let right_delta = (right.rect.width() - target.width()).abs()
+                + (right.rect.height() - target.height()).abs();
+            left_delta.total_cmp(&right_delta)
+        })
+        .unwrap_or_else(|| panic!("could not find the painted frame for {label} at {target:?}"))
+}
+
+#[test]
 fn repair_panel_guidance_and_controls_stay_inside_the_panel() {
     let harness = app_harness_with_size(None, [900.0, 620.0]);
     let panel = harness

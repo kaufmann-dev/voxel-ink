@@ -30,6 +30,8 @@ const MUTED: Color32 = Color32::from_gray(166);
 const SCROLL_HANDLE_IDLE: Color32 = Color32::from_gray(104);
 const SCROLL_HANDLE_HOVERED: Color32 = Color32::from_gray(166);
 const TEAL: Color32 = Color32::from_rgb(36, 200, 219);
+const TEAL_HOVERED: Color32 = Color32::from_rgb(72, 218, 232);
+const TEAL_ACTIVE: Color32 = Color32::from_rgb(24, 176, 194);
 const YELLOW: Color32 = Color32::from_rgb(255, 193, 49);
 const PAINT_GREEN: Color32 = Color32::from_rgb(0x42, 0xd6, 0x7c);
 const ERASE_RED: Color32 = Color32::from_rgb(0xff, 0x5b, 0x45);
@@ -1713,15 +1715,16 @@ impl VoxelInkApp {
                             let action = egui::Button::new(action_text)
                                 .min_size(egui::vec2(ui.available_width(), 38.0))
                                 .corner_radius(CONTROL_RADIUS);
-                            let action = if ready && !self.forced_colors {
-                                action
-                                    .fill(TEAL)
-                                    .stroke(egui::Stroke::new(1.0, TEAL))
+                            let response = if ready {
+                                with_button_palette(
+                                    ui,
+                                    accent_action_button_palette(self.forced_colors),
+                                    |ui| ui.add(action),
+                                )
                             } else {
-                                action
+                                ui.add_enabled(false, action)
                             };
-                            if ui
-                                .add_enabled(ready, action)
+                            if response
                                 .on_hover_text(
                                     "Fill every empty 3D region that cannot reach a volume boundary. The result is one Undo step.",
                                 )
@@ -2545,11 +2548,10 @@ impl VoxelInkApp {
         } else {
             egui::RichText::new("Orbit")
         };
-        let orbit_response = ui.put(
-            orbit_rect,
-            egui::Button::new(orbit_text)
-                .selected(orbit_selected)
-                .truncate(),
+        let orbit_response = with_button_palette(
+            ui,
+            view_mode_button_palette(orbit_selected, self.forced_colors),
+            |ui| ui.put(orbit_rect, egui::Button::new(orbit_text).truncate()),
         );
         orbit_response.widget_info(|| {
             egui::WidgetInfo::selected(
@@ -2571,11 +2573,10 @@ impl VoxelInkApp {
         };
         let fly_response = ui
             .scope_builder(fly_builder, |ui| {
-                ui.put(
-                    fly_rect,
-                    egui::Button::new(fly_text)
-                        .selected(fly_selected)
-                        .truncate(),
+                with_button_palette(
+                    ui,
+                    view_mode_button_palette(fly_selected, self.forced_colors),
+                    |ui| ui.put(fly_rect, egui::Button::new(fly_text).truncate()),
                 )
             })
             .inner;
@@ -3882,30 +3883,22 @@ fn selection_button(
     accent: Color32,
     forced_colors: bool,
 ) -> egui::Response {
-    let (fill, stroke, text) = if forced_colors {
-        if selected {
-            (Color32::WHITE, Color32::WHITE, Color32::BLACK)
-        } else {
-            (Color32::BLACK, Color32::WHITE, Color32::WHITE)
-        }
-    } else if selected {
-        (
-            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 52),
-            accent,
-            TEXT,
-        )
-    } else {
-        (RAISED, LINE, MUTED)
-    };
     let width = ui.available_width();
-    ui.add(
-        egui::Button::new(egui::RichText::new(label).color(text))
-            .selected(selected)
-            .fill(fill)
-            .stroke(egui::Stroke::new(if selected { 1.5 } else { 1.0 }, stroke))
-            .corner_radius(if forced_colors { 0 } else { CONTROL_RADIUS })
-            .min_size(egui::vec2(width, 34.0)),
-    )
+    let response = with_button_palette(
+        ui,
+        selection_button_palette(selected, accent, forced_colors),
+        |ui| {
+            ui.add(
+                egui::Button::new(label)
+                    .corner_radius(if forced_colors { 0 } else { CONTROL_RADIUS })
+                    .min_size(egui::vec2(width, 34.0)),
+            )
+        },
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), selected, label)
+    });
+    response
 }
 
 const fn tool_accent(tool: Tool) -> Color32 {
@@ -3924,29 +3917,158 @@ fn compact_selection_button(
     accent: Color32,
     forced_colors: bool,
 ) -> egui::Response {
-    let (fill, stroke, text) = if forced_colors {
-        if selected {
-            (Color32::WHITE, Color32::WHITE, Color32::BLACK)
+    let response = with_button_palette(
+        ui,
+        selection_button_palette(selected, accent, forced_colors),
+        |ui| {
+            ui.add(
+                egui::Button::new(egui::RichText::new(label).small())
+                    .corner_radius(if forced_colors { 0 } else { CONTROL_RADIUS })
+                    .min_size(egui::vec2(if label == "mm" { 42.0 } else { 58.0 }, 26.0)),
+            )
+        },
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), selected, label)
+    });
+    response
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ButtonAppearance {
+    fill: Color32,
+    stroke: egui::Stroke,
+    text: Color32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ButtonPalette {
+    inactive: ButtonAppearance,
+    hovered: ButtonAppearance,
+    active: ButtonAppearance,
+}
+
+fn with_button_palette<R>(
+    ui: &mut egui::Ui,
+    palette: ButtonPalette,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    ui.scope(|ui| {
+        let visuals = ui.visuals_mut();
+        visuals.override_text_color = None;
+        apply_button_appearance(&mut visuals.widgets.inactive, palette.inactive);
+        apply_button_appearance(&mut visuals.widgets.hovered, palette.hovered);
+        apply_button_appearance(&mut visuals.widgets.active, palette.active);
+        add(ui)
+    })
+    .inner
+}
+
+fn apply_button_appearance(visuals: &mut egui::style::WidgetVisuals, appearance: ButtonAppearance) {
+    visuals.weak_bg_fill = appearance.fill;
+    visuals.bg_fill = appearance.fill;
+    visuals.bg_stroke = appearance.stroke;
+    visuals.fg_stroke = egui::Stroke::new(1.0, appearance.text);
+    visuals.expansion = 0.0;
+}
+
+fn selection_button_palette(selected: bool, accent: Color32, forced_colors: bool) -> ButtonPalette {
+    if forced_colors {
+        let inactive = if selected {
+            ButtonAppearance {
+                fill: Color32::WHITE,
+                stroke: egui::Stroke::new(1.0, Color32::WHITE),
+                text: Color32::BLACK,
+            }
         } else {
-            (Color32::BLACK, Color32::WHITE, Color32::WHITE)
-        }
-    } else if selected {
-        (
-            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 52),
-            accent,
-            TEXT,
-        )
-    } else {
-        (RAISED, LINE, MUTED)
+            ButtonAppearance {
+                fill: Color32::BLACK,
+                stroke: egui::Stroke::new(1.0, Color32::WHITE),
+                text: Color32::WHITE,
+            }
+        };
+        let inverted = ButtonAppearance {
+            fill: if selected {
+                Color32::BLACK
+            } else {
+                Color32::WHITE
+            },
+            stroke: egui::Stroke::new(1.0, Color32::WHITE),
+            text: if selected {
+                Color32::WHITE
+            } else {
+                Color32::BLACK
+            },
+        };
+        return ButtonPalette {
+            inactive,
+            hovered: inverted,
+            active: inverted,
+        };
+    }
+
+    let stroke_width = if selected { 1.5 } else { 1.0 };
+    let inactive = ButtonAppearance {
+        fill: if selected {
+            translucent(accent, 52)
+        } else {
+            RAISED
+        },
+        stroke: egui::Stroke::new(stroke_width, if selected { accent } else { LINE }),
+        text: if selected { TEXT } else { MUTED },
     };
-    ui.add(
-        egui::Button::new(egui::RichText::new(label).small().color(text))
-            .selected(selected)
-            .fill(fill)
-            .stroke(egui::Stroke::new(1.0, stroke))
-            .corner_radius(if forced_colors { 0 } else { CONTROL_RADIUS })
-            .min_size(egui::vec2(if label == "mm" { 42.0 } else { 58.0 }, 26.0)),
-    )
+    let hovered = ButtonAppearance {
+        fill: translucent(accent, if selected { 82 } else { 34 }),
+        stroke: egui::Stroke::new(stroke_width, accent),
+        text: TEXT,
+    };
+    let active = ButtonAppearance {
+        fill: translucent(accent, if selected { 112 } else { 72 }),
+        stroke: egui::Stroke::new(stroke_width, accent),
+        text: TEXT,
+    };
+    ButtonPalette {
+        inactive,
+        hovered,
+        active,
+    }
+}
+
+fn view_mode_button_palette(selected: bool, forced_colors: bool) -> ButtonPalette {
+    if !selected {
+        return selection_button_palette(false, TEAL, forced_colors);
+    }
+    if forced_colors {
+        return selection_button_palette(true, TEAL, true);
+    }
+    accent_action_button_palette(false)
+}
+
+fn accent_action_button_palette(forced_colors: bool) -> ButtonPalette {
+    if forced_colors {
+        return selection_button_palette(true, TEAL, true);
+    }
+    ButtonPalette {
+        inactive: ButtonAppearance {
+            fill: TEAL,
+            stroke: egui::Stroke::new(1.0, TEAL),
+            text: BACKGROUND,
+        },
+        hovered: ButtonAppearance {
+            fill: TEAL_HOVERED,
+            stroke: egui::Stroke::new(1.0, TEAL),
+            text: BACKGROUND,
+        },
+        active: ButtonAppearance {
+            fill: TEAL_ACTIVE,
+            stroke: egui::Stroke::new(1.0, TEAL),
+            text: BACKGROUND,
+        },
+    }
+}
+
+fn translucent(color: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
 }
 
 fn status_chip(ui: &mut egui::Ui, label: &str, value: String, forced_colors: bool) {
@@ -4035,6 +4157,7 @@ fn configure_style(ctx: &egui::Context, forced_colors: bool, reduced_motion: boo
     } else {
         RAISED
     };
+    visuals.widgets.inactive.weak_bg_fill = visuals.widgets.inactive.bg_fill;
     visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, TEXT);
     visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, LINE);
     visuals.widgets.hovered.bg_fill = if forced_colors {
@@ -4042,11 +4165,18 @@ fn configure_style(ctx: &egui::Context, forced_colors: bool, reduced_motion: boo
     } else {
         Color32::from_gray(36)
     };
+    visuals.widgets.hovered.weak_bg_fill = visuals.widgets.hovered.bg_fill;
     visuals.widgets.hovered.fg_stroke =
         egui::Stroke::new(1.5, if forced_colors { Color32::BLACK } else { TEXT });
     visuals.widgets.hovered.bg_stroke =
-        egui::Stroke::new(1.0, if forced_colors { Color32::WHITE } else { TEAL });
+        egui::Stroke::new(1.0, if forced_colors { Color32::WHITE } else { LINE });
     visuals.widgets.active.bg_fill = if forced_colors { Color32::WHITE } else { TEAL };
+    visuals.widgets.active.weak_bg_fill = visuals.widgets.active.bg_fill;
+    visuals.widgets.noninteractive.expansion = 0.0;
+    visuals.widgets.inactive.expansion = 0.0;
+    visuals.widgets.hovered.expansion = 0.0;
+    visuals.widgets.active.expansion = 0.0;
+    visuals.widgets.open.expansion = 0.0;
     visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, MUTED);
     ctx.set_visuals(visuals);
     ctx.style_mut_of(egui::Theme::Dark, |style| {
@@ -4569,6 +4699,23 @@ fn suggested_save_name(summary: &DocumentSummary, purpose: DialogPurpose) -> Str
 mod tests {
     use super::*;
     use crate::brush::Ray;
+
+    #[test]
+    fn every_button_palette_changes_fill_without_changing_border_width() {
+        let palettes = [
+            selection_button_palette(false, ERASE_RED, false),
+            selection_button_palette(true, ERASE_RED, false),
+            view_mode_button_palette(false, false),
+            view_mode_button_palette(true, false),
+            accent_action_button_palette(false),
+        ];
+
+        for palette in palettes {
+            assert_ne!(palette.inactive.fill, palette.hovered.fill);
+            assert_eq!(palette.inactive.stroke.width, palette.hovered.stroke.width);
+            assert_eq!(palette.inactive.stroke.width, palette.active.stroke.width);
+        }
+    }
 
     #[test]
     fn repair_scroll_bar_has_distinct_idle_hover_and_active_states() {
