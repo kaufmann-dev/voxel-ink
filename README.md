@@ -121,7 +121,3 @@ cargo bench --locked --bench hot_paths -- --noplot
 ```
 
 The Linux CI workflow also builds an x86_64 AppImage, builds a Fedora RPM with Podman, and smoke-tests the native application.
-
-## License
-
-The package metadata declares VoxelInk under `MIT OR Apache-2.0`.
