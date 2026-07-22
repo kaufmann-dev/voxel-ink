@@ -39,6 +39,10 @@ struct Uniforms {
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
+// Snorm16x4 exposes the connected 0..32767 step range as 0.0..1.0.
+// Restore the integer magnitude before converting steps to physical distance.
+const LEAK_DISTANCE_SNORM_STEP_RANGE: f32 = 32767.0;
+
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) view_normal: vec3<f32>,
@@ -182,7 +186,8 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     var lighting = base_lighting * depth_factor * surface_factor * voxel_ao_factor;
     if (uniforms.leak_light != 0u) {
         let connected = input.leak_distance >= 0.0;
-        let physical_distance = max(input.leak_distance, 0.0) * uniforms.leak_distance_scale;
+        let physical_distance = max(input.leak_distance, 0.0) * LEAK_DISTANCE_SNORM_STEP_RANGE
+            * uniforms.leak_distance_scale;
         let leak_intensity = exp2(-physical_distance / max(uniforms.leak_half_distance, 1.0e-12));
         let connected_light = select(
             0.015,
@@ -3123,6 +3128,12 @@ mod tests {
     }
 
     #[test]
+    fn leak_distance_shader_restores_the_snorm_step_range() {
+        assert!(SHADER.contains("const LEAK_DISTANCE_SNORM_STEP_RANGE: f32 = 32767.0;"));
+        assert!(SHADER.contains("max(input.leak_distance, 0.0) * LEAK_DISTANCE_SNORM_STEP_RANGE"));
+    }
+
+    #[test]
     fn orbit_and_fly_use_their_expected_fields_of_view() {
         let mut state = SceneState::default();
         let (_, orbit_projection, _, _, _, _, _) = scene_camera(&state);
@@ -5049,5 +5060,181 @@ mod tests {
             .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
             .collect::<Vec<_>>();
         assert_eq!(words, vec![0, 0, 0x8000_8000, 0x8000_8000]);
+        drop(bytes);
+        readback.unmap();
+
+        renderer.apply_update(
+            &device,
+            &queue,
+            SceneUpdate::Chunk {
+                tag: MeshJobTag {
+                    document_epoch: 1,
+                    revision: 2,
+                    chunk_generation: 2,
+                    edit_generation: 0,
+                    chunk: coordinate,
+                },
+                quads: vec![
+                    CompactQuad::new([1, 1, 1], 1, 1, crate::mesh::FaceAxis::Z, true, [0; 4])
+                        .unwrap(),
+                ],
+                priority: MeshUpdatePriority::Background,
+            },
+        );
+        let far_connected = PackedLeakDistance::new([i16::MAX as u16; 4]).unwrap();
+        let far_connected_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("far connected leak-distance test buffer"),
+            contents: bytemuck::bytes_of(&far_connected),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        renderer
+            .chunks
+            .get_mut(&coordinate)
+            .expect("the test face must remain resident")
+            .leak_distance = Some(far_connected_buffer);
+
+        let index_to_world = Mat4::from_scale_rotation_translation(
+            Vec3::new(1.5, 1.5, 1.0),
+            glam::Quat::IDENTITY,
+            Vec3::new(-1.5, -1.5, 0.0),
+        );
+        let uniforms = Uniforms {
+            index_to_world: index_to_world.to_cols_array_2d(),
+            index_normal_to_view: normal_matrix(index_to_world).to_cols_array_2d(),
+            leak_half_distance: 1.0,
+            leak_distance_scale: 0.1,
+            leak_light: 1,
+            ..Uniforms::default()
+        };
+        queue.write_buffer(&renderer.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+
+        const WIDTH: u32 = 64;
+        const HEIGHT: u32 = 64;
+        let multisampled_color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("far connected leak-light multisampled color"),
+            size: wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: MSAA_SAMPLES,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let resolved_color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("far connected leak-light resolved color"),
+            size: wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("far connected leak-light depth"),
+            size: wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: MSAA_SAMPLES,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth24Plus,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let multisampled_view = multisampled_color.create_view(&Default::default());
+        let resolved_view = resolved_color.create_view(&Default::default());
+        let depth_view = depth.create_view(&Default::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("far connected leak-light encoder"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("far connected leak-light pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &multisampled_view,
+                    depth_slice: None,
+                    resolve_target: Some(&resolved_view),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Discard,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            let chunk = renderer.chunks.get(&coordinate).unwrap();
+            pass.set_pipeline(&renderer.leak_pipeline);
+            pass.set_bind_group(0, &renderer.bind_group, &[]);
+            pass.set_vertex_buffer(0, chunk.buffer.slice(..));
+            pass.set_vertex_buffer(1, chunk.leak_distance.as_ref().unwrap().slice(..));
+            pass.draw(0..6, 0..1);
+        }
+
+        let bytes_per_row = WIDTH * size_of::<u32>() as u32;
+        let output = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("far connected leak-light readback"),
+            size: u64::from(bytes_per_row * HEIGHT),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            resolved_color.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &output,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+        );
+        let submission = queue.submit([encoder.finish()]);
+        let slice = output.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(std::time::Duration::from_secs(10)),
+            })
+            .expect("software Vulkan leak-light render must complete");
+        receiver
+            .recv()
+            .expect("readback callback must run")
+            .expect("leak-light readback buffer must map");
+        let pixels = slice.get_mapped_range();
+        let center = ((HEIGHT / 2 * WIDTH + WIDTH / 2) * 4) as usize;
+        let maximum_channel = pixels[center..center + 3].iter().copied().max().unwrap();
+        assert!(
+            (16..80).contains(&maximum_channel),
+            "a far connected surface must be rendered dark, got {maximum_channel}"
+        );
     }
 }
