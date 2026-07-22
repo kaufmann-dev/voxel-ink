@@ -823,7 +823,7 @@ fn fly_selector_is_accessible_without_resizing_and_expand_stays_independent() {
 #[test]
 fn leak_light_control_computes_in_background_and_c_shortcut_toggles_it() {
     let directory = tempdir().unwrap();
-    let path = directory.path().join("leak-light-controls.binvox");
+    let path = directory.path().join("leak-light-controls.nii");
     let dimensions = [7, 7, 7];
     let mut occupancy = vec![1; 343];
     let index = |voxel: [u32; 3]| {
@@ -832,8 +832,8 @@ fn leak_light_control_computes_in_background_and_c_shortcut_toggles_it() {
     for voxel in [[0, 3, 3], [1, 3, 3], [2, 3, 3], [2, 2, 3], [2, 2, 2]] {
         occupancy[index(voxel)] = 0;
     }
-    write_binvox(&path, dimensions, &occupancy);
-    let mut harness = app_harness(Some(path));
+    write_nifti_u8(&path, dimensions, &occupancy);
+    let mut harness = app_harness_with_size(Some(path), [900.0, 620.0]);
     wait_for_label(&mut harness, "7 × 7 × 7");
 
     let control = harness.get_by_label("Show leak light (C)");
@@ -853,14 +853,29 @@ fn leak_light_control_computes_in_background_and_c_shortcut_toggles_it() {
             .toggled(),
         Some(Toggled::True)
     );
+    let reach_label = "Light reach in millimetres (half-brightness distance)";
+    let slider = harness.get_by_role_and_label(Role::Slider, reach_label);
+    let value = harness.get_by_role_and_label(Role::SpinButton, reach_label);
+    assert!(!slider.accesskit_node().is_disabled());
+    let panel = harness
+        .get_by_role_and_label(Role::Pane, "Repair volume controls")
+        .rect();
     assert!(
-        !harness
-            .get_by_role_and_label(
-                Role::Slider,
-                "Light reach in world units (half-brightness distance)",
-            )
+        slider.rect().right() <= value.rect().left()
+            && value.rect().right() <= panel.right() - 12.0,
+        "the light-reach controls overlapped or escaped the repair-panel gutter: {:?}, {:?} outside {panel:?}",
+        slider.rect(),
+        value.rect()
+    );
+    let selected_reach = drag_slider_to_minimum(&mut harness, reach_label);
+    wait_for_label(&mut harness, "Leak light is ready.");
+    assert_eq!(
+        harness
+            .get_by_role_and_label(Role::Slider, reach_label)
             .accesskit_node()
-            .is_disabled()
+            .numeric_value(),
+        Some(selected_reach),
+        "the asynchronous recompute moved the light-reach slider away from its selected minimum"
     );
 
     harness.key_press(egui::Key::C);

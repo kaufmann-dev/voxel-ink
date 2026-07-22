@@ -1906,22 +1906,48 @@ impl VoxelInkApp {
                                     .wrap(),
                                 );
                                 let [minimum, maximum] = leak_light_reach_range(summary);
-                                ui.spacing_mut().slider_width = ui.available_width().max(1.0);
-                                let response = ui
-                                    .add(
-                                        egui::Slider::new(
-                                            &mut self.leak_light_reach,
-                                            minimum..=maximum,
-                                        )
-                                        .logarithmic(true),
-                                    )
-                                    .labelled_by(label.id)
-                                    .on_hover_text(
-                                        "Physical path distance over which propagated brightness halves",
-                                    );
-                                if (response.changed() && !response.dragged())
-                                    || response.drag_stopped()
-                                {
+                                let mut recompute = false;
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(ui.available_width(), CONTROL_MIN_HEIGHT),
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let value_response = ui
+                                            .add(
+                                                egui::DragValue::new(
+                                                    &mut self.leak_light_reach,
+                                                )
+                                                .range(minimum..=maximum)
+                                                .speed((maximum - minimum) / 200.0),
+                                            )
+                                            .labelled_by(label.id)
+                                            .on_hover_text(
+                                                "Physical path distance over which propagated brightness halves",
+                                            );
+                                        recompute |= (value_response.changed()
+                                            && !value_response.dragged())
+                                            || value_response.drag_stopped();
+
+                                        ui.spacing_mut().slider_width =
+                                            ui.available_width().max(1.0);
+                                        let slider_response = ui
+                                            .add(
+                                                egui::Slider::new(
+                                                    &mut self.leak_light_reach,
+                                                    minimum..=maximum,
+                                                )
+                                                .logarithmic(true)
+                                                .show_value(false),
+                                            )
+                                            .labelled_by(label.id)
+                                            .on_hover_text(
+                                                "Physical path distance over which propagated brightness halves",
+                                            );
+                                        recompute |= (slider_response.changed()
+                                            && !slider_response.dragged())
+                                            || slider_response.drag_stopped();
+                                    },
+                                );
+                                if recompute {
                                     self.configure_leak_light(true);
                                 }
                                 ui.label(
