@@ -32,16 +32,6 @@ UI tests live in `tests/ui_kittest.rs`. Renderer validation includes a headless 
 
 Run `shellcheck` for changed packaging scripts. Validate changed desktop metadata with `desktop-file-validate`, AppStream metadata with `appstreamcli validate --no-net`, and XML with `xmllint --noout`.
 
-## Local user installation
-
-After successfully verifying changes that affect the runtime executable or compile-time assets, replace the current user installation:
-
-```sh
-./install
-```
-
-The installer refreshes the user-local executable and desktop integration under `~/.local`. Skip local installation for documentation-only and test-only changes.
-
 ## Packaging
 
 Build `target/release/voxel-ink` before invoking packaging scripts. AppImage inputs live under `packaging/appimage/`; Fedora RPM inputs live under `packaging/rpm/` and are built with Podman. Keep the package version synchronized across Cargo and packaging metadata, and keep the application ID `app.voxelink.editor` consistent across the desktop entry, MIME definition, metainfo, icon, and native window.
