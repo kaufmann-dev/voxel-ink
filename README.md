@@ -36,10 +36,10 @@ Clone the project if necessary, then install or replace the current user copy:
 ```sh
 git clone https://github.com/kaufmann-dev/voxel-ink.git
 cd voxel-ink
-cargo install --locked --force --path . --root "$HOME/.local"
+./install
 ```
 
-For a later update, pull the desired source revision and run only the `cargo install` command again. Confirm that the user copy wins:
+The installer builds and installs the executable, application launcher, icon, AppStream metadata, and file associations. For a later update, pull the desired source revision and run `./install` again; existing files are replaced. Confirm that the user copy wins:
 
 ```sh
 command -v voxel-ink
@@ -51,31 +51,6 @@ If the command is not found, add `~/.local/bin` to your shell's `PATH` and open 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
 ```
-
-### Add the application launcher
-
-`cargo install` installs the executable but not the desktop launcher, icon, or file associations. From the repository root, install those for the current user with:
-
-```sh
-install -Dm0644 assets/voxel-ink.png \
-  "$HOME/.local/share/icons/hicolor/512x512/apps/app.voxelink.editor.png"
-install -Dm0644 packaging/linux/app.voxelink.editor.xml \
-  "$HOME/.local/share/mime/packages/app.voxelink.editor.xml"
-install -Dm0644 packaging/linux/app.voxelink.editor.metainfo.xml \
-  "$HOME/.local/share/metainfo/app.voxelink.editor.metainfo.xml"
-install -d "$HOME/.local/share/applications"
-desktop-file-install \
-  --dir="$HOME/.local/share/applications" \
-  --set-key=Exec --set-value="$HOME/.local/bin/voxel-ink %f" \
-  --set-key=TryExec --set-value="$HOME/.local/bin/voxel-ink" \
-  packaging/linux/app.voxelink.editor.desktop
-update-desktop-database "$HOME/.local/share/applications"
-update-mime-database "$HOME/.local/share/mime"
-gtk-update-icon-cache --force --ignore-theme-index \
-  "$HOME/.local/share/icons/hicolor"
-```
-
-Running that block again refreshes an existing user installation.
 
 ## Start VoxelInk
 

@@ -37,10 +37,10 @@ Run `shellcheck` for changed packaging scripts. Validate changed desktop metadat
 After successfully verifying changes that affect the runtime executable or compile-time assets, replace the current user installation:
 
 ```sh
-cargo install --locked --force --path . --root "$HOME/.local"
+./install
 ```
 
-If the icon or files under `packaging/linux/` changed, also rerun the user desktop-integration installation block from `README.md`. Skip local installation for documentation-only and test-only changes.
+The installer refreshes the user-local executable and desktop integration under `~/.local`. Skip local installation for documentation-only and test-only changes.
 
 ## Packaging
 
