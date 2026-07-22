@@ -189,11 +189,7 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let physical_distance = max(input.leak_distance, 0.0) * LEAK_DISTANCE_SNORM_STEP_RANGE
             * uniforms.leak_distance_scale;
         let leak_intensity = exp2(-physical_distance / max(uniforms.leak_half_distance, 1.0e-12));
-        let connected_light = select(
-            0.015,
-            0.10 + 0.90 * leak_intensity,
-            connected,
-        );
+        let connected_light = select(0.0, leak_intensity, connected);
         lighting = connected_light * (0.35 + 0.65 * base_lighting) * surface_factor
             * voxel_ao_factor;
     }
@@ -3134,6 +3130,12 @@ mod tests {
     }
 
     #[test]
+    fn leak_light_shader_uses_a_black_unlit_baseline() {
+        assert!(SHADER.contains("select(0.0, leak_intensity, connected)"));
+        assert!(!SHADER.contains("0.10 + 0.90 * leak_intensity"));
+    }
+
+    #[test]
     fn orbit_and_fly_use_their_expected_fields_of_view() {
         let mut state = SceneState::default();
         let (_, orbit_projection, _, _, _, _, _) = scene_camera(&state);
@@ -5074,29 +5076,35 @@ mod tests {
                     edit_generation: 0,
                     chunk: coordinate,
                 },
-                quads: vec![
-                    CompactQuad::new([1, 1, 1], 1, 1, crate::mesh::FaceAxis::Z, true, [0; 4])
-                        .unwrap(),
-                ],
+                quads: [[1, 1, 1], [2, 1, 1]]
+                    .map(|origin| {
+                        CompactQuad::new(origin, 1, 1, crate::mesh::FaceAxis::Z, true, [0; 4])
+                            .unwrap()
+                    })
+                    .into(),
                 priority: MeshUpdatePriority::Background,
             },
         );
-        let far_connected = PackedLeakDistance::new([i16::MAX as u16; 4]).unwrap();
-        let far_connected_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("far connected leak-distance test buffer"),
-            contents: bytemuck::bytes_of(&far_connected),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        let diagnostic_distances = [
+            PackedLeakDistance::new([i16::MAX as u16; 4]).unwrap(),
+            PackedLeakDistance::new([0; 4]).unwrap(),
+        ];
+        let diagnostic_distance_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("black baseline leak-distance test buffer"),
+                contents: bytemuck::cast_slice(&diagnostic_distances),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
         renderer
             .chunks
             .get_mut(&coordinate)
-            .expect("the test face must remain resident")
-            .leak_distance = Some(far_connected_buffer);
+            .expect("the test faces must remain resident")
+            .leak_distance = Some(diagnostic_distance_buffer);
 
         let index_to_world = Mat4::from_scale_rotation_translation(
-            Vec3::new(1.5, 1.5, 1.0),
+            Vec3::new(0.75, 1.5, 1.0),
             glam::Quat::IDENTITY,
-            Vec3::new(-1.5, -1.5, 0.0),
+            Vec3::new(-1.125, -1.5, 0.0),
         );
         let uniforms = Uniforms {
             index_to_world: index_to_world.to_cols_array_2d(),
@@ -5187,7 +5195,7 @@ mod tests {
             pass.set_bind_group(0, &renderer.bind_group, &[]);
             pass.set_vertex_buffer(0, chunk.buffer.slice(..));
             pass.set_vertex_buffer(1, chunk.leak_distance.as_ref().unwrap().slice(..));
-            pass.draw(0..6, 0..1);
+            pass.draw(0..6, 0..chunk.instances);
         }
 
         let bytes_per_row = WIDTH * size_of::<u32>() as u32;
@@ -5230,11 +5238,16 @@ mod tests {
             .expect("readback callback must run")
             .expect("leak-light readback buffer must map");
         let pixels = slice.get_mapped_range();
-        let center = ((HEIGHT / 2 * WIDTH + WIDTH / 2) * 4) as usize;
-        let maximum_channel = pixels[center..center + 3].iter().copied().max().unwrap();
+        let maximum_channel = |x| {
+            let pixel = ((HEIGHT / 2 * WIDTH + x) * 4) as usize;
+            pixels[pixel..pixel + 3].iter().copied().max().unwrap()
+        };
+        let far = maximum_channel(WIDTH / 4);
+        let near = maximum_channel(WIDTH * 3 / 4);
+        assert_eq!(far, 0, "a fully faded connected surface must be #000000");
         assert!(
-            (16..80).contains(&maximum_channel),
-            "a far connected surface must be rendered dark, got {maximum_channel}"
+            near > 80,
+            "a zero-distance connected surface must remain visibly lit, got {near}"
         );
     }
 }

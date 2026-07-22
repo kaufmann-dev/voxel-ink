@@ -2927,7 +2927,7 @@ impl VoxelInkApp {
             if self.scene.leak_light()
                 && (!self.gpu_renderer_available || self.scene.leak_distance_ready())
             {
-                Color32::WHITE
+                Color32::BLACK
             } else {
                 self.background_color()
             },
