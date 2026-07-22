@@ -16,7 +16,10 @@ use crate::{
         StrokeSpace,
     },
     io::SaveMode,
-    renderer::{FlyMovement, SceneBridge, VolumePaintCallback, VolumeViewMode, VoxelHighlightKind},
+    renderer::{
+        FlyMovement, FlyMovementBasis, SceneBridge, VolumePaintCallback, VolumeViewMode,
+        VoxelHighlightKind,
+    },
     volume::{DocumentSummary, SliceAxis, SliceImage, SpatialUnits, Tool},
 };
 
@@ -1709,6 +1712,51 @@ impl VoxelInkApp {
                                 .wrap(),
                             );
                             ui.add_space(10.0);
+
+                            ui.label(egui::RichText::new("W/S movement").small().strong());
+                            let movement_basis = self.scene.fly_movement_basis();
+                            ui.columns(2, |columns| {
+                                if selection_button(
+                                    &mut columns[0],
+                                    "Level",
+                                    movement_basis == FlyMovementBasis::Level,
+                                    TEAL,
+                                    self.forced_colors,
+                                )
+                                .on_hover_text(
+                                    "W/S follow camera yaw on world X/Y; A/D strafe on the same level plane",
+                                )
+                                .clicked()
+                                {
+                                    self.scene
+                                        .set_fly_movement_basis(FlyMovementBasis::Level);
+                                }
+                                if selection_button(
+                                    &mut columns[1],
+                                    "Free flight",
+                                    movement_basis == FlyMovementBasis::ViewRelative,
+                                    TEAL,
+                                    self.forced_colors,
+                                )
+                                .on_hover_text(
+                                    "W/S follow the camera's full yaw-and-pitch direction; A/D stay level",
+                                )
+                                .clicked()
+                                {
+                                    self.scene
+                                        .set_fly_movement_basis(FlyMovementBasis::ViewRelative);
+                                }
+                            });
+                            let movement_help = match self.scene.fly_movement_basis() {
+                                FlyMovementBasis::Level => {
+                                    "Only Space/Shift change world-Z height."
+                                }
+                                FlyMovementBasis::ViewRelative => {
+                                    "W/S can change height; Space/Shift move directly along world Z."
+                                }
+                            };
+                            ui.label(egui::RichText::new(movement_help).small().color(MUTED));
+                            ui.add_space(8.0);
 
                             let speed_label = ui.add(
                                 egui::Label::new(

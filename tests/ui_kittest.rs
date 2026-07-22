@@ -699,6 +699,45 @@ fn fly_selector_is_accessible_without_resizing_and_expand_stays_independent() {
     assert_eq!(fly.accesskit_node().toggled(), Some(Toggled::False));
     assert_selected_view_button_text(&harness, "Orbit view", "Orbit");
 
+    let level_movement = harness.get_by_label("Level");
+    let view_relative_movement = harness.get_by_label("Free flight");
+    assert_eq!(
+        level_movement.accesskit_node().toggled(),
+        Some(Toggled::True)
+    );
+    assert_eq!(
+        view_relative_movement.accesskit_node().toggled(),
+        Some(Toggled::False)
+    );
+
+    let initial_editor = harness.get_by_label("Interactive 3D volume editor").rect();
+    view_relative_movement.click_accesskit();
+    harness.step();
+    harness.step();
+    assert_eq!(
+        harness
+            .get_by_label("Free flight")
+            .accesskit_node()
+            .toggled(),
+        Some(Toggled::True)
+    );
+    assert_eq!(
+        harness.get_by_label("Level").accesskit_node().toggled(),
+        Some(Toggled::False)
+    );
+    assert_rect_near(
+        harness.get_by_label("Interactive 3D volume editor").rect(),
+        initial_editor,
+    );
+
+    harness.get_by_label("Level").click_accesskit();
+    harness.step();
+    harness.step();
+    assert_eq!(
+        harness.get_by_label("Level").accesskit_node().toggled(),
+        Some(Toggled::True)
+    );
+
     let fly_speed = harness.get_by_role_and_label(Role::Slider, "Flight speed");
     assert!(
         fly_speed.accesskit_node().is_disabled(),
@@ -712,8 +751,7 @@ fn fly_selector_is_accessible_without_resizing_and_expand_stays_independent() {
         Some(Toggled::True)
     );
 
-    let initial_editor = harness.get_by_label("Interactive 3D volume editor").rect();
-    fly.click_accesskit();
+    harness.get_by_label("Fly view").click_accesskit();
     harness.step();
     harness.step();
 

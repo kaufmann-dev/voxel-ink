@@ -74,9 +74,9 @@ Bridge adds one solid connection while you drag between two points. Very large b
 The 3D pane offers two navigation styles:
 
 - **Orbit** rotates around the volume, pans with the right mouse button, and zooms with the wheel.
-- **Fly** uses a fixed center reticle. Click once to capture the mouse; that first click never edits. Look with the mouse, move with `W/A/S/D`, change world-Z height with Space/Shift, hold `Ctrl` to boost, and use the wheel to adjust speed. Left-click or hold to use Paint, Erase, or Bridge through the reticle. Tool, brush, outline, undo, redo, and Home camera-reset shortcuts remain available without releasing capture; file shortcuts stay suppressed. Press Escape to cancel the active stroke and release the mouse.
+- **Fly** uses a fixed center reticle. Click once to capture the mouse; that first click never edits. Look with the mouse, move with `W/A/S/D`, change world-Z height with Space/Shift, hold `Ctrl` to boost, and use the wheel to adjust speed. Level movement is selected by default, so W/S follow camera yaw on world X/Y regardless of pitch and only Space/Shift change height. The Free flight option instead makes W/S follow the full camera direction, including pitch; A/D remain level in both styles. Left-click or hold to use Paint, Erase, or Bridge through the reticle. Tool, brush, outline, undo, redo, and Home camera-reset shortcuts remain available without releasing capture; file shortcuts stay suppressed. Press Escape to cancel the active stroke and release the mouse.
 
-Orbit and Fly remember separate viewpoints. Reset affects only the active camera, and opening or closing a document returns navigation to Orbit. The **3D view** card in the repair panel provides a flight-speed slider and a shared voxel-outline toggle that affects both navigation modes.
+Orbit and Fly remember separate viewpoints. Reset affects only the active camera, and opening or closing a document returns navigation to Orbit. The **3D view** card in the repair panel provides the session-only W/S movement selector, a flight-speed slider, and a shared voxel-outline toggle that affects both navigation modes.
 
 ## Build and test
 

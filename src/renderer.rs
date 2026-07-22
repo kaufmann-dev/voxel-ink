@@ -302,11 +302,21 @@ pub enum VolumeViewMode {
     Fly,
 }
 
+/// Direction basis used by the forward and backward Fly controls.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FlyMovementBasis {
+    /// Keep forward and backward movement parallel to world X/Y.
+    #[default]
+    Level,
+    /// Follow the camera's full yaw-and-pitch view direction.
+    ViewRelative,
+}
+
 /// Signed movement axes for one Fly-mode frame.
 ///
-/// `forward` follows the full view direction, `right` strafes horizontally,
-/// and `world_up` moves along world Z. Each axis is clamped to `-1.0..=1.0`;
-/// combined movement is normalized so diagonals are not faster.
+/// `forward` uses the selected [`FlyMovementBasis`], `right` strafes
+/// horizontally, and `world_up` moves along world Z. Each axis is clamped to
+/// `-1.0..=1.0`; combined movement is normalized so diagonals are not faster.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FlyMovement {
     pub forward: f32,
@@ -676,6 +686,7 @@ struct SceneState {
     view_mode: VolumeViewMode,
     orbit: OrbitCameraState,
     fly: Option<FlyCameraState>,
+    fly_movement_basis: FlyMovementBasis,
     voxel_seams: bool,
     aspect: f32,
     updates: VecDeque<SceneUpdate>,
@@ -696,6 +707,7 @@ impl Default for SceneState {
             view_mode: VolumeViewMode::Orbit,
             orbit: OrbitCameraState::default(),
             fly: None,
+            fly_movement_basis: FlyMovementBasis::default(),
             voxel_seams: true,
             aspect: 1.0,
             updates: VecDeque::new(),
@@ -867,6 +879,24 @@ impl SceneBridge {
     }
 
     #[must_use]
+    pub fn fly_movement_basis(&self) -> FlyMovementBasis {
+        self.state
+            .lock()
+            .expect("3D scene state poisoned")
+            .fly_movement_basis
+    }
+
+    pub fn set_fly_movement_basis(&self, basis: FlyMovementBasis) {
+        let mut state = self.state.lock().expect("3D scene state poisoned");
+        if state.fly_movement_basis == basis {
+            return;
+        }
+        state.fly_movement_basis = basis;
+        drop(state);
+        self.request_repaint();
+    }
+
+    #[must_use]
     pub fn voxel_seams(&self) -> bool {
         self.state
             .lock()
@@ -992,13 +1022,17 @@ impl SceneBridge {
         if state.view_mode != VolumeViewMode::Fly {
             return;
         }
+        let movement_basis = state.fly_movement_basis;
         let Some(fly) = state.fly.as_mut() else {
             return;
         };
         let forward_axis = movement.forward.clamp(-1.0, 1.0);
         let right_axis = movement.right.clamp(-1.0, 1.0);
         let world_up_axis = movement.world_up.clamp(-1.0, 1.0);
-        let forward = fly_forward(fly.yaw, fly.pitch);
+        let forward = match movement_basis {
+            FlyMovementBasis::Level => Vec3::new(fly.yaw.cos(), fly.yaw.sin(), 0.0),
+            FlyMovementBasis::ViewRelative => fly_forward(fly.yaw, fly.pitch),
+        };
         let right = Vec3::new(fly.yaw.sin(), -fly.yaw.cos(), 0.0);
         let direction = (forward * forward_axis + right * right_axis + Vec3::Z * world_up_axis)
             .normalize_or_zero();
@@ -2899,6 +2933,23 @@ mod tests {
     }
 
     #[test]
+    fn fly_movement_basis_defaults_to_level_and_survives_document_resets() {
+        let bridge = SceneBridge::default();
+        assert_eq!(bridge.fly_movement_basis(), FlyMovementBasis::Level);
+
+        bridge.set_fly_movement_basis(FlyMovementBasis::ViewRelative);
+        bridge.reset(3, 1, [12; 3], SceneState::default().affine);
+        assert_eq!(bridge.fly_movement_basis(), FlyMovementBasis::ViewRelative);
+
+        bridge.set_view_mode(VolumeViewMode::Fly);
+        bridge.clear();
+        assert_eq!(bridge.fly_movement_basis(), FlyMovementBasis::ViewRelative);
+
+        bridge.set_fly_movement_basis(FlyMovementBasis::Level);
+        assert_eq!(bridge.fly_movement_basis(), FlyMovementBasis::Level);
+    }
+
+    #[test]
     fn reset_view_only_restores_the_active_camera() {
         let bridge = SceneBridge::default();
         bridge.reset(8, 1, [24, 18, 12], SceneState::default().affine);
@@ -2995,7 +3046,7 @@ mod tests {
     }
 
     #[test]
-    fn fly_movement_uses_view_strafe_world_z_boost_and_clamped_delta() {
+    fn fly_movement_bases_use_expected_forward_strafe_world_z_boost_and_delta() {
         let bridge = SceneBridge::default();
         bridge.reset(9, 1, [20; 3], SceneState::default().affine);
         bridge.set_view_mode(VolumeViewMode::Fly);
@@ -3015,21 +3066,31 @@ mod tests {
 
         set_pose();
         bridge.fly_move(FlyMovement::new(1.0, 0.0, 0.0, false), 0.05);
-        assert_vec3_close(position() - start, fly_forward(yaw, pitch) * 0.5, 1.0e-5);
+        let level_forward = Vec3::new(yaw.cos(), yaw.sin(), 0.0);
+        assert_vec3_close(position() - start, level_forward * 0.5, 1.0e-5);
 
         set_pose();
         bridge.fly_move(FlyMovement::new(-1.0, 0.0, 0.0, false), 0.05);
-        assert_vec3_close(position() - start, fly_forward(yaw, pitch) * -0.5, 1.0e-5);
+        assert_vec3_close(position() - start, level_forward * -0.5, 1.0e-5);
 
+        bridge.set_fly_movement_basis(FlyMovementBasis::ViewRelative);
         set_pose();
-        bridge.fly_move(FlyMovement::new(0.0, 1.0, 0.0, false), 0.05);
+        bridge.fly_move(FlyMovement::new(1.0, 0.0, 0.0, false), 0.05);
+        assert_vec3_close(position() - start, fly_forward(yaw, pitch) * 0.5, 1.0e-5);
+
         let right = Vec3::new(yaw.sin(), -yaw.cos(), 0.0);
-        assert_vec3_close(position() - start, right * 0.5, 1.0e-5);
+        for basis in [FlyMovementBasis::Level, FlyMovementBasis::ViewRelative] {
+            bridge.set_fly_movement_basis(basis);
+            set_pose();
+            bridge.fly_move(FlyMovement::new(0.0, 1.0, 0.0, false), 0.05);
+            assert_vec3_close(position() - start, right * 0.5, 1.0e-5);
 
-        set_pose();
-        bridge.fly_move(FlyMovement::new(0.0, 0.0, 1.0, false), 0.05);
-        assert_vec3_close(position() - start, Vec3::Z * 0.5, 1.0e-5);
+            set_pose();
+            bridge.fly_move(FlyMovement::new(0.0, 0.0, 1.0, false), 0.05);
+            assert_vec3_close(position() - start, Vec3::Z * 0.5, 1.0e-5);
+        }
 
+        bridge.set_fly_movement_basis(FlyMovementBasis::ViewRelative);
         set_pose();
         bridge.fly_move(FlyMovement::new(1.0, 1.0, 1.0, false), 0.05);
         assert!(((position() - start).length() - 0.5).abs() < 1.0e-5);
