@@ -13,7 +13,7 @@ use wgpu::util::DeviceExt;
 
 use crate::{
     brush::Ray,
-    mesh::{ChunkCoord, CompactQuad, MeshJobTag, MeshUpdatePriority},
+    mesh::{ChunkCoord, CompactQuad, MeshJobTag, MeshUpdatePriority, PackedLeakLight},
     volume::Matrix4,
 };
 
@@ -27,7 +27,7 @@ struct Uniforms {
     near_surface_depth: f32,
     inverse_scene_depth_span: f32,
     voxel_seams: u32,
-    _padding: f32,
+    leak_light: u32,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -39,13 +39,14 @@ struct VertexOutput {
     @location(2) corner_occlusion: f32,
     @location(3) index_position: vec3<f32>,
     @location(4) @interpolate(flat) face_axis: u32,
+    @location(5) leak_intensity: f32,
 };
 
-@vertex
-fn vertex_main(
-    @builtin(vertex_index) vertex_index: u32,
-    @location(0) origin: vec3<u32>,
-    @location(1) packed: u32,
+fn expand_vertex(
+    vertex_index: u32,
+    origin: vec3<u32>,
+    packed: u32,
+    packed_leak_light: u32,
 ) -> VertexOutput {
     let u_length = f32((packed & 31u) + 1u);
     let v_length = f32(((packed >> 5u) & 31u) + 1u);
@@ -107,7 +108,29 @@ fn vertex_main(
     output.corner_occlusion = f32((packed >> (13u + corner * 2u)) & 3u);
     output.index_position = index_position;
     output.face_axis = axis;
+    output.leak_intensity = f32((packed_leak_light >> (corner * 8u)) & 255u) / 255.0;
     return output;
+}
+
+@vertex
+fn vertex_main(
+    @builtin(vertex_index) vertex_index: u32,
+    @location(0) origin: vec3<u32>,
+    @location(1) packed: u32,
+) -> VertexOutput {
+    // A chunk without diagnostic data remains visibly lit during a progressive
+    // upload instead of being mistaken for a sealed surface.
+    return expand_vertex(vertex_index, origin, packed, 0xffffffffu);
+}
+
+@vertex
+fn leak_vertex_main(
+    @builtin(vertex_index) vertex_index: u32,
+    @location(0) origin: vec3<u32>,
+    @location(1) packed: u32,
+    @location(2) packed_leak_light: u32,
+) -> VertexOutput {
+    return expand_vertex(vertex_index, origin, packed, packed_leak_light);
 }
 
 fn voxel_seam(coordinate: f32) -> f32 {
@@ -151,7 +174,16 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     );
     let depth_factor = mix(1.0, 0.62, normalized_scene_depth);
     let voxel_ao_factor = mix(1.0, 0.76, clamp(input.corner_occlusion / 3.0, 0.0, 1.0));
-    let lighting = base_lighting * depth_factor * surface_factor * voxel_ao_factor;
+    var lighting = base_lighting * depth_factor * surface_factor * voxel_ao_factor;
+    if (uniforms.leak_light != 0u) {
+        let connected_light = select(
+            0.015,
+            0.10 + 0.90 * input.leak_intensity,
+            input.leak_intensity > 0.0,
+        );
+        lighting = connected_light * (0.35 + 0.65 * base_lighting) * surface_factor
+            * voxel_ao_factor;
+    }
     let lit_color = uniforms.material_color.rgb * lighting;
     if (uniforms.voxel_seams == 0u) {
         return vec4<f32>(lit_color, 1.0);
@@ -182,7 +214,7 @@ struct Uniforms {
     near_surface_depth: f32,
     inverse_scene_depth_span: f32,
     voxel_seams: u32,
-    _padding: f32,
+    leak_light: u32,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -591,7 +623,7 @@ struct Uniforms {
     near_surface_depth: f32,
     inverse_scene_depth_span: f32,
     voxel_seams: u32,
-    _padding: f32,
+    leak_light: u32,
 }
 
 impl Default for Uniforms {
@@ -605,7 +637,7 @@ impl Default for Uniforms {
             near_surface_depth: 0.0,
             inverse_scene_depth_span: 1.0,
             voxel_seams: 0,
-            _padding: 0.0,
+            leak_light: 0,
         }
     }
 }
@@ -623,6 +655,7 @@ enum SceneUpdate {
     Chunk {
         tag: MeshJobTag,
         quads: Vec<CompactQuad>,
+        leak_light: Option<Vec<PackedLeakLight>>,
         priority: MeshUpdatePriority,
     },
     Highlight {
@@ -688,6 +721,7 @@ struct SceneState {
     fly: Option<FlyCameraState>,
     fly_movement_basis: FlyMovementBasis,
     voxel_seams: bool,
+    leak_light: bool,
     aspect: f32,
     updates: VecDeque<SceneUpdate>,
 }
@@ -709,6 +743,7 @@ impl Default for SceneState {
             fly: None,
             fly_movement_basis: FlyMovementBasis::default(),
             voxel_seams: true,
+            leak_light: false,
             aspect: 1.0,
             updates: VecDeque::new(),
         }
@@ -780,6 +815,7 @@ impl SceneBridge {
         &self,
         tag: MeshJobTag,
         quads: Vec<CompactQuad>,
+        leak_light: Option<Vec<PackedLeakLight>>,
         priority: MeshUpdatePriority,
     ) {
         let mut state = self.state.lock().expect("3D scene state poisoned");
@@ -789,6 +825,7 @@ impl SceneBridge {
                 SceneUpdate::Chunk {
                     tag,
                     quads,
+                    leak_light,
                     priority,
                 },
                 priority,
@@ -910,6 +947,24 @@ impl SceneBridge {
             return;
         }
         state.voxel_seams = enabled;
+        drop(state);
+        self.request_repaint();
+    }
+
+    #[must_use]
+    pub fn leak_light(&self) -> bool {
+        self.state
+            .lock()
+            .expect("3D scene state poisoned")
+            .leak_light
+    }
+
+    pub fn set_leak_light(&self, enabled: bool) {
+        let mut state = self.state.lock().expect("3D scene state poisoned");
+        if state.leak_light == enabled {
+            return;
+        }
+        state.leak_light = enabled;
         drop(state);
         self.request_repaint();
     }
@@ -1300,6 +1355,7 @@ fn reset_document_navigation(state: &mut SceneState) {
     state.view_mode = VolumeViewMode::Orbit;
     state.orbit = OrbitCameraState::default();
     state.fly = None;
+    state.leak_light = false;
 }
 
 pub struct VolumePaintCallback {
@@ -1370,11 +1426,18 @@ impl CallbackTrait for VolumePaintCallback {
         let Some(renderer) = resources.get::<GpuVolumeRenderer>() else {
             return;
         };
-        render_pass.set_pipeline(&renderer.pipeline);
         render_pass.set_bind_group(0, &renderer.bind_group, &[]);
         for chunk in renderer.chunks.values() {
             if !chunk.visible {
                 continue;
+            }
+            if renderer.uniforms.leak_light != 0
+                && let Some(leak_light) = &chunk.leak_light
+            {
+                render_pass.set_pipeline(&renderer.leak_pipeline);
+                render_pass.set_vertex_buffer(1, leak_light.slice(..));
+            } else {
+                render_pass.set_pipeline(&renderer.pipeline);
             }
             render_pass.set_vertex_buffer(0, chunk.buffer.slice(..));
             render_pass.draw(0..6, 0..chunk.instances);
@@ -1394,6 +1457,7 @@ impl CallbackTrait for VolumePaintCallback {
 
 struct GpuChunk {
     buffer: wgpu::Buffer,
+    leak_light: Option<wgpu::Buffer>,
     instances: u32,
     visible: bool,
     visibility_dirty: bool,
@@ -1428,6 +1492,7 @@ impl ChunkVisibilityView {
 
 struct GpuVolumeRenderer {
     pipeline: wgpu::RenderPipeline,
+    leak_pipeline: wgpu::RenderPipeline,
     highlight_pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
     uniforms: Uniforms,
@@ -1535,6 +1600,71 @@ impl GpuVolumeRenderer {
             multiview_mask: None,
             cache: None,
         });
+        let leak_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("VoxelInk leak-light quad pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("leak_vertex_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: size_of::<CompactQuad>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Uint32x3,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Uint32,
+                                offset: 12,
+                                shader_location: 1,
+                            },
+                        ],
+                    },
+                    wgpu::VertexBufferLayout {
+                        array_stride: size_of::<PackedLeakLight>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &[wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Uint32,
+                            offset: 0,
+                            shader_location: 2,
+                        }],
+                    },
+                ],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fragment_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: MSAA_SAMPLES,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: None,
+        });
         let highlight_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("VoxelInk voxel highlight shader"),
             source: wgpu::ShaderSource::Wgsl(VOXEL_HIGHLIGHT_SHADER.into()),
@@ -1585,6 +1715,7 @@ impl GpuVolumeRenderer {
         });
         Self {
             pipeline,
+            leak_pipeline,
             highlight_pipeline,
             uniform_buffer,
             uniforms,
@@ -1623,7 +1754,12 @@ impl GpuVolumeRenderer {
                 self.revision = revision;
                 self.clear_highlight();
             }
-            SceneUpdate::Chunk { tag, quads, .. } => {
+            SceneUpdate::Chunk {
+                tag,
+                quads,
+                leak_light,
+                ..
+            } => {
                 if tag.document_epoch != self.epoch || tag.revision != self.revision {
                     return;
                 }
@@ -1641,10 +1777,21 @@ impl GpuVolumeRenderer {
                     return;
                 }
                 let contents = bytemuck::cast_slice(&quads);
+                let leak_light =
+                    leak_light
+                        .filter(|light| light.len() == quads.len())
+                        .map(|light| {
+                            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("VoxelInk chunk leak-light instances"),
+                                contents: bytemuck::cast_slice(&light),
+                                usage: wgpu::BufferUsages::VERTEX,
+                            })
+                        });
                 if let Some(chunk) = self.chunks.get_mut(&tag.chunk)
                     && can_reuse_chunk_buffer(chunk.buffer.size(), contents.len() as u64)
                 {
                     queue.write_buffer(&chunk.buffer, 0, contents);
+                    chunk.leak_light = leak_light;
                     chunk.instances = quads.len() as u32;
                     return;
                 }
@@ -1663,6 +1810,7 @@ impl GpuVolumeRenderer {
                     tag.chunk,
                     GpuChunk {
                         buffer,
+                        leak_light,
                         instances: quads.len() as u32,
                         visible,
                         visibility_dirty,
@@ -1818,6 +1966,7 @@ fn scene_uniforms(state: &SceneState) -> Uniforms {
         near_surface_depth,
         inverse_scene_depth_span,
         voxel_seams: u32::from(state.voxel_seams),
+        leak_light: u32::from(state.leak_light),
         ..Uniforms::default()
     }
 }
@@ -2234,7 +2383,10 @@ mod tests {
         assert!(SHADER.contains("subpixel_fade"));
         assert!(SHADER.contains("if (uniforms.voxel_seams == 0u)"));
         assert!(SHADER.contains("return vec4<f32>(lit_color, 1.0);"));
+        assert!(SHADER.contains("if (uniforms.leak_light != 0u)"));
+        assert!(SHADER.contains("0.10 + 0.90 * input.leak_intensity"));
         assert_eq!(size_of::<CompactQuad>(), 16);
+        assert_eq!(size_of::<PackedLeakLight>(), 4);
     }
 
     #[test]
@@ -2589,11 +2741,13 @@ mod tests {
         bridge.insert_chunk(
             tag(ChunkCoord::new(0, 0, 0), MeshUpdatePriority::Background),
             Vec::new(),
+            None,
             MeshUpdatePriority::Background,
         );
         bridge.insert_chunk(
             tag(ChunkCoord::new(1, 0, 0), MeshUpdatePriority::Live),
             Vec::new(),
+            None,
             MeshUpdatePriority::Live,
         );
         assert!(bridge.set_voxel_highlight(3, 6, vec![([2, 2, 2], VoxelHighlightKind::Paint)],));
@@ -2653,26 +2807,40 @@ mod tests {
         bridge.insert_chunk(
             tag(8, 1, replaced),
             Vec::new(),
+            None,
             MeshUpdatePriority::Background,
         );
         bridge.invalidate(4, 9, vec![replaced]);
         bridge.insert_chunk(
             tag(9, 1, background),
             Vec::new(),
+            None,
             MeshUpdatePriority::Background,
         );
         bridge.insert_chunk(
             tag(9, 2, replaced),
             Vec::new(),
+            None,
             MeshUpdatePriority::Background,
         );
         bridge.insert_chunk(
             tag(9, 3, replaced),
             Vec::new(),
+            None,
             MeshUpdatePriority::Background,
         );
-        bridge.insert_chunk(tag(9, 3, replaced), Vec::new(), MeshUpdatePriority::Live);
-        bridge.insert_chunk(tag(9, 1, other_live), Vec::new(), MeshUpdatePriority::Live);
+        bridge.insert_chunk(
+            tag(9, 3, replaced),
+            Vec::new(),
+            None,
+            MeshUpdatePriority::Live,
+        );
+        bridge.insert_chunk(
+            tag(9, 1, other_live),
+            Vec::new(),
+            None,
+            MeshUpdatePriority::Live,
+        );
 
         let state = bridge.state.lock().unwrap();
         assert_eq!(state.updates.len(), 6);
@@ -3046,6 +3214,21 @@ mod tests {
     }
 
     #[test]
+    fn leak_light_is_explicit_and_resets_for_a_new_document() {
+        let bridge = SceneBridge::default();
+        assert!(!bridge.leak_light());
+
+        bridge.set_leak_light(true);
+        assert!(bridge.leak_light());
+        assert_eq!(scene_uniforms(&bridge.state.lock().unwrap()).leak_light, 1);
+        bridge.reset(0, 1, [8; 3], SceneState::default().affine);
+        assert!(bridge.leak_light());
+
+        bridge.reset(1, 1, [8; 3], SceneState::default().affine);
+        assert!(!bridge.leak_light());
+    }
+
+    #[test]
     fn fly_movement_bases_use_expected_forward_strafe_world_z_boost_and_delta() {
         let bridge = SceneBridge::default();
         bridge.reset(9, 1, [20; 3], SceneState::default().affine);
@@ -3398,6 +3581,7 @@ mod tests {
                     )
                     .expect("the test surface fits one greedy quad"),
                 ],
+                leak_light: None,
                 priority: MeshUpdatePriority::Background,
             },
         );
@@ -3663,10 +3847,15 @@ mod tests {
                     CompactQuad::new([1, 0, 0], 1, 1, crate::mesh::FaceAxis::X, true, [0; 4])
                         .expect("unit face is representable"),
                 ],
+                leak_light: Some(vec![
+                    PackedLeakLight::new([0; 4]),
+                    PackedLeakLight::new([u8::MAX; 4]),
+                ]),
                 priority: MeshUpdatePriority::Background,
             },
         );
         assert!(renderer.chunks.contains_key(&chunk));
+        assert!(renderer.chunks.get(&chunk).unwrap().leak_light.is_some());
         let initial_chunk_buffer = renderer
             .chunks
             .get(&chunk)
@@ -3692,6 +3881,7 @@ mod tests {
                     CompactQuad::new([2, 0, 0], 1, 1, crate::mesh::FaceAxis::Y, true, [0; 4])
                         .expect("unit face is representable"),
                 ],
+                leak_light: None,
                 priority: MeshUpdatePriority::Live,
             },
         );
@@ -3720,6 +3910,7 @@ mod tests {
                             .expect("unit face is representable")
                     })
                     .collect(),
+                leak_light: None,
                 priority: MeshUpdatePriority::Live,
             },
         );
@@ -3748,6 +3939,7 @@ mod tests {
                     chunk,
                 },
                 quads: vec![representative_quad; oversized_quad_count],
+                leak_light: None,
                 priority: MeshUpdatePriority::Live,
             },
         );
@@ -3771,6 +3963,7 @@ mod tests {
                     chunk,
                 },
                 quads: vec![representative_quad],
+                leak_light: None,
                 priority: MeshUpdatePriority::Live,
             },
         );
@@ -3797,6 +3990,7 @@ mod tests {
                     CompactQuad::new([64, 0, 0], 1, 1, crate::mesh::FaceAxis::X, true, [0; 4])
                         .expect("unit face is representable"),
                 ],
+                leak_light: None,
                 priority: MeshUpdatePriority::Background,
             },
         );
@@ -3890,6 +4084,7 @@ mod tests {
                     chunk,
                 },
                 quads: Vec::new(),
+                leak_light: None,
                 priority: MeshUpdatePriority::Live,
             },
         );
@@ -3912,6 +4107,7 @@ mod tests {
                     CompactQuad::new([0, 0, 0], 1, 1, crate::mesh::FaceAxis::X, true, [0; 4])
                         .expect("unit face is representable"),
                 ],
+                leak_light: None,
                 priority: MeshUpdatePriority::Background,
             },
         );

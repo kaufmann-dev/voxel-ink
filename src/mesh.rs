@@ -95,6 +95,7 @@ pub struct ChunkInput {
     extent: [u32; 3],
     halo_dimensions: [u32; 3],
     occupancy: Vec<u8>,
+    leak_light: Option<Vec<u8>>,
     has_occupied_core: bool,
 }
 
@@ -119,7 +120,6 @@ impl ChunkInput {
                 occupancy.len()
             )));
         }
-
         let origin = coord.origin().ok_or_else(|| {
             AppError::InvalidDimensions("chunk origin overflows u32 coordinates".into())
         })?;
@@ -139,7 +139,6 @@ impl ChunkInput {
             .try_reserve_exact(halo_len)
             .map_err(|_| AppError::Allocation { bytes: halo_len })?;
         copied.resize(halo_len, 0);
-
         let volume_width = dimensions[0] as usize;
         let volume_height = dimensions[1] as usize;
         let source_x_start = origin[0].saturating_sub(HALO_WIDTH) as usize;
@@ -194,8 +193,79 @@ impl ChunkInput {
             extent,
             halo_dimensions,
             occupancy: copied,
+            leak_light: None,
             has_occupied_core,
         })
+    }
+
+    /// Copies one chunk, its one-voxel occupancy halo, and an optional light halo.
+    /// Outside-volume light samples are initialized to full exterior brightness.
+    pub fn copy_from_volume_with_leak_light(
+        dimensions: [u32; 3],
+        occupancy: &[u8],
+        leak_light: Option<&[u8]>,
+        coord: ChunkCoord,
+        cancellation: &CancellationToken,
+    ) -> Result<Self> {
+        let mut input = Self::copy_from_volume(dimensions, occupancy, coord, cancellation)?;
+        let Some(source_light) = leak_light else {
+            return Ok(input);
+        };
+        if source_light.len() != occupancy.len() {
+            return Err(AppError::InvalidDimensions(format!(
+                "expected {} leak-light bytes, got {}",
+                occupancy.len(),
+                source_light.len()
+            )));
+        }
+
+        let halo_len = input.occupancy.len();
+        let mut copied_light = Vec::new();
+        copied_light
+            .try_reserve_exact(halo_len)
+            .map_err(|_| AppError::Allocation { bytes: halo_len })?;
+        copied_light.resize(halo_len, u8::MAX);
+
+        let volume_width = dimensions[0] as usize;
+        let volume_height = dimensions[1] as usize;
+        let source_x_start = input.origin[0].saturating_sub(HALO_WIDTH) as usize;
+        let source_x_end =
+            (input.origin[0] as usize + input.extent[0] as usize + HALO_WIDTH as usize)
+                .min(volume_width);
+        let copied_row_width = source_x_end - source_x_start;
+        let destination_x = usize::from(input.origin[0] == 0);
+        let halo_width = input.halo_dimensions[0] as usize;
+        let halo_plane = halo_width * input.halo_dimensions[1] as usize;
+
+        for local_z in 0..input.halo_dimensions[2] {
+            cancellation.check()?;
+            let global_z = i64::from(input.origin[2]) + i64::from(local_z) - i64::from(HALO_WIDTH);
+            if !(0..i64::from(dimensions[2])).contains(&global_z) {
+                continue;
+            }
+            let global_z = usize::try_from(global_z).map_err(|_| {
+                AppError::InvalidDimensions("negative z coordinate escaped halo clipping".into())
+            })?;
+            for local_y in 0..input.halo_dimensions[1] {
+                let global_y =
+                    i64::from(input.origin[1]) + i64::from(local_y) - i64::from(HALO_WIDTH);
+                if !(0..i64::from(dimensions[1])).contains(&global_y) {
+                    continue;
+                }
+                let global_y = usize::try_from(global_y).map_err(|_| {
+                    AppError::InvalidDimensions(
+                        "negative y coordinate escaped halo clipping".into(),
+                    )
+                })?;
+                let source = source_x_start + volume_width * (global_y + volume_height * global_z);
+                let destination =
+                    destination_x + halo_width * local_y as usize + halo_plane * local_z as usize;
+                copied_light[destination..destination + copied_row_width]
+                    .copy_from_slice(&source_light[source..source + copied_row_width]);
+            }
+        }
+        input.leak_light = Some(copied_light);
+        Ok(input)
     }
 
     #[must_use]
@@ -221,6 +291,11 @@ impl ChunkInput {
     #[must_use]
     pub const fn copied_bytes(&self) -> usize {
         self.occupancy.len()
+            + if let Some(light) = &self.leak_light {
+                light.len()
+            } else {
+                0
+            }
     }
 
     #[cfg(test)]
@@ -291,6 +366,30 @@ impl FaceAxis {
 pub struct CompactQuad {
     pub origin: [u32; 3],
     pub packed: u32,
+}
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Pod, Zeroable)]
+pub struct PackedLeakLight(u32);
+
+impl PackedLeakLight {
+    #[must_use]
+    pub const fn new(corners: [u8; 4]) -> Self {
+        Self(
+            corners[0] as u32
+                | ((corners[1] as u32) << 8)
+                | ((corners[2] as u32) << 16)
+                | ((corners[3] as u32) << 24),
+        )
+    }
+
+    #[must_use]
+    pub const fn corner(self, corner: usize) -> Option<u8> {
+        if corner >= 4 {
+            return None;
+        }
+        Some(((self.0 >> (corner as u32 * 8)) & 0xff) as u8)
+    }
 }
 
 impl CompactQuad {
@@ -456,6 +555,7 @@ pub const fn mesh_result_is_stale(
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ChunkMesh {
     pub quads: Vec<CompactQuad>,
+    pub leak_light: Option<Vec<PackedLeakLight>>,
     pub exposed_voxel_faces: u32,
 }
 
@@ -463,6 +563,10 @@ impl ChunkMesh {
     #[must_use]
     pub const fn gpu_bytes(&self) -> usize {
         self.quads.len() * size_of::<CompactQuad>()
+            + match &self.leak_light {
+                Some(light) => light.len() * size_of::<PackedLeakLight>(),
+                None => 0,
+            }
     }
 }
 
@@ -506,24 +610,42 @@ pub fn mesh_chunk(
         })?;
     let mut exposed_voxel_faces = 0_u32;
     let mut mask = [0_i8; MAX_FACE_CELLS];
+    let mut leak_light = Vec::new();
 
-    for normal_axis in FaceAxis::ALL {
-        mesh_axis(
-            input,
-            normal_axis,
-            &mut mask,
-            &mut quads,
-            &mut exposed_voxel_faces,
-            cancellation,
-        )?;
+    if input.leak_light.is_some() {
+        for normal_axis in FaceAxis::ALL {
+            mesh_axis::<true>(
+                input,
+                normal_axis,
+                &mut mask,
+                &mut quads,
+                &mut leak_light,
+                &mut exposed_voxel_faces,
+                cancellation,
+            )?;
+        }
+    } else {
+        for normal_axis in FaceAxis::ALL {
+            mesh_axis::<false>(
+                input,
+                normal_axis,
+                &mut mask,
+                &mut quads,
+                &mut leak_light,
+                &mut exposed_voxel_faces,
+                cancellation,
+            )?;
+        }
     }
 
     cancellation.check()?;
     quads.shrink_to_fit();
+    leak_light.shrink_to_fit();
     Ok(TaggedChunkMesh {
         tag,
         mesh: ChunkMesh {
             quads,
+            leak_light: input.leak_light.is_some().then_some(leak_light),
             exposed_voxel_faces,
         },
     })
@@ -542,11 +664,12 @@ struct PlaneLayout {
     halo_strides: [usize; 3],
 }
 
-fn mesh_axis(
+fn mesh_axis<const LEAK_LIGHT: bool>(
     input: &ChunkInput,
     normal_axis: FaceAxis,
     mask: &mut [i8; MAX_FACE_CELLS],
     quads: &mut Vec<CompactQuad>,
+    leak_light: &mut Vec<PackedLeakLight>,
     exposed_voxel_faces: &mut u32,
     cancellation: &CancellationToken,
 ) -> Result<()> {
@@ -577,7 +700,14 @@ fn mesh_axis(
         };
         let active_mask = &mut mask[..u_extent * v_extent];
         fill_face_mask(input, layout, active_mask);
-        emit_greedy_quads(input, layout, active_mask, quads, exposed_voxel_faces)?;
+        emit_greedy_quads::<LEAK_LIGHT>(
+            input,
+            layout,
+            active_mask,
+            quads,
+            leak_light,
+            exposed_voxel_faces,
+        )?;
     }
     Ok(())
 }
@@ -605,11 +735,12 @@ fn fill_face_mask(input: &ChunkInput, layout: PlaneLayout, mask: &mut [i8]) {
     }
 }
 
-fn emit_greedy_quads(
+fn emit_greedy_quads<const LEAK_LIGHT: bool>(
     input: &ChunkInput,
     layout: PlaneLayout,
     mask: &mut [i8],
     quads: &mut Vec<CompactQuad>,
+    leak_light: &mut Vec<PackedLeakLight>,
     exposed_voxel_faces: &mut u32,
 ) -> Result<()> {
     let mut v = 0;
@@ -665,11 +796,53 @@ fn emit_greedy_quads(
                         )
                     })?;
             try_push_quad(quads, quad)?;
+            if LEAK_LIGHT {
+                leak_light
+                    .try_reserve(1)
+                    .map_err(|_| AppError::Allocation {
+                        bytes: (leak_light.len() + 1) * size_of::<PackedLeakLight>(),
+                    })?;
+                leak_light.push(PackedLeakLight::new(quad_corner_leak_light(
+                    input,
+                    layout,
+                    u,
+                    v,
+                    width,
+                    height,
+                    face > 0,
+                )));
+            }
             u += width;
         }
         v += 1;
     }
     Ok(())
+}
+
+fn quad_corner_leak_light(
+    input: &ChunkInput,
+    layout: PlaneLayout,
+    u: usize,
+    v: usize,
+    width: usize,
+    height: usize,
+    positive: bool,
+) -> [u8; 4] {
+    let Some(light) = &input.leak_light else {
+        return [0; 4];
+    };
+    let normal_offset =
+        (layout.plane + usize::from(positive)) * layout.halo_strides[layout.normal_axis_index];
+    let u_stride = layout.halo_strides[layout.u_axis];
+    let v_stride = layout.halo_strides[layout.v_axis];
+    std::array::from_fn(|corner| {
+        let [maximum_u, maximum_v] =
+            [[false, false], [true, false], [true, true], [false, true]][corner];
+        let outside = normal_offset
+            + (u + 1 + usize::from(maximum_u) * (width - 1)) * u_stride
+            + (v + 1 + usize::from(maximum_v) * (height - 1)) * v_stride;
+        light[outside]
+    })
 }
 
 fn quad_corner_occlusion(
@@ -1336,6 +1509,45 @@ mod tests {
         assert!(quad.flipped_diagonal());
         assert_eq!(quad.expanded_vertex(2), Some([5.5, 6.5, 8.5]));
         assert!(CompactQuad::new([0; 3], 1, 1, FaceAxis::Z, true, [0, 1, 2, 4]).is_none());
+    }
+
+    #[test]
+    fn optional_leak_light_is_packed_per_greedy_quad_without_expanding_compact_quads() {
+        let dimensions = [3, 3, 3];
+        let mut occupancy = vec![1; 27];
+        let mut light = vec![0; 27];
+        let center = 1 + 3 * (1 + 3);
+        occupancy[center] = 0;
+        light[center] = 7;
+        let input = ChunkInput::copy_from_volume_with_leak_light(
+            dimensions,
+            &occupancy,
+            Some(&light),
+            ChunkCoord::new(0, 0, 0),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        let mesh = mesh_chunk(
+            &input,
+            tag(ChunkCoord::new(0, 0, 0)),
+            &CancellationToken::default(),
+        )
+        .unwrap()
+        .mesh;
+        let packed = mesh.leak_light.unwrap();
+
+        assert_eq!(size_of::<CompactQuad>(), 16);
+        assert_eq!(packed.len(), mesh.quads.len());
+        assert!(
+            packed
+                .iter()
+                .any(|light| { (0..4).all(|corner| light.corner(corner) == Some(7)) })
+        );
+        assert!(
+            packed
+                .iter()
+                .any(|light| { (0..4).all(|corner| light.corner(corner) == Some(u8::MAX)) })
+        );
     }
 
     #[test]

@@ -12,7 +12,10 @@ use voxel_ink::{
     EngineCommand, EngineEvent, EngineHandle,
     brush::{BrushDepth, BrushShape, BrushSize, BrushSpec},
     cancel::CancellationToken,
-    engine::{BrushPreviewRequest, EditOutcome, PointerSample, StrokeDisposition, StrokeSpace},
+    engine::{
+        BrushPreviewRequest, EditOutcome, LeakLightStatus, PointerSample, StrokeDisposition,
+        StrokeSpace,
+    },
     mesh::{
         ChunkCoord, CompactQuad, MeshJobTag, MeshUpdatePriority, bounded_mesh_queue,
         mesh_queue_capacity, mesh_result_is_stale,
@@ -791,6 +794,77 @@ fn load_single_chunk(occupancy: Vec<u8>) -> (EngineHandle, u64, MeshJobTag, Vec<
         unreachable!()
     };
     (engine, epoch, tag, quads)
+}
+
+#[test]
+fn leak_light_is_non_mutating_and_publishes_lit_meshes_before_ready() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("leak-light.binvox");
+    let dimensions = [7, 7, 7];
+    let mut occupancy = vec![1; 343];
+    let index = |voxel: [u32; 3]| {
+        (voxel[0] + dimensions[0] * (voxel[1] + dimensions[1] * voxel[2])) as usize
+    };
+    for voxel in [[0, 3, 3], [1, 3, 3], [2, 3, 3], [2, 2, 3], [2, 2, 2]] {
+        occupancy[index(voxel)] = 0;
+    }
+    write_binvox(&path, dimensions, &occupancy);
+    let engine = EngineHandle::spawn(egui::Context::default());
+    engine.start_load(path).unwrap();
+    let replaced = wait_for_event(&engine, |event| {
+        matches!(event, EngineEvent::DocumentReplaced { .. })
+    });
+    let EngineEvent::DocumentReplaced { epoch, summary, .. } = replaced else {
+        unreachable!()
+    };
+    let original_count = summary.occupied_count;
+    engine
+        .send(EngineCommand::ConfigureLeakLight {
+            enabled: true,
+            half_distance: 4.0,
+        })
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut saw_updating = false;
+    let mut saw_lit_mesh = false;
+    loop {
+        if let Some(event) = engine.try_event() {
+            match event {
+                EngineEvent::LeakLightStatus {
+                    epoch: event_epoch,
+                    status: LeakLightStatus::Updating,
+                    ..
+                } if event_epoch == epoch => saw_updating = true,
+                EngineEvent::MeshChunk {
+                    tag,
+                    quads,
+                    leak_light: Some(light),
+                    ..
+                } if tag.document_epoch == epoch => {
+                    assert_eq!(light.len(), quads.len());
+                    saw_lit_mesh = true;
+                }
+                EngineEvent::LeakLightStatus {
+                    epoch: event_epoch,
+                    status: LeakLightStatus::Ready { .. },
+                    ..
+                } if event_epoch == epoch => break,
+                EngineEvent::Summary { summary, .. } => {
+                    assert_eq!(summary.occupied_count, original_count);
+                    assert_eq!(summary.revision, 1);
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for leak light"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(saw_updating);
+    assert!(saw_lit_mesh);
 }
 
 fn one_voxel_brush() -> BrushSpec {

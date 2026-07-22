@@ -199,6 +199,7 @@ fn repair_panel_guidance_and_controls_stay_inside_the_panel() {
         "Paint missing voxels or bridge gaps.",
         "Adjust flight movement and voxel surface detail.",
         "Show voxel outlines (V)",
+        "Show leak light (C)",
         "Fill empty regions that cannot reach a volume boundary.",
         "Fill enclosed cavities",
     ] {
@@ -816,6 +817,60 @@ fn fly_selector_is_accessible_without_resizing_and_expand_stays_independent() {
     assert_eq!(
         harness.get_by_label("Fly view").accesskit_node().toggled(),
         Some(Toggled::True)
+    );
+}
+
+#[test]
+fn leak_light_control_computes_in_background_and_c_shortcut_toggles_it() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("leak-light-controls.binvox");
+    let dimensions = [7, 7, 7];
+    let mut occupancy = vec![1; 343];
+    let index = |voxel: [u32; 3]| {
+        (voxel[0] + dimensions[0] * (voxel[1] + dimensions[1] * voxel[2])) as usize
+    };
+    for voxel in [[0, 3, 3], [1, 3, 3], [2, 3, 3], [2, 2, 3], [2, 2, 2]] {
+        occupancy[index(voxel)] = 0;
+    }
+    write_binvox(&path, dimensions, &occupancy);
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "7 × 7 × 7");
+
+    let control = harness.get_by_label("Show leak light (C)");
+    assert_eq!(control.accesskit_node().toggled(), Some(Toggled::False));
+    control.scroll_to_me();
+    for _ in 0..3 {
+        harness.step();
+    }
+    harness
+        .get_by_label("Show leak light (C)")
+        .click_accesskit();
+    wait_for_label(&mut harness, "Leak light is ready.");
+    assert_eq!(
+        harness
+            .get_by_label("Show leak light (C)")
+            .accesskit_node()
+            .toggled(),
+        Some(Toggled::True)
+    );
+    assert!(
+        !harness
+            .get_by_role_and_label(
+                Role::Slider,
+                "Light reach in world units (half-brightness distance)",
+            )
+            .accesskit_node()
+            .is_disabled()
+    );
+
+    harness.key_press(egui::Key::C);
+    harness.step();
+    assert_eq!(
+        harness
+            .get_by_label("Show leak light (C)")
+            .accesskit_node()
+            .toggled(),
+        Some(Toggled::False)
     );
 }
 

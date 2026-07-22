@@ -67,7 +67,7 @@ Use **File → Open** to load a supported volume. Common shortcuts are `Ctrl+O` 
 
 Choose a tool from the toolbar or press `I` for Inspect, `B` for Paint, `E` for Erase, or `L` for Bridge. The slice views preview the exact Paint, Erase, or Bridge voxels in every intersected pane, and support wheel-based slice navigation, `Ctrl`+wheel zoom, drag-to-pan, and click/drag editing. Arrow keys plus Page Up/Page Down move through slices; Space or Enter applies Paint or Erase.
 
-With Paint, Erase, or Bridge selected, press `-` or `+` to change brush diameter, `R` or `Q` for Round or Square, `1` or `3` for One slice or 3D volume, and `U` to switch between voxel and millimetre sizing when physical units are available. Press `V` to toggle voxel outlines. A brush setting changed during an active stroke applies to the next stroke; the current stroke keeps the brush it started with.
+With Paint, Erase, or Bridge selected, press `-` or `+` to change brush diameter, `R` or `Q` for Round or Square, `1` or `3` for One slice or 3D volume, and `U` to switch between voxel and millimetre sizing when physical units are available. Press `V` to toggle voxel outlines or `C` to toggle leak light. A brush setting changed during an active stroke applies to the next stroke; the current stroke keeps the brush it started with.
 
 Bridge adds one solid connection while you drag between two points. Very large bridges may be too expensive to preview exactly; in that case VoxelInk keeps the endpoints visible and shows a yellow notice instead of interrupting the drag. Shorten the bridge to restore the full preview, or release to let VoxelInk make a larger bounded attempt. If that final attempt is still too large, no voxels are changed and a nonmodal notice asks you to reduce the diameter or length.
 
@@ -76,7 +76,9 @@ The 3D pane offers two navigation styles:
 - **Orbit** rotates around the volume, pans with the right mouse button, and zooms with the wheel.
 - **Fly** uses a fixed center reticle. Click once to capture the mouse; that first click never edits. Look with the mouse, move with `W/A/S/D`, change world-Z height with Space/Shift, hold `Ctrl` to boost, and use the wheel to adjust speed. Level movement is selected by default, so W/S follow camera yaw on world X/Y regardless of pitch and only Space/Shift change height. The Free flight option instead makes W/S follow the full camera direction, including pitch; A/D remain level in both styles. Left-click or hold to use Paint, Erase, or Bridge through the reticle. Tool, brush, outline, undo, redo, and Home camera-reset shortcuts remain available without releasing capture; file shortcuts stay suppressed. Press Escape to cancel the active stroke and release the mouse.
 
-Orbit and Fly remember separate viewpoints. Reset affects only the active camera, and opening or closing a document returns navigation to Orbit. The **3D view** card in the repair panel provides the session-only W/S movement selector, a flight-speed slider, and a shared voxel-outline toggle that affects both navigation modes.
+Orbit and Fly remember separate viewpoints. Reset affects only the active camera, and opening or closing a document returns navigation to Orbit. The **3D view** card in the repair panel provides the session-only W/S movement selector, a flight-speed slider, and shared voxel-outline and leak-light controls that affect both navigation modes.
+
+**Leak light** is a diagnostic approximation of outside light travelling through face-connected empty voxels. It remains faintly visible through long or winding tunnels, while sealed cavities stay dark; the Light reach slider controls the physical distance over which its brighter gradient halves. Natural anatomical openings and accidental gaps propagate light identically, so VoxelInk leaves the decision about what to seal to you. Leak light changes only the view and is never saved into the volume.
 
 ## Build and test
 

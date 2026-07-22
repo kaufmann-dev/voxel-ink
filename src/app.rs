@@ -12,8 +12,8 @@ use crate::{
     cancel::CancellationToken,
     codecs::{FormatFamily, SourceVariant},
     engine::{
-        BrushPreviewRequest, BusyKind, EditId, JobId, PointerSample, SlicePatch, StrokeDisposition,
-        StrokeSpace,
+        BrushPreviewRequest, BusyKind, EditId, JobId, LeakLightStatus, PointerSample, SlicePatch,
+        StrokeDisposition, StrokeSpace,
     },
     io::SaveMode,
     renderer::{
@@ -402,6 +402,9 @@ pub struct VoxelInkApp {
     preview_notice: Option<String>,
     bridge_notice: Option<String>,
     mesh_preview_failed: bool,
+    leak_light_requested: bool,
+    leak_light_reach: f64,
+    leak_light_status: LeakLightStatus,
     dialog: Option<(DialogPurpose, Receiver<Option<PathBuf>>)>,
     dialog_copy_request: Option<SaveRequest>,
     allow_exit: bool,
@@ -498,6 +501,9 @@ impl VoxelInkApp {
             preview_notice: None,
             bridge_notice: None,
             mesh_preview_failed: false,
+            leak_light_requested: false,
+            leak_light_reach: 1.0,
+            leak_light_status: LeakLightStatus::Off,
             dialog: None,
             dialog_copy_request: None,
             allow_exit: false,
@@ -643,6 +649,10 @@ impl VoxelInkApp {
                     {
                         self.bridge_commit = None;
                     }
+                    self.scene.set_leak_light(matches!(
+                        self.leak_light_status,
+                        LeakLightStatus::Ready { .. }
+                    ));
                 }
                 EngineEvent::DocumentReplaced {
                     epoch,
@@ -650,6 +660,10 @@ impl VoxelInkApp {
                     slices,
                 } => {
                     self.release_fly_cursor(ctx);
+                    self.leak_light_reach = default_leak_light_reach(&summary);
+                    self.leak_light_requested = false;
+                    self.leak_light_status = LeakLightStatus::Off;
+                    self.scene.set_leak_light(false);
                     self.brush_size_unit = if summary.units == SpatialUnits::Unknown {
                         BrushSizeUnit::Voxels
                     } else {
@@ -702,6 +716,9 @@ impl VoxelInkApp {
                         view.reset();
                     }
                     self.scene.clear();
+                    self.leak_light_requested = false;
+                    self.leak_light_status = LeakLightStatus::Off;
+                    self.scene.set_leak_light(false);
                     self.preview_notice = None;
                     self.bridge_notice = None;
                     self.mesh_preview_failed = false;
@@ -874,9 +891,33 @@ impl VoxelInkApp {
                 EngineEvent::MeshChunk {
                     tag,
                     quads,
+                    leak_light,
                     priority,
                 } => {
-                    self.scene.insert_chunk(tag, quads, priority);
+                    self.scene.insert_chunk(tag, quads, leak_light, priority);
+                }
+                EngineEvent::LeakLightStatus {
+                    epoch,
+                    revision,
+                    status,
+                } if epoch == self.epoch
+                    && self
+                        .summary
+                        .as_ref()
+                        .is_some_and(|summary| summary.revision == revision) =>
+                {
+                    if status == LeakLightStatus::Off {
+                        self.leak_light_requested = false;
+                    }
+                    self.leak_light_status = status;
+                    self.scene
+                        .set_leak_light(matches!(status, LeakLightStatus::Ready { .. }));
+                    if matches!(status, LeakLightStatus::Ready { degraded: true }) {
+                        self.preview_notice = Some(
+                            "Leak light kept exact connectivity but simplified its brightness gradient at the memory limit."
+                                .into(),
+                        );
+                    }
                 }
                 EngineEvent::PreviewTooComplex { epoch, .. } if epoch == self.epoch => {
                     self.mesh_preview_failed = true;
@@ -1086,6 +1127,9 @@ impl VoxelInkApp {
         if consume_setting_key(ctx, egui::Key::V, fly_captured, false) {
             self.scene.set_voxel_seams(!self.scene.voxel_seams());
         }
+        if self.summary.is_some() && consume_setting_key(ctx, egui::Key::C, fly_captured, false) {
+            self.configure_leak_light(!self.leak_light_requested);
+        }
         if fly_captured && consume_setting_key(ctx, egui::Key::Home, true, false) {
             self.scene.reset_view();
         }
@@ -1117,6 +1161,24 @@ impl VoxelInkApp {
         if consume_setting_key(ctx, egui::Key::Plus, fly_captured, true) {
             self.suppress_fly_vertical_this_frame = ctx.input(|input| input.modifiers.shift);
             self.apply_brush_setting_shortcut(BrushSettingShortcut::AdjustDiameter(1));
+        }
+    }
+
+    fn configure_leak_light(&mut self, enabled: bool) {
+        self.scene.set_leak_light(false);
+        self.leak_light_requested = enabled;
+        self.leak_light_status = if enabled {
+            LeakLightStatus::Updating
+        } else {
+            LeakLightStatus::Off
+        };
+        if let Err(error) = self.engine.send(EngineCommand::ConfigureLeakLight {
+            enabled,
+            half_distance: self.leak_light_reach,
+        }) {
+            self.leak_light_requested = false;
+            self.leak_light_status = LeakLightStatus::Off;
+            self.error_message = Some(error.to_string());
         }
     }
 
@@ -1814,6 +1876,68 @@ impl VoxelInkApp {
                                 .changed()
                             {
                                 self.scene.set_voxel_seams(voxel_seams);
+                            }
+
+                            let mut leak_light = self.leak_light_requested;
+                            if ui
+                                .add_enabled(
+                                    self.summary.is_some(),
+                                    egui::Checkbox::new(
+                                        &mut leak_light,
+                                        "Show leak light (C)",
+                                    ),
+                                )
+                                .on_hover_text(
+                                    "Propagate outside light through face-connected empty voxels. Natural and accidental openings are treated alike.",
+                                )
+                                .changed()
+                            {
+                                self.configure_leak_light(leak_light);
+                            }
+                            if self.leak_light_requested
+                                && let Some(summary) = &self.summary
+                            {
+                                ui.add_space(6.0);
+                                let label = ui.add(
+                                    egui::Label::new(format!(
+                                        "Light reach in {} (half-brightness distance)",
+                                        leak_light_unit_label(summary.units)
+                                    ))
+                                    .wrap(),
+                                );
+                                let [minimum, maximum] = leak_light_reach_range(summary);
+                                ui.spacing_mut().slider_width = ui.available_width().max(1.0);
+                                let response = ui
+                                    .add(
+                                        egui::Slider::new(
+                                            &mut self.leak_light_reach,
+                                            minimum..=maximum,
+                                        )
+                                        .logarithmic(true),
+                                    )
+                                    .labelled_by(label.id)
+                                    .on_hover_text(
+                                        "Physical path distance over which propagated brightness halves",
+                                    );
+                                if (response.changed() && !response.dragged())
+                                    || response.drag_stopped()
+                                {
+                                    self.configure_leak_light(true);
+                                }
+                                ui.label(
+                                    egui::RichText::new(match self.leak_light_status {
+                                        LeakLightStatus::Off => "Leak light is off.",
+                                        LeakLightStatus::Updating => "Updating leak light…",
+                                        LeakLightStatus::Ready { degraded: false } => {
+                                            "Leak light is ready."
+                                        }
+                                        LeakLightStatus::Ready { degraded: true } => {
+                                            "Ready with a simplified brightness gradient."
+                                        }
+                                    })
+                                    .small()
+                                    .color(MUTED),
+                                );
                             }
                         });
                         view_card.response.widget_info(|| {
@@ -2740,8 +2864,15 @@ impl VoxelInkApp {
             ),
             pane_rect.max - egui::vec2(PANE_CONTENT_INSET, PANE_CONTENT_INSET),
         );
-        ui.painter()
-            .rect_filled(content, CONTROL_RADIUS, self.background_color());
+        ui.painter().rect_filled(
+            content,
+            CONTROL_RADIUS,
+            if self.scene.leak_light() {
+                Color32::WHITE
+            } else {
+                self.background_color()
+            },
+        );
         self.scene
             .set_aspect(content.width() / content.height().max(1.0));
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
@@ -3604,6 +3735,7 @@ impl VoxelInkApp {
             initial_sample,
             cancel: cancel.clone(),
         }) {
+            self.scene.set_leak_light(false);
             self.stroke = Some(UiStroke {
                 edit_id,
                 space,
@@ -3697,6 +3829,7 @@ impl VoxelInkApp {
             cancel: commit.cancel.clone(),
         }) {
             Ok(()) => {
+                self.scene.set_leak_light(false);
                 if let Some(queued) = self
                     .bridge_commit
                     .as_mut()
@@ -4390,6 +4523,37 @@ fn cavities_filled_notice(summary: Option<&DocumentSummary>, added_voxels: u64) 
             format!("Filled {count} enclosed {voxel_label} ({volume} cm³) · Undo restores them")
         },
     )
+}
+
+fn leak_light_reach_range(summary: &DocumentSummary) -> [f64; 2] {
+    let minimum = summary
+        .spacing
+        .into_iter()
+        .fold(f64::INFINITY, f64::min)
+        .max(f64::EPSILON);
+    let diagonal = summary
+        .dimensions
+        .into_iter()
+        .zip(summary.spacing)
+        .map(|(dimension, spacing)| (f64::from(dimension) * spacing).powi(2))
+        .sum::<f64>()
+        .sqrt()
+        .max(minimum);
+    [minimum, diagonal]
+}
+
+fn default_leak_light_reach(summary: &DocumentSummary) -> f64 {
+    let [minimum, maximum] = leak_light_reach_range(summary);
+    (maximum * 0.1).clamp(minimum, maximum)
+}
+
+const fn leak_light_unit_label(units: SpatialUnits) -> &'static str {
+    match units {
+        SpatialUnits::Meter => "metres",
+        SpatialUnits::Millimeter => "millimetres",
+        SpatialUnits::Micron => "microns",
+        SpatialUnits::Unknown => "world units",
+    }
 }
 
 fn format_count(value: u64) -> String {
