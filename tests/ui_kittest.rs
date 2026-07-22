@@ -821,7 +821,7 @@ fn fly_selector_is_accessible_without_resizing_and_expand_stays_independent() {
 }
 
 #[test]
-fn leak_light_control_computes_in_background_and_c_shortcut_toggles_it() {
+fn leak_light_control_prepares_once_and_reach_changes_immediately() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("leak-light-controls.nii");
     let dimensions = [7, 7, 7];
@@ -868,14 +868,20 @@ fn leak_light_control_computes_in_background_and_c_shortcut_toggles_it() {
         value.rect()
     );
     let selected_reach = drag_slider_to_minimum(&mut harness, reach_label);
-    wait_for_label(&mut harness, "Leak light is ready.");
+    assert!(harness.query_by_label("Leak light is ready.").is_some());
+    assert!(harness.query_by_label("Computing leak paths…").is_none());
+    assert!(
+        harness
+            .query_by_label("Preparing leak-light shading…")
+            .is_none()
+    );
     assert_eq!(
         harness
             .get_by_role_and_label(Role::Slider, reach_label)
             .accesskit_node()
             .numeric_value(),
         Some(selected_reach),
-        "the asynchronous recompute moved the light-reach slider away from its selected minimum"
+        "the renderer-only reach update moved the slider away from its selected minimum"
     );
 
     harness.key_press(egui::Key::C);
@@ -886,6 +892,16 @@ fn leak_light_control_computes_in_background_and_c_shortcut_toggles_it() {
             .accesskit_node()
             .toggled(),
         Some(Toggled::False)
+    );
+
+    harness.key_press(egui::Key::C);
+    wait_for_label(&mut harness, "Leak light is ready.");
+    assert_eq!(
+        harness
+            .get_by_label("Show leak light (C)")
+            .accesskit_node()
+            .toggled(),
+        Some(Toggled::True)
     );
 }
 

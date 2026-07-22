@@ -21,12 +21,12 @@ use crate::{
     io::{SaveMode, load_path, save_document},
     mesh::{
         ChunkCoord, ChunkInput, CompactQuad, MeshBudgetError, MeshJobTag, MeshMemoryBudget,
-        MeshUpdatePriority, PackedLeakLight, TaggedChunkMesh, bounded_mesh_queue, chunk_grid,
+        MeshUpdatePriority, TaggedChunkMesh, bounded_mesh_queue, chunk_grid,
         invalidated_chunks_for_index_spans, invalidated_chunks_for_indices, mesh_chunk,
     },
     volume::{
-        ChangedVoxels, DocumentSummary, LeakLightField, Matrix4, SliceAxis, SliceImage, Tool,
-        VolumeDocument, compute_leak_light, linear_index,
+        ChangedVoxels, DocumentSummary, LeakDistanceField, Matrix4, SliceAxis, SliceImage, Tool,
+        VolumeDocument, compute_leak_distance, linear_index,
     },
 };
 
@@ -79,7 +79,8 @@ pub enum EditOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LeakLightStatus {
     Off,
-    Updating,
+    Computing,
+    Preparing,
     Ready { degraded: bool },
 }
 
@@ -152,7 +153,6 @@ pub enum EngineCommand {
     RebuildPreview,
     ConfigureLeakLight {
         enabled: bool,
-        half_distance: f64,
     },
     Shutdown,
 }
@@ -257,8 +257,13 @@ pub enum EngineEvent {
     MeshChunk {
         tag: MeshJobTag,
         quads: Vec<CompactQuad>,
-        leak_light: Option<Vec<PackedLeakLight>>,
         priority: MeshUpdatePriority,
+    },
+    LeakDistanceField {
+        epoch: u64,
+        revision: u64,
+        generation: u64,
+        field: Arc<LeakDistanceField>,
     },
     LeakLightStatus {
         epoch: u64,
@@ -548,7 +553,7 @@ struct StrokeContext {
 }
 
 type MeshResult = (MeshJobTag, MeshUpdatePriority, Result<TaggedChunkMesh>);
-type LeakLightResult = (u64, u64, u64, Result<LeakLightField>);
+type LeakLightResult = (u64, u64, u64, Result<LeakDistanceField>);
 
 #[derive(Debug, Default)]
 struct DirtyChunkQueue {
@@ -676,15 +681,11 @@ struct EngineState {
     mesh_background_cancel: CancellationToken,
     preview_too_complex: bool,
     leak_light_requested: bool,
-    leak_light_half_distance: f64,
     leak_light_generation: u64,
     leak_light_cancel: CancellationToken,
-    leak_light_field: Option<LeakLightField>,
-    leak_light_mesh_pending: bool,
-    pending_live_mesh_chunks:
-        VecDeque<(MeshJobTag, Vec<CompactQuad>, Option<Vec<PackedLeakLight>>)>,
-    pending_background_mesh_chunks:
-        VecDeque<(MeshJobTag, Vec<CompactQuad>, Option<Vec<PackedLeakLight>>)>,
+    leak_distance_field: Option<Arc<LeakDistanceField>>,
+    pending_live_mesh_chunks: VecDeque<(MeshJobTag, Vec<CompactQuad>)>,
+    pending_background_mesh_chunks: VecDeque<(MeshJobTag, Vec<CompactQuad>)>,
 }
 
 impl EngineState {
@@ -740,11 +741,9 @@ impl EngineState {
             mesh_background_cancel: CancellationToken::default(),
             preview_too_complex: false,
             leak_light_requested: false,
-            leak_light_half_distance: 1.0,
             leak_light_generation: 0,
             leak_light_cancel: CancellationToken::default(),
-            leak_light_field: None,
-            leak_light_mesh_pending: false,
+            leak_distance_field: None,
             pending_live_mesh_chunks: VecDeque::new(),
             pending_background_mesh_chunks: VecDeque::new(),
         }
@@ -754,7 +753,6 @@ impl EngineState {
         loop {
             self.flush_pending_mesh_chunk();
             self.dispatch_mesh_jobs();
-            self.maybe_finish_leak_light_mesh();
             if self.live_feedback_pending()
                 && self.command_rx.is_empty()
                 && let Ok(result) = self.mesh_rx.try_recv()
@@ -882,34 +880,25 @@ impl EngineState {
                     self.reset_mesh_preview();
                 }
             }
-            EngineCommand::ConfigureLeakLight {
-                enabled,
-                half_distance,
-            } => self.configure_leak_light(enabled, half_distance),
+            EngineCommand::ConfigureLeakLight { enabled } => self.configure_leak_light(enabled),
             EngineCommand::Shutdown => {}
         }
     }
 
-    fn configure_leak_light(&mut self, enabled: bool, half_distance: f64) {
+    fn configure_leak_light(&mut self, enabled: bool) {
         self.leak_light_cancel.cancel();
         self.leak_light_generation = self.leak_light_generation.saturating_add(1);
-        self.leak_light_field = None;
-        self.leak_light_mesh_pending = false;
         self.leak_light_requested = enabled;
         if !enabled {
             self.emit_leak_light_status(LeakLightStatus::Off);
             return;
         }
-        if !half_distance.is_finite() || half_distance <= 0.0 {
-            self.leak_light_requested = false;
-            self.emit_error(
-                None,
-                AppError::InvalidDimensions("leak-light reach must be finite and positive".into()),
-            );
-            self.emit_leak_light_status(LeakLightStatus::Off);
+        if let Some(field) = self.leak_distance_field.clone() {
+            self.emit_leak_light_status(LeakLightStatus::Ready {
+                degraded: field.degraded(),
+            });
             return;
         }
-        self.leak_light_half_distance = half_distance;
         self.start_leak_light_compute();
     }
 
@@ -922,8 +911,7 @@ impl EngineState {
         self.leak_light_cancel.cancel();
         self.leak_light_cancel = CancellationToken::default();
         self.leak_light_generation = self.leak_light_generation.saturating_add(1);
-        self.leak_light_field = None;
-        self.leak_light_mesh_pending = false;
+        self.leak_distance_field = None;
         let generation = self.leak_light_generation;
         let epoch = self.epoch;
         let revision = document.revision();
@@ -943,13 +931,11 @@ impl EngineState {
             return;
         }
         occupancy.extend_from_slice(source);
-        let half_distance = self.leak_light_half_distance;
         let cancel = self.leak_light_cancel.clone();
         let sender = self.leak_light_tx.clone();
-        self.emit_leak_light_status(LeakLightStatus::Updating);
+        self.emit_leak_light_status(LeakLightStatus::Computing);
         rayon::spawn(move || {
-            let result =
-                compute_leak_light(&occupancy, dimensions, &spacing, half_distance, &cancel);
+            let result = compute_leak_distance(&occupancy, dimensions, &spacing, &cancel);
             let _ = sender.send((epoch, revision, generation, result));
         });
     }
@@ -968,9 +954,9 @@ impl EngineState {
         }
         match result {
             Ok(field) => {
-                self.leak_light_field = Some(field);
-                self.leak_light_mesh_pending = true;
-                self.reset_mesh_preview();
+                let field = Arc::new(field);
+                self.leak_distance_field = Some(Arc::clone(&field));
+                self.publish_leak_distance_field(field);
             }
             Err(AppError::Cancelled) => {}
             Err(error) => {
@@ -981,29 +967,19 @@ impl EngineState {
         }
     }
 
-    fn maybe_finish_leak_light_mesh(&mut self) {
-        if !self.leak_light_mesh_pending {
+    fn publish_leak_distance_field(&self, field: Arc<LeakDistanceField>) {
+        let Some(document) = &self.document else {
             return;
-        }
-        if self.preview_too_complex {
-            self.leak_light_mesh_pending = false;
-            self.leak_light_requested = false;
-            self.leak_light_field = None;
-            self.emit_leak_light_status(LeakLightStatus::Off);
-            return;
-        }
-        if self.mesh_scan_next < self.mesh_scan_total
-            || !self.mesh_dirty.order.is_empty()
-            || self.mesh_in_flight != 0
-            || self.has_pending_mesh_chunks()
-        {
-            return;
-        }
-        self.leak_light_mesh_pending = false;
-        let degraded = self
-            .leak_light_field
-            .as_ref()
-            .is_some_and(LeakLightField::degraded);
+        };
+        let revision = document.revision();
+        let degraded = field.degraded();
+        self.emit_leak_light_status(LeakLightStatus::Preparing);
+        self.emit(EngineEvent::LeakDistanceField {
+            epoch: self.epoch,
+            revision,
+            generation: self.leak_light_generation,
+            field,
+        });
         self.emit_leak_light_status(LeakLightStatus::Ready { degraded });
     }
 
@@ -1051,8 +1027,7 @@ impl EngineState {
                 self.document = Some(document);
                 self.stroke = None;
                 self.leak_light_requested = false;
-                self.leak_light_field = None;
-                self.leak_light_mesh_pending = false;
+                self.leak_distance_field = None;
                 self.mesh_generations.clear();
                 self.reset_mesh_preview();
                 self.emit(EngineEvent::DocumentReplaced {
@@ -1192,8 +1167,7 @@ impl EngineState {
         self.leak_light_cancel.cancel();
         self.document = None;
         self.leak_light_requested = false;
-        self.leak_light_field = None;
-        self.leak_light_mesh_pending = false;
+        self.leak_distance_field = None;
         self.epoch = self.epoch.saturating_add(1);
         self.mesh_dirty.configure([0; 3]);
         self.mesh_scan_grid = [0; 3];
@@ -1890,7 +1864,7 @@ impl EngineState {
                 edit_generation: self.preview_generation,
                 chunk,
             };
-            self.queue_mesh_chunk(tag, Vec::new(), None, MeshUpdatePriority::Live);
+            self.queue_mesh_chunk(tag, Vec::new(), MeshUpdatePriority::Live);
             self.mesh_budget.release_reservation(chunk);
             if !self.preview_too_complex {
                 let queued = self.mesh_dirty.enqueue_back(chunk);
@@ -1981,6 +1955,9 @@ impl EngineState {
     fn reset_mesh_preview(&mut self) {
         self.mesh_cancel.cancel();
         self.mesh_background_cancel.cancel();
+        if !self.leak_light_requested {
+            self.leak_distance_field = None;
+        }
         self.mesh_dirty.clear();
         self.mesh_live_chunks.clear();
         self.mesh_recovery_chunks.clear();
@@ -2025,11 +2002,19 @@ impl EngineState {
             dimensions,
             index_to_world,
         });
+        if self.leak_light_requested
+            && let Some(field) = self.leak_distance_field.clone()
+        {
+            self.publish_leak_distance_field(field);
+        }
     }
 
     fn restart_mesh_after_change(&mut self, invalidated: Vec<ChunkCoord>, revision: u64) {
         self.mesh_cancel.cancel();
         self.mesh_background_cancel.cancel();
+        self.leak_light_cancel.cancel();
+        self.leak_light_generation = self.leak_light_generation.saturating_add(1);
+        self.leak_distance_field = None;
         self.mesh_cancel = CancellationToken::default();
         self.mesh_background_cancel = CancellationToken::default();
         self.progressive_live_jobs.clear();
@@ -2113,12 +2098,12 @@ impl EngineState {
 
     fn requeue_pending_mesh_chunks(&mut self) -> HashSet<ChunkCoord> {
         let mut preserved_live = HashSet::new();
-        for (tag, _, _) in self.pending_live_mesh_chunks.drain(..) {
+        for (tag, _) in self.pending_live_mesh_chunks.drain(..) {
             preserved_live.insert(tag.chunk);
             let queued = self.mesh_dirty.enqueue_back(tag.chunk);
             debug_assert!(queued);
         }
-        for (tag, _, _) in self.pending_background_mesh_chunks.drain(..) {
+        for (tag, _) in self.pending_background_mesh_chunks.drain(..) {
             let queued = self.mesh_dirty.enqueue_back(tag.chunk);
             debug_assert!(queued);
         }
@@ -2289,12 +2274,9 @@ impl EngineState {
                 MeshUpdatePriority::Background => self.mesh_background_cancel.clone(),
                 MeshUpdatePriority::Live => self.mesh_cancel.clone(),
             };
-            let input = match ChunkInput::copy_from_volume_with_leak_light(
+            let input = match ChunkInput::copy_from_volume(
                 document.geometry().dimensions,
                 document.view().occupancy,
-                self.leak_light_field
-                    .as_ref()
-                    .map(LeakLightField::intensities),
                 chunk,
                 &cancel,
             ) {
@@ -2470,12 +2452,7 @@ impl EngineState {
             });
             return;
         }
-        self.queue_mesh_chunk(
-            tagged.tag,
-            tagged.mesh.quads,
-            tagged.mesh.leak_light,
-            priority,
-        );
+        self.queue_mesh_chunk(tagged.tag, tagged.mesh.quads, priority);
         if priority == MeshUpdatePriority::Live && self.stroke.is_some() {
             self.last_live_feedback_generation =
                 self.last_live_feedback_generation.max(tag.edit_generation);
@@ -2487,12 +2464,7 @@ impl EngineState {
         let tag = tagged.tag;
         self.mesh_budget.release_reservation(tag.chunk);
         self.mesh_recovery_chunks.remove(&tag.chunk);
-        self.queue_mesh_chunk(
-            tag,
-            tagged.mesh.quads,
-            tagged.mesh.leak_light,
-            MeshUpdatePriority::Live,
-        );
+        self.queue_mesh_chunk(tag, tagged.mesh.quads, MeshUpdatePriority::Live);
     }
 
     fn requeue_deferred_recovery_chunks(&mut self) {
@@ -2525,7 +2497,7 @@ impl EngineState {
         self.mesh_scan_promoted.clear();
         self.progressive_live_jobs.clear();
         self.pending_live_mesh_chunks
-            .retain(|(tag, _, _)| !failed_chunks.contains(&tag.chunk));
+            .retain(|(tag, _)| !failed_chunks.contains(&tag.chunk));
         for chunk in self.mesh_recovery_chunks.drain() {
             self.mesh_budget.release_reservation(chunk);
         }
@@ -2558,27 +2530,24 @@ impl EngineState {
         &mut self,
         tag: MeshJobTag,
         quads: Vec<CompactQuad>,
-        leak_light: Option<Vec<PackedLeakLight>>,
         priority: MeshUpdatePriority,
     ) {
         if self.has_pending_mesh_chunks() || self.event_tx.len() >= MESH_EVENT_BACKLOG_LIMIT {
-            self.enqueue_pending_mesh_chunk(tag, quads, leak_light, priority);
+            self.enqueue_pending_mesh_chunk(tag, quads, priority);
             return;
         }
         match self.event_tx.try_send(EngineEvent::MeshChunk {
             tag,
             quads,
-            leak_light,
             priority,
         }) {
             Ok(()) => self.repaint.request_repaint(),
             Err(TrySendError::Full(EngineEvent::MeshChunk {
                 tag,
                 quads,
-                leak_light,
                 priority,
             })) => {
-                self.enqueue_pending_mesh_chunk(tag, quads, leak_light, priority);
+                self.enqueue_pending_mesh_chunk(tag, quads, priority);
             }
             Err(TrySendError::Disconnected(_)) => {}
             Err(TrySendError::Full(_)) => unreachable!("only mesh chunks are queued here"),
@@ -2589,12 +2558,11 @@ impl EngineState {
         &mut self,
         tag: MeshJobTag,
         quads: Vec<CompactQuad>,
-        leak_light: Option<Vec<PackedLeakLight>>,
         priority: MeshUpdatePriority,
     ) {
         match priority {
             MeshUpdatePriority::Live => {
-                let newer_is_queued = self.pending_live_mesh_chunks.iter().any(|(queued, _, _)| {
+                let newer_is_queued = self.pending_live_mesh_chunks.iter().any(|(queued, _)| {
                     queued.document_epoch == tag.document_epoch
                         && queued.revision == tag.revision
                         && queued.chunk == tag.chunk
@@ -2603,24 +2571,22 @@ impl EngineState {
                 if newer_is_queued {
                     return;
                 }
-                self.pending_live_mesh_chunks.retain(|(queued, _, _)| {
+                self.pending_live_mesh_chunks.retain(|(queued, _)| {
                     queued.document_epoch != tag.document_epoch
                         || queued.revision != tag.revision
                         || queued.chunk != tag.chunk
                         || queued.chunk_generation > tag.chunk_generation
                 });
-                self.pending_background_mesh_chunks
-                    .retain(|(queued, _, _)| {
-                        queued.document_epoch != tag.document_epoch
-                            || queued.revision != tag.revision
-                            || queued.chunk != tag.chunk
-                            || queued.chunk_generation > tag.chunk_generation
-                    });
-                self.pending_live_mesh_chunks
-                    .push_back((tag, quads, leak_light));
+                self.pending_background_mesh_chunks.retain(|(queued, _)| {
+                    queued.document_epoch != tag.document_epoch
+                        || queued.revision != tag.revision
+                        || queued.chunk != tag.chunk
+                        || queued.chunk_generation > tag.chunk_generation
+                });
+                self.pending_live_mesh_chunks.push_back((tag, quads));
             }
             MeshUpdatePriority::Background => {
-                if self.pending_live_mesh_chunks.iter().any(|(queued, _, _)| {
+                if self.pending_live_mesh_chunks.iter().any(|(queued, _)| {
                     queued.document_epoch == tag.document_epoch
                         && queued.revision == tag.revision
                         && queued.chunk == tag.chunk
@@ -2628,8 +2594,7 @@ impl EngineState {
                 }) {
                     return;
                 }
-                self.pending_background_mesh_chunks
-                    .push_back((tag, quads, leak_light))
+                self.pending_background_mesh_chunks.push_back((tag, quads))
             }
         }
     }
@@ -2649,11 +2614,10 @@ impl EngineState {
         } else {
             return;
         };
-        let (tag, quads, leak_light) = pending;
+        let (tag, quads) = pending;
         match self.event_tx.try_send(EngineEvent::MeshChunk {
             tag,
             quads,
-            leak_light,
             priority,
         }) {
             Ok(()) => {
@@ -2665,16 +2629,13 @@ impl EngineState {
             Err(TrySendError::Full(EngineEvent::MeshChunk {
                 tag,
                 quads,
-                leak_light,
                 priority,
             })) => match priority {
                 MeshUpdatePriority::Live => {
-                    self.pending_live_mesh_chunks
-                        .push_front((tag, quads, leak_light));
+                    self.pending_live_mesh_chunks.push_front((tag, quads));
                 }
                 MeshUpdatePriority::Background => {
-                    self.pending_background_mesh_chunks
-                        .push_front((tag, quads, leak_light));
+                    self.pending_background_mesh_chunks.push_front((tag, quads));
                 }
             },
             Err(TrySendError::Disconnected(_)) => {}
@@ -4186,9 +4147,7 @@ mod tests {
             edit_generation: 1,
             chunk: pending_live,
         };
-        state
-            .pending_live_mesh_chunks
-            .push_back((tag, Vec::new(), None));
+        state.pending_live_mesh_chunks.push_back((tag, Vec::new()));
         state.mesh_in_flight_chunks.insert(in_flight_live);
         state
             .mesh_in_flight_priorities
@@ -4272,7 +4231,6 @@ mod tests {
                     CompactQuad::new([0, 0, 0], 1, 1, crate::mesh::FaceAxis::X, true, [0; 4])
                         .unwrap(),
                 ],
-                None,
                 MeshUpdatePriority::Live,
             );
         }
@@ -4576,7 +4534,6 @@ mod tests {
                 tag: tag(grow),
                 mesh: ChunkMesh {
                     quads: vec![quad; 2],
-                    leak_light: None,
                     exposed_voxel_faces: 2,
                 },
             }),
@@ -4591,7 +4548,6 @@ mod tests {
                 tag: tag(shrink),
                 mesh: ChunkMesh {
                     quads: vec![quad],
-                    leak_light: None,
                     exposed_voxel_faces: 1,
                 },
             }),
@@ -4607,7 +4563,6 @@ mod tests {
                 tag: tag(grow),
                 mesh: ChunkMesh {
                     quads: vec![quad; 2],
-                    leak_light: None,
                     exposed_voxel_faces: 2,
                 },
             }),

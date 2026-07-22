@@ -18,7 +18,7 @@ use crate::{
     io::SaveMode,
     renderer::{
         FlyMovement, FlyMovementBasis, SceneBridge, VolumePaintCallback, VolumeViewMode,
-        VoxelHighlightKind,
+        VoxelHighlightKind, leak_compute_supported,
     },
     volume::{DocumentSummary, SliceAxis, SliceImage, SpatialUnits, Tool},
 };
@@ -387,6 +387,8 @@ pub struct VoxelInkApp {
     scene: SceneBridge,
     target_format: wgpu::TextureFormat,
     adapter_name: String,
+    gpu_renderer_available: bool,
+    leak_compute_supported: bool,
     tool: Tool,
     brush_shape: BrushShape,
     brush_depth: BrushDepth,
@@ -437,28 +439,32 @@ impl VoxelInkApp {
         let logo = cc
             .egui_ctx
             .load_texture("voxel-ink-logo", logo_image, TextureOptions::LINEAR);
-        let (target_format, adapter_name) = cc.wgpu_render_state.as_ref().map_or_else(
-            || {
-                (
-                    wgpu::TextureFormat::Bgra8UnormSrgb,
-                    "GPU unavailable in UI test harness".to_owned(),
-                )
-            },
-            |state| {
-                let info = state.adapter.get_info();
-                tracing::info!(
-                    adapter = %info.name,
-                    backend = ?info.backend,
-                    device_type = ?info.device_type,
-                    driver = %info.driver,
-                    "selected graphics adapter"
-                );
-                (
-                    state.target_format,
-                    format!("{} ({:?})", info.name, info.backend),
-                )
-            },
-        );
+        let gpu_renderer_available = cc.wgpu_render_state.is_some();
+        let (target_format, adapter_name, leak_compute_supported) =
+            cc.wgpu_render_state.as_ref().map_or_else(
+                || {
+                    (
+                        wgpu::TextureFormat::Bgra8UnormSrgb,
+                        "GPU unavailable in UI test harness".to_owned(),
+                        false,
+                    )
+                },
+                |state| {
+                    let info = state.adapter.get_info();
+                    tracing::info!(
+                        adapter = %info.name,
+                        backend = ?info.backend,
+                        device_type = ?info.device_type,
+                        driver = %info.driver,
+                        "selected graphics adapter"
+                    );
+                    (
+                        state.target_format,
+                        format!("{} ({:?})", info.name, info.backend),
+                        leak_compute_supported(&state.adapter),
+                    )
+                },
+            );
         let engine = EngineHandle::spawn(cc.egui_ctx.clone());
         let scene = SceneBridge::default();
         scene.set_repaint_context(cc.egui_ctx.clone());
@@ -483,6 +489,8 @@ impl VoxelInkApp {
             scene,
             target_format,
             adapter_name,
+            gpu_renderer_available,
+            leak_compute_supported,
             tool: Tool::Inspect,
             brush_shape: BrushShape::Round,
             brush_depth: BrushDepth::Slice,
@@ -661,6 +669,7 @@ impl VoxelInkApp {
                 } => {
                     self.release_fly_cursor(ctx);
                     self.leak_light_reach = default_leak_light_reach(&summary);
+                    self.scene.set_leak_light_reach(self.leak_light_reach);
                     self.leak_light_requested = false;
                     self.leak_light_status = LeakLightStatus::Off;
                     self.scene.set_leak_light(false);
@@ -891,10 +900,18 @@ impl VoxelInkApp {
                 EngineEvent::MeshChunk {
                     tag,
                     quads,
-                    leak_light,
                     priority,
                 } => {
-                    self.scene.insert_chunk(tag, quads, leak_light, priority);
+                    self.scene.insert_chunk(tag, quads, priority);
+                }
+                EngineEvent::LeakDistanceField {
+                    epoch,
+                    revision,
+                    generation,
+                    field,
+                } => {
+                    self.scene
+                        .set_leak_distance_field(epoch, revision, generation, field);
                 }
                 EngineEvent::LeakLightStatus {
                     epoch,
@@ -1168,14 +1185,14 @@ impl VoxelInkApp {
         self.scene.set_leak_light(false);
         self.leak_light_requested = enabled;
         self.leak_light_status = if enabled {
-            LeakLightStatus::Updating
+            LeakLightStatus::Computing
         } else {
             LeakLightStatus::Off
         };
-        if let Err(error) = self.engine.send(EngineCommand::ConfigureLeakLight {
-            enabled,
-            half_distance: self.leak_light_reach,
-        }) {
+        if let Err(error) = self
+            .engine
+            .send(EngineCommand::ConfigureLeakLight { enabled })
+        {
             self.leak_light_requested = false;
             self.leak_light_status = LeakLightStatus::Off;
             self.error_message = Some(error.to_string());
@@ -1906,7 +1923,7 @@ impl VoxelInkApp {
                                     .wrap(),
                                 );
                                 let [minimum, maximum] = leak_light_reach_range(summary);
-                                let mut recompute = false;
+                                let mut reach_changed = false;
                                 ui.allocate_ui_with_layout(
                                     egui::vec2(ui.available_width(), CONTROL_MIN_HEIGHT),
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -1923,9 +1940,7 @@ impl VoxelInkApp {
                                             .on_hover_text(
                                                 "Physical path distance over which propagated brightness halves",
                                             );
-                                        recompute |= (value_response.changed()
-                                            && !value_response.dragged())
-                                            || value_response.drag_stopped();
+                                        reach_changed |= value_response.changed();
 
                                         ui.spacing_mut().slider_width =
                                             ui.available_width().max(1.0);
@@ -1942,18 +1957,34 @@ impl VoxelInkApp {
                                             .on_hover_text(
                                                 "Physical path distance over which propagated brightness halves",
                                             );
-                                        recompute |= (slider_response.changed()
-                                            && !slider_response.dragged())
-                                            || slider_response.drag_stopped();
+                                        reach_changed |= slider_response.changed();
                                     },
                                 );
-                                if recompute {
-                                    self.configure_leak_light(true);
+                                if reach_changed {
+                                    self.scene.set_leak_light_reach(self.leak_light_reach);
+                                }
+                                if self.gpu_renderer_available
+                                    && matches!(
+                                        self.leak_light_status,
+                                        LeakLightStatus::Ready { .. }
+                                    )
+                                    && !self.scene.leak_distance_ready()
+                                {
+                                    ui.ctx().request_repaint();
                                 }
                                 ui.label(
                                     egui::RichText::new(match self.leak_light_status {
                                         LeakLightStatus::Off => "Leak light is off.",
-                                        LeakLightStatus::Updating => "Updating leak light…",
+                                        LeakLightStatus::Computing => "Computing leak paths…",
+                                        LeakLightStatus::Preparing => {
+                                            "Preparing leak-light shading…"
+                                        }
+                                        LeakLightStatus::Ready { .. }
+                                            if self.gpu_renderer_available
+                                                && !self.scene.leak_distance_ready() =>
+                                        {
+                                            "Preparing leak-light shading…"
+                                        }
                                         LeakLightStatus::Ready { degraded: false } => {
                                             "Leak light is ready."
                                         }
@@ -2893,7 +2924,9 @@ impl VoxelInkApp {
         ui.painter().rect_filled(
             content,
             CONTROL_RADIUS,
-            if self.scene.leak_light() {
+            if self.scene.leak_light()
+                && (!self.gpu_renderer_available || self.scene.leak_distance_ready())
+            {
                 Color32::WHITE
             } else {
                 self.background_color()
@@ -2903,7 +2936,11 @@ impl VoxelInkApp {
             .set_aspect(content.width() / content.height().max(1.0));
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             content,
-            VolumePaintCallback::new(self.scene.clone(), self.target_format),
+            VolumePaintCallback::new(
+                self.scene.clone(),
+                self.target_format,
+                self.leak_compute_supported,
+            ),
         ));
         let response = ui.interact(
             content,

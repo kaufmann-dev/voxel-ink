@@ -797,7 +797,7 @@ fn load_single_chunk(occupancy: Vec<u8>) -> (EngineHandle, u64, MeshJobTag, Vec<
 }
 
 #[test]
-fn leak_light_is_non_mutating_and_publishes_lit_meshes_before_ready() {
+fn leak_light_is_non_mutating_and_prepares_distances_without_remeshing() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("leak-light.binvox");
     let dimensions = [7, 7, 7];
@@ -818,38 +818,62 @@ fn leak_light_is_non_mutating_and_publishes_lit_meshes_before_ready() {
         unreachable!()
     };
     let original_count = summary.occupied_count;
+    let _baseline = wait_for_event(&engine, |event| {
+        matches!(
+            event,
+            EngineEvent::MeshChunk { tag, .. }
+                if tag.document_epoch == epoch && tag.revision == summary.revision
+        )
+    });
     engine
-        .send(EngineCommand::ConfigureLeakLight {
-            enabled: true,
-            half_distance: 4.0,
-        })
+        .send(EngineCommand::ConfigureLeakLight { enabled: true })
         .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(3);
-    let mut saw_updating = false;
-    let mut saw_lit_mesh = false;
+    let mut saw_computing = false;
+    let mut saw_preparing = false;
+    let mut saw_field = false;
     loop {
         if let Some(event) = engine.try_event() {
             match event {
                 EngineEvent::LeakLightStatus {
                     epoch: event_epoch,
-                    status: LeakLightStatus::Updating,
+                    status: LeakLightStatus::Computing,
                     ..
-                } if event_epoch == epoch => saw_updating = true,
-                EngineEvent::MeshChunk {
-                    tag,
-                    quads,
-                    leak_light: Some(light),
+                } if event_epoch == epoch => saw_computing = true,
+                EngineEvent::LeakLightStatus {
+                    epoch: event_epoch,
+                    status: LeakLightStatus::Preparing,
                     ..
-                } if tag.document_epoch == epoch => {
-                    assert_eq!(light.len(), quads.len());
-                    saw_lit_mesh = true;
+                } if event_epoch == epoch => saw_preparing = true,
+                EngineEvent::LeakDistanceField {
+                    epoch: event_epoch,
+                    revision,
+                    field,
+                    ..
+                } if event_epoch == epoch => {
+                    assert_eq!(revision, summary.revision);
+                    assert_eq!(field.steps().len(), occupancy.len());
+                    saw_field = true;
                 }
                 EngineEvent::LeakLightStatus {
                     epoch: event_epoch,
                     status: LeakLightStatus::Ready { .. },
                     ..
                 } if event_epoch == epoch => break,
+                EngineEvent::MeshReset {
+                    epoch: event_epoch, ..
+                }
+                | EngineEvent::MeshChunk {
+                    tag:
+                        voxel_ink::mesh::MeshJobTag {
+                            document_epoch: event_epoch,
+                            ..
+                        },
+                    ..
+                } if event_epoch == epoch => {
+                    panic!("leak-light activation must not rebuild geometry")
+                }
                 EngineEvent::Summary { summary, .. } => {
                     assert_eq!(summary.occupied_count, original_count);
                     assert_eq!(summary.revision, 1);
@@ -863,8 +887,69 @@ fn leak_light_is_non_mutating_and_publishes_lit_meshes_before_ready() {
         );
         thread::sleep(Duration::from_millis(1));
     }
-    assert!(saw_updating);
-    assert!(saw_lit_mesh);
+    assert!(saw_computing);
+    assert!(saw_preparing);
+    assert!(saw_field);
+
+    engine
+        .send(EngineCommand::ConfigureLeakLight { enabled: false })
+        .unwrap();
+    let _off = wait_for_event(&engine, |event| {
+        matches!(
+            event,
+            EngineEvent::LeakLightStatus {
+                epoch: event_epoch,
+                status: LeakLightStatus::Off,
+                ..
+            } if *event_epoch == epoch
+        )
+    });
+    engine
+        .send(EngineCommand::ConfigureLeakLight { enabled: true })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(event) = engine.try_event() {
+            match event {
+                EngineEvent::LeakLightStatus {
+                    epoch: event_epoch,
+                    status: LeakLightStatus::Ready { .. },
+                    ..
+                } if event_epoch == epoch => break,
+                EngineEvent::LeakLightStatus {
+                    epoch: event_epoch,
+                    status: LeakLightStatus::Computing,
+                    ..
+                } if event_epoch == epoch => {
+                    panic!("re-enabling an unchanged revision recomputed topology")
+                }
+                EngineEvent::LeakDistanceField {
+                    epoch: event_epoch, ..
+                } if event_epoch == epoch => {
+                    panic!("re-enabling an unchanged revision re-streamed distances")
+                }
+                EngineEvent::MeshReset {
+                    epoch: event_epoch, ..
+                }
+                | EngineEvent::MeshChunk {
+                    tag:
+                        voxel_ink::mesh::MeshJobTag {
+                            document_epoch: event_epoch,
+                            ..
+                        },
+                    ..
+                } if event_epoch == epoch => {
+                    panic!("re-enabling an unchanged revision rebuilt geometry")
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for cached leak light"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 fn one_voxel_brush() -> BrushSpec {

@@ -5,7 +5,10 @@ compile_error!("VoxelInk is intentionally supported only on Linux");
 
 use std::{path::PathBuf, sync::Arc};
 
-use voxel_ink::{VoxelInkApp, renderer::MSAA_SAMPLES};
+use voxel_ink::{
+    VoxelInkApp,
+    renderer::{MSAA_SAMPLES, leak_compute_supported},
+};
 
 const LOGO_BYTES: &[u8] = include_bytes!("../assets/voxel-ink.png");
 
@@ -26,6 +29,25 @@ fn main() -> eframe::Result {
     setup.instance_descriptor.backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
     setup.power_preference = wgpu::PowerPreference::HighPerformance;
     setup.native_adapter_selector = Some(Arc::new(select_linux_adapter));
+    setup.device_descriptor = Arc::new(|adapter| {
+        let base_limits = if adapter.get_info().backend == wgpu::Backend::Gl {
+            if leak_compute_supported(adapter) {
+                wgpu::Limits::downlevel_defaults()
+            } else {
+                wgpu::Limits::downlevel_webgl2_defaults()
+            }
+        } else {
+            wgpu::Limits::default()
+        };
+        wgpu::DeviceDescriptor {
+            label: Some("VoxelInk wgpu device"),
+            required_limits: wgpu::Limits {
+                max_texture_dimension_2d: 8192,
+                ..base_limits
+            },
+            ..Default::default()
+        }
+    });
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("VoxelInk")

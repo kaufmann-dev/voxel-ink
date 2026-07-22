@@ -1,15 +1,16 @@
-use std::{hint::black_box, io::Cursor};
+use std::{hint::black_box, io::Cursor, path::PathBuf, time::SystemTime};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use voxel_ink::{
+    VolumeDocument,
     brush::{BrushDepth, BrushShape, BrushSize, BrushSpec, brush_indices},
     cancel::CancellationToken,
     codecs::{
         BinvoxMetadata, CodecSaveState, DecodeOptions, EncodeOptions, SourceVariant, VolumeCodec,
         binvox::BINVOX_CODEC,
     },
-    mesh::{ChunkCoord, ChunkInput, MeshJobTag, mesh_chunk},
-    volume::{SpatialUnits, VolumeGeometry, VolumeView},
+    mesh::{ChunkCoord, ChunkInput, MeshJobTag, mesh_chunk, pack_leak_distances},
+    volume::{SourceIdentity, SpatialUnits, VolumeGeometry, VolumeView},
 };
 
 const VOLUME_DIMENSIONS: [u32; 3] = [96, 96, 96];
@@ -58,6 +59,28 @@ fn identity_geometry(dimensions: [u32; 3]) -> VolumeGeometry {
     .unwrap()
 }
 
+fn leak_distance_document(occupancy: Vec<u8>) -> VolumeDocument {
+    VolumeDocument::new(
+        identity_geometry(VOLUME_DIMENSIONS),
+        occupancy,
+        SourceIdentity {
+            canonical_path: PathBuf::from("/tmp/voxel-ink-leak-distance-benchmark.binvox"),
+            size: 0,
+            modified: SystemTime::UNIX_EPOCH,
+            sha256: [0; 32],
+        },
+        SourceVariant::Binvox { version: 1 },
+        CodecSaveState::Binvox(BinvoxMetadata {
+            version: 1,
+            dimensions: VOLUME_DIMENSIONS,
+            translation: [0.0; 3],
+            scale: 1.0,
+        }),
+        false,
+    )
+    .unwrap()
+}
+
 fn hot_paths(c: &mut Criterion) {
     let cancel = CancellationToken::default();
     let empty = occupancy("empty");
@@ -94,6 +117,44 @@ fn hot_paths(c: &mut Criterion) {
         });
     }
     mesh_group.finish();
+
+    let leak_quads = mesh_chunk(&noisy_chunk, tag(), &cancel).unwrap().mesh.quads;
+    let leak_halo_dimensions = noisy_chunk.halo_dimensions();
+    let leak_halo = vec![1_024_u16; 34_usize.pow(3)];
+    let mut leak_pack_group = c.benchmark_group("leak_distance_quad_pack");
+    leak_pack_group.throughput(Throughput::Elements(leak_quads.len() as u64));
+    leak_pack_group.bench_function("noisy", |b| {
+        b.iter(|| {
+            pack_leak_distances(
+                black_box(&leak_quads),
+                CHUNK.origin().unwrap(),
+                leak_halo_dimensions,
+                black_box(&leak_halo),
+            )
+            .unwrap()
+        });
+    });
+    leak_pack_group.finish();
+
+    let leak_documents = [
+        ("empty", leak_distance_document(empty)),
+        ("dense", leak_distance_document(dense)),
+        ("noisy", leak_distance_document(noisy)),
+    ];
+    let mut leak_group = c.benchmark_group("leak_distance_field");
+    leak_group.throughput(Throughput::Elements(
+        VOLUME_DIMENSIONS.into_iter().map(u64::from).product(),
+    ));
+    for (name, document) in &leak_documents {
+        leak_group.bench_with_input(
+            BenchmarkId::from_parameter(name),
+            document,
+            |b, document| {
+                b.iter(|| black_box(document.leak_distance_field(&cancel).unwrap()));
+            },
+        );
+    }
+    leak_group.finish();
 
     let geometry = identity_geometry([129, 129, 129]);
     let mut brush_group = c.benchmark_group("maximum_volume_brush");

@@ -78,7 +78,7 @@ The 3D pane offers two navigation styles:
 
 Orbit and Fly remember separate viewpoints. Reset affects only the active camera, and opening or closing a document returns navigation to Orbit. The **3D view** card in the repair panel provides the session-only W/S movement selector, a flight-speed slider, and shared voxel-outline and leak-light controls that affect both navigation modes.
 
-**Leak light** is a diagnostic approximation of outside light travelling through face-connected empty voxels. It remains faintly visible through long or winding tunnels, while sealed cavities stay dark; the Light reach slider controls the physical distance over which its brighter gradient halves. Natural anatomical openings and accidental gaps propagate light identically, so VoxelInk leaves the decision about what to seal to you. Leak light changes only the view and is never saved into the volume.
+**Leak light** is a diagnostic approximation of outside light travelling through face-connected empty voxels. It remains faintly visible through long or winding tunnels, while sealed cavities stay dark; the Light reach slider controls the physical distance over which its brighter gradient halves. Once paths for the current volume revision are prepared, changing the reach updates the view immediately; those paths remain cached until an edit changes the volume. Natural anatomical openings and accidental gaps propagate light identically, so VoxelInk leaves the decision about what to seal to you. Leak light changes only the view and is never saved into the volume.
 
 ## Build and test
 
@@ -91,7 +91,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
 ```
 
-Run the repeatable CPU hot-path benchmarks after changing meshing, brushes, or codecs:
+Run the repeatable CPU hot-path benchmarks after changing meshing, leak-light preparation, brushes, or codecs:
 
 ```sh
 cargo bench --locked --bench hot_paths -- --noplot

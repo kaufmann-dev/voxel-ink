@@ -95,7 +95,6 @@ pub struct ChunkInput {
     extent: [u32; 3],
     halo_dimensions: [u32; 3],
     occupancy: Vec<u8>,
-    leak_light: Option<Vec<u8>>,
     has_occupied_core: bool,
 }
 
@@ -193,79 +192,8 @@ impl ChunkInput {
             extent,
             halo_dimensions,
             occupancy: copied,
-            leak_light: None,
             has_occupied_core,
         })
-    }
-
-    /// Copies one chunk, its one-voxel occupancy halo, and an optional light halo.
-    /// Outside-volume light samples are initialized to full exterior brightness.
-    pub fn copy_from_volume_with_leak_light(
-        dimensions: [u32; 3],
-        occupancy: &[u8],
-        leak_light: Option<&[u8]>,
-        coord: ChunkCoord,
-        cancellation: &CancellationToken,
-    ) -> Result<Self> {
-        let mut input = Self::copy_from_volume(dimensions, occupancy, coord, cancellation)?;
-        let Some(source_light) = leak_light else {
-            return Ok(input);
-        };
-        if source_light.len() != occupancy.len() {
-            return Err(AppError::InvalidDimensions(format!(
-                "expected {} leak-light bytes, got {}",
-                occupancy.len(),
-                source_light.len()
-            )));
-        }
-
-        let halo_len = input.occupancy.len();
-        let mut copied_light = Vec::new();
-        copied_light
-            .try_reserve_exact(halo_len)
-            .map_err(|_| AppError::Allocation { bytes: halo_len })?;
-        copied_light.resize(halo_len, u8::MAX);
-
-        let volume_width = dimensions[0] as usize;
-        let volume_height = dimensions[1] as usize;
-        let source_x_start = input.origin[0].saturating_sub(HALO_WIDTH) as usize;
-        let source_x_end =
-            (input.origin[0] as usize + input.extent[0] as usize + HALO_WIDTH as usize)
-                .min(volume_width);
-        let copied_row_width = source_x_end - source_x_start;
-        let destination_x = usize::from(input.origin[0] == 0);
-        let halo_width = input.halo_dimensions[0] as usize;
-        let halo_plane = halo_width * input.halo_dimensions[1] as usize;
-
-        for local_z in 0..input.halo_dimensions[2] {
-            cancellation.check()?;
-            let global_z = i64::from(input.origin[2]) + i64::from(local_z) - i64::from(HALO_WIDTH);
-            if !(0..i64::from(dimensions[2])).contains(&global_z) {
-                continue;
-            }
-            let global_z = usize::try_from(global_z).map_err(|_| {
-                AppError::InvalidDimensions("negative z coordinate escaped halo clipping".into())
-            })?;
-            for local_y in 0..input.halo_dimensions[1] {
-                let global_y =
-                    i64::from(input.origin[1]) + i64::from(local_y) - i64::from(HALO_WIDTH);
-                if !(0..i64::from(dimensions[1])).contains(&global_y) {
-                    continue;
-                }
-                let global_y = usize::try_from(global_y).map_err(|_| {
-                    AppError::InvalidDimensions(
-                        "negative y coordinate escaped halo clipping".into(),
-                    )
-                })?;
-                let source = source_x_start + volume_width * (global_y + volume_height * global_z);
-                let destination =
-                    destination_x + halo_width * local_y as usize + halo_plane * local_z as usize;
-                copied_light[destination..destination + copied_row_width]
-                    .copy_from_slice(&source_light[source..source + copied_row_width]);
-            }
-        }
-        input.leak_light = Some(copied_light);
-        Ok(input)
     }
 
     #[must_use]
@@ -291,11 +219,6 @@ impl ChunkInput {
     #[must_use]
     pub const fn copied_bytes(&self) -> usize {
         self.occupancy.len()
-            + if let Some(light) = &self.leak_light {
-                light.len()
-            } else {
-                0
-            }
     }
 
     #[cfg(test)]
@@ -368,28 +291,64 @@ pub struct CompactQuad {
     pub packed: u32,
 }
 
-#[repr(transparent)]
+/// Four leak-distance samples packed for a `Snorm16x4` vertex attribute.
+///
+/// Connected distances occupy the non-negative signed-normalized range. The
+/// `u16::MAX` input sentinel is encoded as `i16::MIN`, which the GPU exposes as
+/// `-1.0` and therefore keeps distinct from every connected distance.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Pod, Zeroable)]
-pub struct PackedLeakLight(u32);
+pub struct PackedLeakDistance {
+    words: [u32; 2],
+}
 
-impl PackedLeakLight {
-    #[must_use]
-    pub const fn new(corners: [u8; 4]) -> Self {
-        Self(
-            corners[0] as u32
-                | ((corners[1] as u32) << 8)
-                | ((corners[2] as u32) << 16)
-                | ((corners[3] as u32) << 24),
-        )
+impl PackedLeakDistance {
+    /// Packs four bounded distance steps into two little-lane-order words.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a value is neither a connected distance in
+    /// `0..=i16::MAX` nor the `u16::MAX` disconnected sentinel.
+    pub fn new(corners: [u16; 4]) -> Result<Self> {
+        let encoded = [
+            encode_leak_distance(corners[0])?,
+            encode_leak_distance(corners[1])?,
+            encode_leak_distance(corners[2])?,
+            encode_leak_distance(corners[3])?,
+        ];
+        Ok(Self {
+            words: [
+                u32::from(encoded[0]) | (u32::from(encoded[1]) << 16),
+                u32::from(encoded[2]) | (u32::from(encoded[3]) << 16),
+            ],
+        })
     }
 
     #[must_use]
-    pub const fn corner(self, corner: usize) -> Option<u8> {
+    pub const fn words(self) -> [u32; 2] {
+        self.words
+    }
+
+    #[must_use]
+    pub const fn corner_bits(self, corner: usize) -> Option<u16> {
         if corner >= 4 {
             return None;
         }
-        Some(((self.0 >> (corner as u32 * 8)) & 0xff) as u8)
+        let word = self.words[corner / 2];
+        Some(((word >> ((corner % 2) * 16)) & 0xffff) as u16)
     }
+}
+
+fn encode_leak_distance(distance: u16) -> Result<u16> {
+    if distance == u16::MAX {
+        return Ok(i16::MIN as u16);
+    }
+    if distance <= i16::MAX as u16 {
+        return Ok(distance);
+    }
+    Err(AppError::InvalidDimensions(format!(
+        "leak distance {distance} exceeds the signed 16-bit connected range"
+    )))
 }
 
 impl CompactQuad {
@@ -495,6 +454,106 @@ impl CompactQuad {
     }
 }
 
+/// Packs the outside-voxel distance at every corner of each greedy quad.
+///
+/// `halo_steps` is an x-major, one-voxel-padded chunk halo. Quad origins are
+/// global grid boundaries, while `chunk_origin` is the global first voxel of
+/// the unpadded chunk core.
+///
+/// # Errors
+///
+/// Returns an error for an invalid halo length, a quad outside the supplied
+/// chunk halo, an unsupported distance encoding, arithmetic overflow, or a
+/// failed bounded allocation.
+pub fn pack_leak_distances(
+    quads: &[CompactQuad],
+    chunk_origin: [u32; 3],
+    halo_dimensions: [u32; 3],
+    halo_steps: &[u16],
+) -> Result<Vec<PackedLeakDistance>> {
+    let halo_dimensions = halo_dimensions.map(|dimension| dimension as usize);
+    let halo_plane = halo_dimensions[0]
+        .checked_mul(halo_dimensions[1])
+        .ok_or(AppError::Allocation { bytes: usize::MAX })?;
+    let halo_len = halo_plane
+        .checked_mul(halo_dimensions[2])
+        .ok_or(AppError::Allocation { bytes: usize::MAX })?;
+    if halo_steps.len() != halo_len {
+        return Err(AppError::InvalidDimensions(format!(
+            "expected {halo_len} leak-distance halo steps, got {}",
+            halo_steps.len()
+        )));
+    }
+    let output_bytes = quads
+        .len()
+        .checked_mul(size_of::<PackedLeakDistance>())
+        .ok_or(AppError::Allocation { bytes: usize::MAX })?;
+    let mut packed = Vec::new();
+    packed
+        .try_reserve_exact(quads.len())
+        .map_err(|_| AppError::Allocation {
+            bytes: output_bytes,
+        })?;
+    let strides = [1, halo_dimensions[0], halo_plane];
+
+    for &quad in quads {
+        let local_origin = [
+            quad.origin[0].checked_sub(chunk_origin[0]),
+            quad.origin[1].checked_sub(chunk_origin[1]),
+            quad.origin[2].checked_sub(chunk_origin[2]),
+        ];
+        let local_origin = [
+            local_origin[0].ok_or_else(|| quad_outside_halo_error(quad, chunk_origin))? as usize,
+            local_origin[1].ok_or_else(|| quad_outside_halo_error(quad, chunk_origin))? as usize,
+            local_origin[2].ok_or_else(|| quad_outside_halo_error(quad, chunk_origin))? as usize,
+        ];
+        let normal_axis = quad.normal_axis().index();
+        let [u_axis, v_axis] = quad.normal_axis().tangent_axes();
+        let normal = local_origin[normal_axis]
+            .checked_add(usize::from(quad.positive()))
+            .ok_or(AppError::Allocation { bytes: usize::MAX })?;
+        let u_min = local_origin[u_axis]
+            .checked_add(HALO_WIDTH as usize)
+            .ok_or(AppError::Allocation { bytes: usize::MAX })?;
+        let v_min = local_origin[v_axis]
+            .checked_add(HALO_WIDTH as usize)
+            .ok_or(AppError::Allocation { bytes: usize::MAX })?;
+        let u_max = u_min
+            .checked_add(quad.u_length() as usize - 1)
+            .ok_or(AppError::Allocation { bytes: usize::MAX })?;
+        let v_max = v_min
+            .checked_add(quad.v_length() as usize - 1)
+            .ok_or(AppError::Allocation { bytes: usize::MAX })?;
+        if normal >= halo_dimensions[normal_axis]
+            || u_max >= halo_dimensions[u_axis]
+            || v_max >= halo_dimensions[v_axis]
+        {
+            return Err(quad_outside_halo_error(quad, chunk_origin));
+        }
+
+        let corners = [
+            [u_min, v_min],
+            [u_max, v_min],
+            [u_max, v_max],
+            [u_min, v_max],
+        ];
+        let distances = corners.map(|[u, v]| {
+            normal * strides[normal_axis] + u * strides[u_axis] + v * strides[v_axis]
+        });
+        packed.push(PackedLeakDistance::new(
+            distances.map(|index| halo_steps[index]),
+        )?);
+    }
+    Ok(packed)
+}
+
+fn quad_outside_halo_error(quad: CompactQuad, chunk_origin: [u32; 3]) -> AppError {
+    AppError::InvalidDimensions(format!(
+        "quad at {:?} lies outside the leak-distance halo for chunk origin {chunk_origin:?}",
+        quad.origin
+    ))
+}
+
 const fn face_vertex_corner(
     positive: bool,
     flipped_diagonal: bool,
@@ -555,7 +614,6 @@ pub const fn mesh_result_is_stale(
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ChunkMesh {
     pub quads: Vec<CompactQuad>,
-    pub leak_light: Option<Vec<PackedLeakLight>>,
     pub exposed_voxel_faces: u32,
 }
 
@@ -563,10 +621,6 @@ impl ChunkMesh {
     #[must_use]
     pub const fn gpu_bytes(&self) -> usize {
         self.quads.len() * size_of::<CompactQuad>()
-            + match &self.leak_light {
-                Some(light) => light.len() * size_of::<PackedLeakLight>(),
-                None => 0,
-            }
     }
 }
 
@@ -610,42 +664,24 @@ pub fn mesh_chunk(
         })?;
     let mut exposed_voxel_faces = 0_u32;
     let mut mask = [0_i8; MAX_FACE_CELLS];
-    let mut leak_light = Vec::new();
 
-    if input.leak_light.is_some() {
-        for normal_axis in FaceAxis::ALL {
-            mesh_axis::<true>(
-                input,
-                normal_axis,
-                &mut mask,
-                &mut quads,
-                &mut leak_light,
-                &mut exposed_voxel_faces,
-                cancellation,
-            )?;
-        }
-    } else {
-        for normal_axis in FaceAxis::ALL {
-            mesh_axis::<false>(
-                input,
-                normal_axis,
-                &mut mask,
-                &mut quads,
-                &mut leak_light,
-                &mut exposed_voxel_faces,
-                cancellation,
-            )?;
-        }
+    for normal_axis in FaceAxis::ALL {
+        mesh_axis(
+            input,
+            normal_axis,
+            &mut mask,
+            &mut quads,
+            &mut exposed_voxel_faces,
+            cancellation,
+        )?;
     }
 
     cancellation.check()?;
     quads.shrink_to_fit();
-    leak_light.shrink_to_fit();
     Ok(TaggedChunkMesh {
         tag,
         mesh: ChunkMesh {
             quads,
-            leak_light: input.leak_light.is_some().then_some(leak_light),
             exposed_voxel_faces,
         },
     })
@@ -664,12 +700,11 @@ struct PlaneLayout {
     halo_strides: [usize; 3],
 }
 
-fn mesh_axis<const LEAK_LIGHT: bool>(
+fn mesh_axis(
     input: &ChunkInput,
     normal_axis: FaceAxis,
     mask: &mut [i8; MAX_FACE_CELLS],
     quads: &mut Vec<CompactQuad>,
-    leak_light: &mut Vec<PackedLeakLight>,
     exposed_voxel_faces: &mut u32,
     cancellation: &CancellationToken,
 ) -> Result<()> {
@@ -700,14 +735,7 @@ fn mesh_axis<const LEAK_LIGHT: bool>(
         };
         let active_mask = &mut mask[..u_extent * v_extent];
         fill_face_mask(input, layout, active_mask);
-        emit_greedy_quads::<LEAK_LIGHT>(
-            input,
-            layout,
-            active_mask,
-            quads,
-            leak_light,
-            exposed_voxel_faces,
-        )?;
+        emit_greedy_quads(input, layout, active_mask, quads, exposed_voxel_faces)?;
     }
     Ok(())
 }
@@ -735,12 +763,11 @@ fn fill_face_mask(input: &ChunkInput, layout: PlaneLayout, mask: &mut [i8]) {
     }
 }
 
-fn emit_greedy_quads<const LEAK_LIGHT: bool>(
+fn emit_greedy_quads(
     input: &ChunkInput,
     layout: PlaneLayout,
     mask: &mut [i8],
     quads: &mut Vec<CompactQuad>,
-    leak_light: &mut Vec<PackedLeakLight>,
     exposed_voxel_faces: &mut u32,
 ) -> Result<()> {
     let mut v = 0;
@@ -796,53 +823,11 @@ fn emit_greedy_quads<const LEAK_LIGHT: bool>(
                         )
                     })?;
             try_push_quad(quads, quad)?;
-            if LEAK_LIGHT {
-                leak_light
-                    .try_reserve(1)
-                    .map_err(|_| AppError::Allocation {
-                        bytes: (leak_light.len() + 1) * size_of::<PackedLeakLight>(),
-                    })?;
-                leak_light.push(PackedLeakLight::new(quad_corner_leak_light(
-                    input,
-                    layout,
-                    u,
-                    v,
-                    width,
-                    height,
-                    face > 0,
-                )));
-            }
             u += width;
         }
         v += 1;
     }
     Ok(())
-}
-
-fn quad_corner_leak_light(
-    input: &ChunkInput,
-    layout: PlaneLayout,
-    u: usize,
-    v: usize,
-    width: usize,
-    height: usize,
-    positive: bool,
-) -> [u8; 4] {
-    let Some(light) = &input.leak_light else {
-        return [0; 4];
-    };
-    let normal_offset =
-        (layout.plane + usize::from(positive)) * layout.halo_strides[layout.normal_axis_index];
-    let u_stride = layout.halo_strides[layout.u_axis];
-    let v_stride = layout.halo_strides[layout.v_axis];
-    std::array::from_fn(|corner| {
-        let [maximum_u, maximum_v] =
-            [[false, false], [true, false], [true, true], [false, true]][corner];
-        let outside = normal_offset
-            + (u + 1 + usize::from(maximum_u) * (width - 1)) * u_stride
-            + (v + 1 + usize::from(maximum_v) * (height - 1)) * v_stride;
-        light[outside]
-    })
 }
 
 fn quad_corner_occlusion(
@@ -1512,41 +1497,55 @@ mod tests {
     }
 
     #[test]
-    fn optional_leak_light_is_packed_per_greedy_quad_without_expanding_compact_quads() {
-        let dimensions = [3, 3, 3];
-        let mut occupancy = vec![1; 27];
-        let mut light = vec![0; 27];
-        let center = 1 + 3 * (1 + 3);
-        occupancy[center] = 0;
-        light[center] = 7;
-        let input = ChunkInput::copy_from_volume_with_leak_light(
-            dimensions,
-            &occupancy,
-            Some(&light),
-            ChunkCoord::new(0, 0, 0),
-            &CancellationToken::default(),
-        )
-        .unwrap();
-        let mesh = mesh_chunk(
-            &input,
-            tag(ChunkCoord::new(0, 0, 0)),
-            &CancellationToken::default(),
-        )
-        .unwrap()
-        .mesh;
-        let packed = mesh.leak_light.unwrap();
+    fn packed_leak_distance_matches_snorm16x4_lane_encoding() {
+        let packed = PackedLeakDistance::new([0, 7, i16::MAX as u16, u16::MAX]).unwrap();
 
-        assert_eq!(size_of::<CompactQuad>(), 16);
-        assert_eq!(packed.len(), mesh.quads.len());
-        assert!(
-            packed
-                .iter()
-                .any(|light| { (0..4).all(|corner| light.corner(corner) == Some(7)) })
+        assert_eq!(size_of::<PackedLeakDistance>(), 8);
+        assert_eq!(packed.words(), [0x0007_0000, 0x8000_7fff]);
+        assert_eq!(
+            std::array::from_fn(|corner| packed.corner_bits(corner).unwrap()),
+            [0, 7, i16::MAX as u16, i16::MIN as u16]
         );
+        assert_eq!(packed.corner_bits(4), None);
         assert!(
-            packed
-                .iter()
-                .any(|light| { (0..4).all(|corner| light.corner(corner) == Some(u8::MAX)) })
+            PackedLeakDistance::new([i16::MAX as u16 + 1, 0, 0, 0]).is_err(),
+            "values between the connected range and sentinel are not representable"
+        );
+    }
+
+    #[test]
+    fn leak_distances_are_packed_from_each_quad_outside_corner() {
+        let chunk_origin = [10, 20, 30];
+        let halo_dimensions = [5, 5, 5];
+        let mut halo_steps = vec![u16::MAX; 125];
+        let halo_index = |[x, y, z]: [usize; 3]| x + 5 * (y + 5 * z);
+        for (coordinate, distance) in [
+            ([2, 2, 2], 0),
+            ([3, 2, 2], 7),
+            ([3, 3, 2], i16::MAX as u16),
+            ([2, 3, 2], u16::MAX),
+        ] {
+            halo_steps[halo_index(coordinate)] = distance;
+        }
+        let quads = [
+            CompactQuad::new([11, 21, 31], 2, 2, FaceAxis::Z, true, [0; 4]).unwrap(),
+            CompactQuad::new([10, 20, 30], 1, 1, FaceAxis::Z, false, [0; 4]).unwrap(),
+        ];
+
+        let packed =
+            pack_leak_distances(&quads, chunk_origin, halo_dimensions, &halo_steps).unwrap();
+
+        assert_eq!(packed.len(), quads.len());
+        assert_eq!(packed[0].words(), [0x0007_0000, 0x8000_7fff]);
+        assert_eq!(packed[1].words(), [0x8000_8000; 2]);
+        assert!(
+            pack_leak_distances(
+                &quads,
+                chunk_origin,
+                halo_dimensions,
+                &halo_steps[..halo_steps.len() - 1],
+            )
+            .is_err()
         );
     }
 

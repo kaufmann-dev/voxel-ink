@@ -1,5 +1,6 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
+    mem::size_of,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -13,8 +14,11 @@ use wgpu::util::DeviceExt;
 
 use crate::{
     brush::Ray,
-    mesh::{ChunkCoord, CompactQuad, MeshJobTag, MeshUpdatePriority, PackedLeakLight},
-    volume::Matrix4,
+    mesh::{
+        CHUNK_SIZE, ChunkCoord, CompactQuad, MeshJobTag, MeshUpdatePriority, PackedLeakDistance,
+        pack_leak_distances,
+    },
+    volume::{LeakDistanceField, Matrix4},
 };
 
 const SHADER: &str = r#"
@@ -26,8 +30,11 @@ struct Uniforms {
     material_color: vec4<f32>,
     near_surface_depth: f32,
     inverse_scene_depth_span: f32,
+    leak_half_distance: f32,
+    leak_distance_scale: f32,
     voxel_seams: u32,
     leak_light: u32,
+    _padding: vec2<u32>,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -39,14 +46,14 @@ struct VertexOutput {
     @location(2) corner_occlusion: f32,
     @location(3) index_position: vec3<f32>,
     @location(4) @interpolate(flat) face_axis: u32,
-    @location(5) leak_intensity: f32,
+    @location(5) leak_distance: f32,
 };
 
 fn expand_vertex(
     vertex_index: u32,
     origin: vec3<u32>,
     packed: u32,
-    packed_leak_light: u32,
+    corner_leak_distances: vec4<f32>,
 ) -> VertexOutput {
     let u_length = f32((packed & 31u) + 1u);
     let v_length = f32(((packed >> 5u) & 31u) + 1u);
@@ -108,7 +115,7 @@ fn expand_vertex(
     output.corner_occlusion = f32((packed >> (13u + corner * 2u)) & 3u);
     output.index_position = index_position;
     output.face_axis = axis;
-    output.leak_intensity = f32((packed_leak_light >> (corner * 8u)) & 255u) / 255.0;
+    output.leak_distance = corner_leak_distances[corner];
     return output;
 }
 
@@ -118,9 +125,7 @@ fn vertex_main(
     @location(0) origin: vec3<u32>,
     @location(1) packed: u32,
 ) -> VertexOutput {
-    // A chunk without diagnostic data remains visibly lit during a progressive
-    // upload instead of being mistaken for a sealed surface.
-    return expand_vertex(vertex_index, origin, packed, 0xffffffffu);
+    return expand_vertex(vertex_index, origin, packed, vec4<f32>(-1.0));
 }
 
 @vertex
@@ -128,9 +133,9 @@ fn leak_vertex_main(
     @builtin(vertex_index) vertex_index: u32,
     @location(0) origin: vec3<u32>,
     @location(1) packed: u32,
-    @location(2) packed_leak_light: u32,
+    @location(2) corner_leak_distances: vec4<f32>,
 ) -> VertexOutput {
-    return expand_vertex(vertex_index, origin, packed, packed_leak_light);
+    return expand_vertex(vertex_index, origin, packed, corner_leak_distances);
 }
 
 fn voxel_seam(coordinate: f32) -> f32 {
@@ -176,10 +181,13 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let voxel_ao_factor = mix(1.0, 0.76, clamp(input.corner_occlusion / 3.0, 0.0, 1.0));
     var lighting = base_lighting * depth_factor * surface_factor * voxel_ao_factor;
     if (uniforms.leak_light != 0u) {
+        let connected = input.leak_distance >= 0.0;
+        let physical_distance = max(input.leak_distance, 0.0) * uniforms.leak_distance_scale;
+        let leak_intensity = exp2(-physical_distance / max(uniforms.leak_half_distance, 1.0e-12));
         let connected_light = select(
             0.015,
-            0.10 + 0.90 * input.leak_intensity,
-            input.leak_intensity > 0.0,
+            0.10 + 0.90 * leak_intensity,
+            connected,
         );
         lighting = connected_light * (0.35 + 0.65 * base_lighting) * surface_factor
             * voxel_ao_factor;
@@ -204,6 +212,81 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+const LEAK_DISTANCE_COMPUTE_SHADER: &str = r#"
+struct CompactQuad {
+    origin: vec3<u32>,
+    packed: u32,
+};
+
+struct LeakComputeParams {
+    chunk_origin_and_count: vec4<u32>,
+    halo_dimensions: vec4<u32>,
+};
+
+@group(0) @binding(0) var<uniform> params: LeakComputeParams;
+@group(0) @binding(1) var<storage, read> quads: array<CompactQuad>;
+@group(0) @binding(2) var<storage, read> halo_words: array<u32>;
+@group(0) @binding(3) var<storage, read_write> output_words: array<vec2<u32>>;
+
+fn halo_step(index: u32) -> u32 {
+    let word = halo_words[index / 2u];
+    return (word >> ((index & 1u) * 16u)) & 0xffffu;
+}
+
+fn snorm_bits(step: u32) -> u32 {
+    return select(min(step, 0x7fffu), 0x8000u, step == 0xffffu);
+}
+
+fn sample_corner(
+    quad: CompactQuad,
+    axis: u32,
+    u_axis: u32,
+    v_axis: u32,
+    corner: u32,
+) -> u32 {
+    let local_origin = quad.origin - params.chunk_origin_and_count.xyz;
+    let positive = ((quad.packed >> 12u) & 1u) != 0u;
+    let u_length = (quad.packed & 31u) + 1u;
+    let v_length = ((quad.packed >> 5u) & 31u) + 1u;
+    let maximum_u = corner == 1u || corner == 2u;
+    let maximum_v = corner == 2u || corner == 3u;
+    var halo = local_origin + vec3<u32>(1u);
+    halo[axis] = local_origin[axis] + select(0u, 1u, positive);
+    halo[u_axis] += select(0u, u_length - 1u, maximum_u);
+    halo[v_axis] += select(0u, v_length - 1u, maximum_v);
+    let dimensions = params.halo_dimensions.xyz;
+    let index = halo.x + dimensions.x * (halo.y + dimensions.y * halo.z);
+    return snorm_bits(halo_step(index));
+}
+
+@compute @workgroup_size(64)
+fn prepare_leak_distance(@builtin(global_invocation_id) invocation: vec3<u32>) {
+    let index = invocation.x;
+    if (index >= params.chunk_origin_and_count.w) {
+        return;
+    }
+    let quad = quads[index];
+    let axis = (quad.packed >> 10u) & 3u;
+    var u_axis = 0u;
+    var v_axis = 1u;
+    if (axis == 0u) {
+        u_axis = 1u;
+        v_axis = 2u;
+    } else if (axis == 1u) {
+        u_axis = 2u;
+        v_axis = 0u;
+    }
+    let corner_0 = sample_corner(quad, axis, u_axis, v_axis, 0u);
+    let corner_1 = sample_corner(quad, axis, u_axis, v_axis, 1u);
+    let corner_2 = sample_corner(quad, axis, u_axis, v_axis, 2u);
+    let corner_3 = sample_corner(quad, axis, u_axis, v_axis, 3u);
+    output_words[index] = vec2<u32>(
+        corner_0 | (corner_1 << 16u),
+        corner_2 | (corner_3 << 16u),
+    );
+}
+"#;
+
 const VOXEL_HIGHLIGHT_SHADER: &str = r#"
 struct Uniforms {
     view_projection: mat4x4<f32>,
@@ -213,8 +296,11 @@ struct Uniforms {
     material_color: vec4<f32>,
     near_surface_depth: f32,
     inverse_scene_depth_span: f32,
+    leak_half_distance: f32,
+    leak_distance_scale: f32,
     voxel_seams: u32,
     leak_light: u32,
+    _padding: vec2<u32>,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -299,6 +385,15 @@ fn highlight_fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
 "#;
 
 const MAX_GPU_UPDATES_PER_FRAME: usize = 4;
+const MAX_LEAK_DISTANCE_CHUNKS_PER_FRAME: usize = 2;
+const LEAK_COMPUTE_WORKGROUP_SIZE: u32 = 64;
+const LEAK_COMPUTE_STORAGE_BINDINGS: u32 = 3;
+const LEAK_COMPUTE_BINDINGS: u32 = 4;
+const LEAK_COMPUTE_PARAMETER_BYTES: u64 = 32;
+const MAX_CHUNK_QUADS: u64 = 6 * CHUNK_SIZE as u64 * CHUNK_SIZE as u64 * CHUNK_SIZE as u64;
+const MAX_CHUNK_QUAD_BYTES: u64 = MAX_CHUNK_QUADS * size_of::<CompactQuad>() as u64;
+const MAX_CHUNK_LEAK_WORKGROUPS: u32 =
+    MAX_CHUNK_QUADS.div_ceil(LEAK_COMPUTE_WORKGROUP_SIZE as u64) as u32;
 pub const MSAA_SAMPLES: u32 = 4;
 const ORBIT_FIELD_OF_VIEW_RADIANS: f32 = 45_f32.to_radians();
 const FLY_FIELD_OF_VIEW_RADIANS: f32 = 70_f32.to_radians();
@@ -325,6 +420,35 @@ const MAX_CHUNK_BUFFER_REUSE_RATIO: u64 = 4;
 const MAX_RETAINED_HIGHLIGHT_BUFFER_BYTES: u64 = 4 * 1024 * 1024;
 const HIGHLIGHT_ALLOCATION_CHUNK: usize = 65_536;
 const HIGHLIGHT_CANCELLATION_INTERVAL: usize = 1_024;
+
+/// Returns whether an adapter can prepare reach-independent leak distances in compute.
+///
+/// No optional shader feature is required: the compute shader writes signed-normalized
+/// 16-bit vertex data with integer operations. Buffers are padded to 16 bytes so the
+/// downlevel unaligned-binding flag is deliberately not part of this check.
+#[must_use]
+pub fn leak_compute_supported(adapter: &wgpu::Adapter) -> bool {
+    leak_compute_supported_for(
+        adapter.get_downlevel_capabilities().flags,
+        &adapter.limits(),
+    )
+}
+
+fn leak_compute_supported_for(flags: wgpu::DownlevelFlags, limits: &wgpu::Limits) -> bool {
+    flags.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
+        && limits.max_bind_groups >= 1
+        && limits.max_bindings_per_bind_group >= LEAK_COMPUTE_BINDINGS
+        && limits.max_uniform_buffers_per_shader_stage >= 1
+        && limits.max_uniform_buffer_binding_size >= LEAK_COMPUTE_PARAMETER_BYTES
+        && limits.max_storage_buffers_per_shader_stage >= LEAK_COMPUTE_STORAGE_BINDINGS
+        && limits.max_storage_buffer_binding_size >= MAX_CHUNK_QUAD_BYTES
+        && limits.max_buffer_size >= MAX_CHUNK_QUAD_BYTES
+        && limits.max_compute_invocations_per_workgroup >= LEAK_COMPUTE_WORKGROUP_SIZE
+        && limits.max_compute_workgroup_size_x >= LEAK_COMPUTE_WORKGROUP_SIZE
+        && limits.max_compute_workgroup_size_y >= 1
+        && limits.max_compute_workgroup_size_z >= 1
+        && limits.max_compute_workgroups_per_dimension >= MAX_CHUNK_LEAK_WORKGROUPS
+}
 const CLIP_PLANE_RELATIVE_TOLERANCE: f64 = 128.0 * f32::EPSILON as f64;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -622,8 +746,11 @@ struct Uniforms {
     material_color: [f32; 4],
     near_surface_depth: f32,
     inverse_scene_depth_span: f32,
+    leak_half_distance: f32,
+    leak_distance_scale: f32,
     voxel_seams: u32,
     leak_light: u32,
+    _padding: [u32; 2],
 }
 
 impl Default for Uniforms {
@@ -636,8 +763,11 @@ impl Default for Uniforms {
             material_color: [0.80, 0.81, 0.82, 1.0],
             near_surface_depth: 0.0,
             inverse_scene_depth_span: 1.0,
+            leak_half_distance: 1.0,
+            leak_distance_scale: 1.0,
             voxel_seams: 0,
             leak_light: 0,
+            _padding: [0; 2],
         }
     }
 }
@@ -655,8 +785,13 @@ enum SceneUpdate {
     Chunk {
         tag: MeshJobTag,
         quads: Vec<CompactQuad>,
-        leak_light: Option<Vec<PackedLeakLight>>,
         priority: MeshUpdatePriority,
+    },
+    LeakDistanceField {
+        epoch: u64,
+        revision: u64,
+        generation: u64,
+        field: Arc<LeakDistanceField>,
     },
     Highlight {
         epoch: u64,
@@ -722,6 +857,7 @@ struct SceneState {
     fly_movement_basis: FlyMovementBasis,
     voxel_seams: bool,
     leak_light: bool,
+    leak_half_distance: f32,
     aspect: f32,
     updates: VecDeque<SceneUpdate>,
 }
@@ -744,6 +880,7 @@ impl Default for SceneState {
             fly_movement_basis: FlyMovementBasis::default(),
             voxel_seams: true,
             leak_light: false,
+            leak_half_distance: 1.0,
             aspect: 1.0,
             updates: VecDeque::new(),
         }
@@ -754,6 +891,7 @@ impl Default for SceneState {
 pub struct SceneBridge {
     state: Arc<Mutex<SceneState>>,
     needs_remesh: Arc<AtomicBool>,
+    leak_distance_ready: Arc<AtomicBool>,
     repaint: Arc<Mutex<Option<egui::Context>>>,
     highlight_generation: Arc<AtomicU64>,
     highlight_failure: Arc<Mutex<Option<VoxelHighlightFailure>>>,
@@ -785,6 +923,7 @@ impl SceneBridge {
         state.revision = revision;
         state.dimensions = dimensions;
         state.affine = affine;
+        self.leak_distance_ready.store(false, Ordering::Release);
         state.updates.clear();
         state.updates.push_back(SceneUpdate::Reset {
             epoch,
@@ -803,6 +942,7 @@ impl SceneBridge {
         }
         self.cancel_highlight_build_locked();
         state.revision = revision;
+        self.leak_distance_ready.store(false, Ordering::Release);
         remove_queued_highlight_updates(&mut state.updates);
         state
             .updates
@@ -815,7 +955,6 @@ impl SceneBridge {
         &self,
         tag: MeshJobTag,
         quads: Vec<CompactQuad>,
-        leak_light: Option<Vec<PackedLeakLight>>,
         priority: MeshUpdatePriority,
     ) {
         let mut state = self.state.lock().expect("3D scene state poisoned");
@@ -825,7 +964,6 @@ impl SceneBridge {
                 SceneUpdate::Chunk {
                     tag,
                     quads,
-                    leak_light,
                     priority,
                 },
                 priority,
@@ -967,6 +1105,70 @@ impl SceneBridge {
         state.leak_light = enabled;
         drop(state);
         self.request_repaint();
+    }
+
+    #[must_use]
+    pub fn leak_light_reach(&self) -> f64 {
+        f64::from(
+            self.state
+                .lock()
+                .expect("3D scene state poisoned")
+                .leak_half_distance,
+        )
+    }
+
+    pub fn set_leak_light_reach(&self, half_distance: f64) {
+        let half_distance = half_distance as f32;
+        if !half_distance.is_finite() || half_distance <= 0.0 {
+            return;
+        }
+        let mut state = self.state.lock().expect("3D scene state poisoned");
+        if state.leak_half_distance == half_distance {
+            return;
+        }
+        state.leak_half_distance = half_distance;
+        drop(state);
+        self.request_repaint();
+    }
+
+    pub fn set_leak_distance_field(
+        &self,
+        epoch: u64,
+        revision: u64,
+        generation: u64,
+        field: Arc<LeakDistanceField>,
+    ) {
+        let mut state = self.state.lock().expect("3D scene state poisoned");
+        if state.epoch != epoch || state.revision != revision {
+            return;
+        }
+        self.leak_distance_ready.store(false, Ordering::Release);
+        state.updates.retain(|update| {
+            !matches!(
+                update,
+                SceneUpdate::LeakDistanceField {
+                    epoch: queued_epoch,
+                    revision: queued_revision,
+                    generation: queued_generation,
+                    ..
+                } if *queued_epoch == epoch
+                    && *queued_revision == revision
+                    && *queued_generation <= generation
+            )
+        });
+        state.updates.push_back(SceneUpdate::LeakDistanceField {
+            epoch,
+            revision,
+            generation,
+            field,
+        });
+        drop(state);
+        self.request_repaint();
+    }
+
+    #[must_use]
+    pub fn leak_distance_ready(&self) -> bool {
+        self.leak_distance_ready.load(Ordering::Acquire)
     }
 
     pub fn orbit(&self, delta: egui::Vec2) {
@@ -1361,14 +1563,20 @@ fn reset_document_navigation(state: &mut SceneState) {
 pub struct VolumePaintCallback {
     scene: SceneBridge,
     target_format: wgpu::TextureFormat,
+    compute_supported: bool,
 }
 
 impl VolumePaintCallback {
     #[must_use]
-    pub const fn new(scene: SceneBridge, target_format: wgpu::TextureFormat) -> Self {
+    pub const fn new(
+        scene: SceneBridge,
+        target_format: wgpu::TextureFormat,
+        compute_supported: bool,
+    ) -> Self {
         Self {
             scene,
             target_format,
+            compute_supported,
         }
     }
 }
@@ -1379,32 +1587,61 @@ impl CallbackTrait for VolumePaintCallback {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         _screen_descriptor: &ScreenDescriptor,
-        _encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut wgpu::CommandEncoder,
         resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         if resources.get::<GpuVolumeRenderer>().is_none() {
-            resources.insert(GpuVolumeRenderer::new(device, self.target_format));
+            resources.insert(GpuVolumeRenderer::new(
+                device,
+                self.target_format,
+                self.compute_supported,
+            ));
             self.scene.needs_remesh.store(true, Ordering::Release);
         }
         let renderer = resources
             .get_mut::<GpuVolumeRenderer>()
             .expect("renderer was inserted above");
-        let (updates, uniforms, has_more_updates) = {
+        let (updates, uniforms, has_more_updates, has_pending_geometry_updates) = {
             let mut state = self.scene.state.lock().expect("3D scene state poisoned");
             let updates: [Option<SceneUpdate>; MAX_GPU_UPDATES_PER_FRAME] =
                 std::array::from_fn(|_| state.updates.pop_front());
             let uniforms = scene_uniforms(&state);
-            (updates, uniforms, !state.updates.is_empty())
+            let has_pending_geometry_updates = state.updates.iter().any(|update| {
+                matches!(
+                    update,
+                    SceneUpdate::Reset { .. }
+                        | SceneUpdate::Invalidate { .. }
+                        | SceneUpdate::Chunk { .. }
+                        | SceneUpdate::LeakDistanceField { .. }
+                )
+            });
+            (
+                updates,
+                uniforms,
+                !state.updates.is_empty(),
+                has_pending_geometry_updates,
+            )
         };
         for update in updates.into_iter().flatten() {
             renderer.apply_update(device, queue, update);
         }
+        let leak_preparation_pending =
+            renderer.prepare_leak_distances(device, encoder, MAX_LEAK_DISTANCE_CHUNKS_PER_FRAME);
+        let leak_distance_ready = renderer.leak_distance_ready() && !has_pending_geometry_updates;
+        let leak_readiness_changed = self
+            .scene
+            .leak_distance_ready
+            .swap(leak_distance_ready, Ordering::AcqRel)
+            != leak_distance_ready;
+        let mut uniforms = uniforms;
+        uniforms.leak_distance_scale = renderer.leak_distance_scale();
+        uniforms.leak_light = u32::from(uniforms.leak_light != 0 && leak_distance_ready);
         renderer.refresh_chunk_visibility(&uniforms);
         if renderer.uniforms != uniforms {
             queue.write_buffer(&renderer.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
             renderer.uniforms = uniforms;
         }
-        if has_more_updates
+        if (has_more_updates || leak_preparation_pending || leak_readiness_changed)
             && let Some(context) = self
                 .scene
                 .repaint
@@ -1432,10 +1669,10 @@ impl CallbackTrait for VolumePaintCallback {
                 continue;
             }
             if renderer.uniforms.leak_light != 0
-                && let Some(leak_light) = &chunk.leak_light
+                && let Some(leak_distance) = &chunk.leak_distance
             {
                 render_pass.set_pipeline(&renderer.leak_pipeline);
-                render_pass.set_vertex_buffer(1, leak_light.slice(..));
+                render_pass.set_vertex_buffer(1, leak_distance.slice(..));
             } else {
                 render_pass.set_pipeline(&renderer.pipeline);
             }
@@ -1457,10 +1694,30 @@ impl CallbackTrait for VolumePaintCallback {
 
 struct GpuChunk {
     buffer: wgpu::Buffer,
-    leak_light: Option<wgpu::Buffer>,
+    leak_distance: Option<wgpu::Buffer>,
+    retained_quads: Option<Vec<CompactQuad>>,
     instances: u32,
     visible: bool,
     visibility_dirty: bool,
+}
+
+struct GpuLeakCompute {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct LeakComputeParams {
+    chunk_origin_and_count: [u32; 4],
+    halo_dimensions: [u32; 4],
+}
+
+struct TaggedLeakDistanceField {
+    epoch: u64,
+    revision: u64,
+    generation: u64,
+    field: Arc<LeakDistanceField>,
 }
 
 struct GpuHighlight {
@@ -1497,6 +1754,7 @@ struct GpuVolumeRenderer {
     uniform_buffer: wgpu::Buffer,
     uniforms: Uniforms,
     bind_group: wgpu::BindGroup,
+    leak_compute: Option<GpuLeakCompute>,
     chunks: HashMap<ChunkCoord, GpuChunk>,
     chunk_generations: HashMap<ChunkCoord, u64>,
     chunk_visibility_view: Option<ChunkVisibilityView>,
@@ -1506,10 +1764,17 @@ struct GpuVolumeRenderer {
     revision: u64,
     dimensions: [u32; 3],
     affine: Matrix4,
+    leak_distance_field: Option<TaggedLeakDistanceField>,
+    leak_distance_pending: VecDeque<ChunkCoord>,
+    leak_distance_pending_set: HashSet<ChunkCoord>,
 }
 
 impl GpuVolumeRenderer {
-    fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+    fn new(
+        device: &wgpu::Device,
+        target_format: wgpu::TextureFormat,
+        compute_supported: bool,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("VoxelInk compact quad shader"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -1625,10 +1890,10 @@ impl GpuVolumeRenderer {
                         ],
                     },
                     wgpu::VertexBufferLayout {
-                        array_stride: size_of::<PackedLeakLight>() as u64,
+                        array_stride: size_of::<PackedLeakDistance>() as u64,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &[wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Uint32,
+                            format: wgpu::VertexFormat::Snorm16x4,
                             offset: 0,
                             shader_location: 2,
                         }],
@@ -1713,6 +1978,75 @@ impl GpuVolumeRenderer {
             multiview_mask: None,
             cache: None,
         });
+        let leak_compute = compute_supported.then(|| {
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("VoxelInk leak-distance compute shader"),
+                source: wgpu::ShaderSource::Wgsl(LEAK_DISTANCE_COMPUTE_SHADER.into()),
+            });
+            let bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("VoxelInk leak-distance compute bind group layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("VoxelInk leak-distance compute pipeline layout"),
+                bind_group_layouts: &[Some(&bind_group_layout)],
+                immediate_size: 0,
+            });
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("VoxelInk leak-distance preparation pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("prepare_leak_distance"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+            GpuLeakCompute {
+                pipeline,
+                bind_group_layout,
+            }
+        });
         Self {
             pipeline,
             leak_pipeline,
@@ -1720,6 +2054,7 @@ impl GpuVolumeRenderer {
             uniform_buffer,
             uniforms,
             bind_group,
+            leak_compute,
             chunks: HashMap::new(),
             chunk_generations: HashMap::new(),
             chunk_visibility_view: None,
@@ -1729,6 +2064,9 @@ impl GpuVolumeRenderer {
             revision: 0,
             dimensions: [1; 3],
             affine: SceneState::default().affine,
+            leak_distance_field: None,
+            leak_distance_pending: VecDeque::new(),
+            leak_distance_pending_set: HashSet::new(),
         }
     }
 
@@ -1749,17 +2087,14 @@ impl GpuVolumeRenderer {
                 self.revision = revision;
                 self.dimensions = dimensions;
                 self.affine = affine;
+                self.clear_leak_distance_field();
             }
             SceneUpdate::Invalidate { revision } => {
                 self.revision = revision;
                 self.clear_highlight();
+                self.clear_leak_distance_field();
             }
-            SceneUpdate::Chunk {
-                tag,
-                quads,
-                leak_light,
-                ..
-            } => {
+            SceneUpdate::Chunk { tag, quads, .. } => {
                 if tag.document_epoch != self.epoch || tag.revision != self.revision {
                     return;
                 }
@@ -1774,32 +2109,33 @@ impl GpuVolumeRenderer {
                     .insert(tag.chunk, tag.chunk_generation);
                 if quads.is_empty() {
                     self.chunks.remove(&tag.chunk);
+                    self.leak_distance_pending_set.remove(&tag.chunk);
                     return;
                 }
+                let instances = quads.len() as u32;
                 let contents = bytemuck::cast_slice(&quads);
-                let leak_light =
-                    leak_light
-                        .filter(|light| light.len() == quads.len())
-                        .map(|light| {
-                            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                label: Some("VoxelInk chunk leak-light instances"),
-                                contents: bytemuck::cast_slice(&light),
-                                usage: wgpu::BufferUsages::VERTEX,
-                            })
-                        });
                 if let Some(chunk) = self.chunks.get_mut(&tag.chunk)
                     && can_reuse_chunk_buffer(chunk.buffer.size(), contents.len() as u64)
                 {
                     queue.write_buffer(&chunk.buffer, 0, contents);
-                    chunk.leak_light = leak_light;
-                    chunk.instances = quads.len() as u32;
+                    chunk.leak_distance = None;
+                    chunk.retained_quads = self.leak_compute.is_none().then_some(quads);
+                    chunk.instances = instances;
+                    if self.leak_distance_field.is_some() {
+                        self.enqueue_leak_distance(tag.chunk);
+                    }
                     return;
+                }
+                let mut usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST;
+                if self.leak_compute.is_some() {
+                    usage |= wgpu::BufferUsages::STORAGE;
                 }
                 let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("VoxelInk chunk quad instances"),
                     contents,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    usage,
                 });
+                let retained_quads = self.leak_compute.is_none().then_some(quads);
                 let previous_visibility = self
                     .chunks
                     .get(&tag.chunk)
@@ -1810,12 +2146,65 @@ impl GpuVolumeRenderer {
                     tag.chunk,
                     GpuChunk {
                         buffer,
-                        leak_light,
-                        instances: quads.len() as u32,
+                        leak_distance: None,
+                        retained_quads,
+                        instances,
                         visible,
                         visibility_dirty,
                     },
                 );
+                if self.leak_distance_field.is_some() {
+                    if let Some(chunk) = self.chunks.get_mut(&tag.chunk) {
+                        chunk.leak_distance = None;
+                    }
+                    self.enqueue_leak_distance(tag.chunk);
+                }
+            }
+            SceneUpdate::LeakDistanceField {
+                epoch,
+                revision,
+                generation,
+                field,
+            } => {
+                let expected_steps = self
+                    .dimensions
+                    .into_iter()
+                    .try_fold(1_usize, |total, dimension| {
+                        total.checked_mul(dimension as usize)
+                    });
+                if epoch != self.epoch
+                    || revision != self.revision
+                    || expected_steps != Some(field.steps().len())
+                {
+                    return;
+                }
+                if let Some(current) = self.leak_distance_field.as_mut()
+                    && current.epoch == epoch
+                    && current.revision == revision
+                {
+                    if current.generation >= generation {
+                        return;
+                    }
+                    if Arc::ptr_eq(&current.field, &field) {
+                        current.generation = generation;
+                        return;
+                    }
+                }
+                self.leak_distance_field = Some(TaggedLeakDistanceField {
+                    epoch,
+                    revision,
+                    generation,
+                    field,
+                });
+                self.leak_distance_pending.clear();
+                self.leak_distance_pending_set.clear();
+                let chunks = self.chunks.keys().copied().collect::<Vec<_>>();
+                for chunk in self.chunks.values_mut() {
+                    chunk.leak_distance = None;
+                }
+                for chunk in chunks {
+                    self.enqueue_leak_distance(chunk);
+                }
             }
             SceneUpdate::Highlight {
                 epoch,
@@ -1856,6 +2245,111 @@ impl GpuVolumeRenderer {
         }
     }
 
+    fn clear_leak_distance_field(&mut self) {
+        self.leak_distance_field = None;
+        self.leak_distance_pending.clear();
+        self.leak_distance_pending_set.clear();
+        for chunk in self.chunks.values_mut() {
+            chunk.leak_distance = None;
+        }
+    }
+
+    fn enqueue_leak_distance(&mut self, chunk: ChunkCoord) {
+        if self.chunks.contains_key(&chunk) && self.leak_distance_pending_set.insert(chunk) {
+            self.leak_distance_pending.push_back(chunk);
+        }
+    }
+
+    fn leak_distance_scale(&self) -> f32 {
+        self.leak_distance_field
+            .as_ref()
+            .map(|tagged| tagged.field.distance_scale() as f32)
+            .filter(|scale| scale.is_finite() && *scale > 0.0)
+            .unwrap_or(1.0)
+    }
+
+    fn leak_distance_ready(&self) -> bool {
+        self.leak_distance_field.is_some()
+            && self.leak_distance_pending_set.is_empty()
+            && self
+                .chunks
+                .values()
+                .all(|chunk| chunk.leak_distance.is_some())
+    }
+
+    /// Prepares at most `maximum_chunks` diagnostic buffers and returns whether
+    /// another frame is required. The visible mode remains disabled until every
+    /// current chunk has a prepared buffer, so progressive work is never mistaken
+    /// for a sealed surface.
+    fn prepare_leak_distances(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        maximum_chunks: usize,
+    ) -> bool {
+        if self.leak_distance_field.is_none() {
+            return false;
+        }
+        let mut failed = false;
+        for _ in 0..maximum_chunks {
+            let coordinate = loop {
+                let Some(coordinate) = self.leak_distance_pending.pop_front() else {
+                    break None;
+                };
+                if self.leak_distance_pending_set.remove(&coordinate) {
+                    break Some(coordinate);
+                }
+            };
+            let Some(coordinate) = coordinate else {
+                break;
+            };
+            let Some(field) = self
+                .leak_distance_field
+                .as_ref()
+                .map(|tagged| Arc::clone(&tagged.field))
+            else {
+                break;
+            };
+            let Some((chunk_origin, halo_dimensions, halo_steps)) =
+                copy_leak_distance_halo(self.dimensions, coordinate, field.steps())
+            else {
+                failed = true;
+                break;
+            };
+            let prepared = if let Some(compute) = &self.leak_compute {
+                let Some(chunk) = self.chunks.get(&coordinate) else {
+                    continue;
+                };
+                prepare_gpu_leak_distance(
+                    device,
+                    encoder,
+                    compute,
+                    chunk,
+                    chunk_origin,
+                    halo_dimensions,
+                    &halo_steps,
+                )
+            } else {
+                let Some(chunk) = self.chunks.get(&coordinate) else {
+                    continue;
+                };
+                prepare_cpu_leak_distance(device, chunk, chunk_origin, halo_dimensions, &halo_steps)
+            };
+            let Some(prepared) = prepared else {
+                failed = true;
+                break;
+            };
+            if let Some(chunk) = self.chunks.get_mut(&coordinate) {
+                chunk.leak_distance = Some(prepared);
+            }
+        }
+        if failed {
+            self.clear_leak_distance_field();
+            return false;
+        }
+        !self.leak_distance_pending_set.is_empty()
+    }
+
     fn clear_highlight(&mut self) {
         if let Some(highlight) = self.highlight.as_mut()
             && highlight.buffer.size() <= MAX_RETAINED_HIGHLIGHT_BUFFER_BYTES
@@ -1887,6 +2381,165 @@ impl GpuVolumeRenderer {
         self.has_dirty_chunk_visibility = false;
         refreshed
     }
+}
+
+fn copy_leak_distance_halo(
+    dimensions: [u32; 3],
+    coordinate: ChunkCoord,
+    field_steps: &[u16],
+) -> Option<([u32; 3], [u32; 3], Vec<u16>)> {
+    let expected_steps = dimensions
+        .into_iter()
+        .try_fold(1_usize, |total, dimension| {
+            total.checked_mul(dimension as usize)
+        })?;
+    if field_steps.len() != expected_steps {
+        return None;
+    }
+    let origin = coordinate.origin()?;
+    let extent = coordinate.extent(dimensions)?;
+    let halo_dimensions = extent.map(|axis| axis + 2);
+    let halo_len = halo_dimensions
+        .into_iter()
+        .try_fold(1_usize, |total, dimension| {
+            total.checked_mul(dimension as usize)
+        })?;
+    let mut halo = Vec::new();
+    halo.try_reserve_exact(halo_len).ok()?;
+    let width = dimensions[0] as usize;
+    let height = dimensions[1] as usize;
+    for local_z in 0..halo_dimensions[2] {
+        let global_z = i64::from(origin[2]) + i64::from(local_z) - 1;
+        for local_y in 0..halo_dimensions[1] {
+            let global_y = i64::from(origin[1]) + i64::from(local_y) - 1;
+            for local_x in 0..halo_dimensions[0] {
+                let global_x = i64::from(origin[0]) + i64::from(local_x) - 1;
+                if !(0..i64::from(dimensions[0])).contains(&global_x)
+                    || !(0..i64::from(dimensions[1])).contains(&global_y)
+                    || !(0..i64::from(dimensions[2])).contains(&global_z)
+                {
+                    // Space beyond the stored volume is the exterior source.
+                    halo.push(0);
+                    continue;
+                }
+                let x = usize::try_from(global_x).ok()?;
+                let y = usize::try_from(global_y).ok()?;
+                let z = usize::try_from(global_z).ok()?;
+                halo.push(field_steps[x + width * (y + height * z)]);
+            }
+        }
+    }
+    Some((origin, halo_dimensions, halo))
+}
+
+fn prepare_cpu_leak_distance(
+    device: &wgpu::Device,
+    chunk: &GpuChunk,
+    chunk_origin: [u32; 3],
+    halo_dimensions: [u32; 3],
+    halo_steps: &[u16],
+) -> Option<wgpu::Buffer> {
+    let quads = chunk.retained_quads.as_deref()?;
+    let packed = pack_leak_distances(quads, chunk_origin, halo_dimensions, halo_steps).ok()?;
+    if packed.len() != chunk.instances as usize {
+        return None;
+    }
+    Some(
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("VoxelInk CPU-prepared chunk leak distances"),
+            contents: bytemuck::cast_slice(&packed),
+            usage: wgpu::BufferUsages::VERTEX,
+        }),
+    )
+}
+
+fn prepare_gpu_leak_distance(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    compute: &GpuLeakCompute,
+    chunk: &GpuChunk,
+    chunk_origin: [u32; 3],
+    halo_dimensions: [u32; 3],
+    halo_steps: &[u16],
+) -> Option<wgpu::Buffer> {
+    if chunk.instances == 0 {
+        return None;
+    }
+    let mut halo_words = Vec::new();
+    let word_count = halo_steps.len().div_ceil(2);
+    let padded_word_count = word_count.div_ceil(4) * 4;
+    halo_words.try_reserve_exact(padded_word_count).ok()?;
+    halo_words.resize(padded_word_count, 0_u32);
+    for (index, &step) in halo_steps.iter().enumerate() {
+        halo_words[index / 2] |= u32::from(step) << ((index % 2) * 16);
+    }
+    let halo_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("VoxelInk packed chunk leak-distance halo"),
+        contents: bytemuck::cast_slice(&halo_words),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let output_bytes =
+        u64::from(chunk.instances).checked_mul(size_of::<PackedLeakDistance>() as u64)?;
+    let padded_output_bytes = output_bytes.div_ceil(16) * 16;
+    let output = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("VoxelInk GPU-prepared chunk leak distances"),
+        size: padded_output_bytes,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::VERTEX
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let parameters = LeakComputeParams {
+        chunk_origin_and_count: [
+            chunk_origin[0],
+            chunk_origin[1],
+            chunk_origin[2],
+            chunk.instances,
+        ],
+        halo_dimensions: [
+            halo_dimensions[0],
+            halo_dimensions[1],
+            halo_dimensions[2],
+            0,
+        ],
+    };
+    let parameter_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("VoxelInk leak-distance compute parameters"),
+        contents: bytemuck::bytes_of(&parameters),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("VoxelInk leak-distance compute bind group"),
+        layout: &compute.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: parameter_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: chunk.buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: halo_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: output.as_entire_binding(),
+            },
+        ],
+    });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("VoxelInk prepare chunk leak distances"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&compute.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(chunk.instances.div_ceil(LEAK_COMPUTE_WORKGROUP_SIZE), 1, 1);
+    }
+    Some(output)
 }
 
 fn can_reuse_chunk_buffer(existing_bytes: u64, replacement_bytes: u64) -> bool {
@@ -1965,6 +2618,7 @@ fn scene_uniforms(state: &SceneState) -> Uniforms {
         index_normal_to_view: normal_matrix(model_view).to_cols_array_2d(),
         near_surface_depth,
         inverse_scene_depth_span,
+        leak_half_distance: state.leak_half_distance,
         voxel_seams: u32::from(state.voxel_seams),
         leak_light: u32::from(state.leak_light),
         ..Uniforms::default()
@@ -2357,7 +3011,85 @@ mod tests {
     fn production_renderer_uses_four_sample_msaa() {
         assert_eq!(MSAA_SAMPLES, 4);
         assert!(MSAA_SAMPLES.is_power_of_two());
-        assert_eq!(size_of::<Uniforms>(), 288);
+        assert_eq!(size_of::<Uniforms>(), 304);
+    }
+
+    #[test]
+    fn leak_compute_capability_requires_compute_storage_and_workgroup_limits() {
+        let limits = wgpu::Limits::downlevel_defaults();
+        assert!(leak_compute_supported_for(
+            wgpu::DownlevelFlags::COMPUTE_SHADERS,
+            &limits,
+        ));
+        assert!(!leak_compute_supported_for(
+            wgpu::DownlevelFlags::empty(),
+            &limits,
+        ));
+
+        let mut limited = limits.clone();
+        limited.max_storage_buffers_per_shader_stage = LEAK_COMPUTE_STORAGE_BINDINGS - 1;
+        assert!(!leak_compute_supported_for(
+            wgpu::DownlevelFlags::COMPUTE_SHADERS,
+            &limited,
+        ));
+        limited = limits;
+        limited.max_compute_workgroup_size_x = LEAK_COMPUTE_WORKGROUP_SIZE - 1;
+        assert!(!leak_compute_supported_for(
+            wgpu::DownlevelFlags::COMPUTE_SHADERS,
+            &limited,
+        ));
+    }
+
+    #[test]
+    fn leak_reach_is_a_uniform_only_setting() {
+        let bridge = SceneBridge::default();
+        assert_eq!(bridge.leak_light_reach(), 1.0);
+        assert!(bridge.state.lock().unwrap().updates.is_empty());
+
+        bridge.set_leak_light_reach(7.25);
+        assert_eq!(bridge.leak_light_reach(), 7.25);
+        let state = bridge.state.lock().unwrap();
+        assert_eq!(scene_uniforms(&state).leak_half_distance, 7.25);
+        assert!(state.updates.is_empty());
+        drop(state);
+
+        bridge.set_leak_light_reach(f64::NAN);
+        bridge.set_leak_light_reach(0.0);
+        assert_eq!(bridge.leak_light_reach(), 7.25);
+    }
+
+    #[test]
+    fn latest_leak_field_generation_replaces_queued_work_and_clears_readiness() {
+        let bridge = SceneBridge::default();
+        bridge.reset(7, 3, [2; 3], SceneState::default().affine);
+        let field = Arc::new(
+            crate::volume::compute_leak_distance(
+                &[0; 8],
+                [2; 3],
+                &[1.0; 3],
+                &crate::cancel::CancellationToken::default(),
+            )
+            .unwrap(),
+        );
+        bridge.leak_distance_ready.store(true, Ordering::Release);
+        bridge.set_leak_distance_field(7, 3, 4, Arc::clone(&field));
+        bridge.set_leak_distance_field(7, 3, 5, Arc::clone(&field));
+
+        assert!(!bridge.leak_distance_ready());
+        let state = bridge.state.lock().unwrap();
+        let queued = state
+            .updates
+            .iter()
+            .filter_map(|update| match update {
+                SceneUpdate::LeakDistanceField {
+                    generation,
+                    field: queued,
+                    ..
+                } => Some((*generation, Arc::ptr_eq(queued, &field))),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(queued, vec![(5, true)]);
     }
 
     #[test]
@@ -2384,9 +3116,10 @@ mod tests {
         assert!(SHADER.contains("if (uniforms.voxel_seams == 0u)"));
         assert!(SHADER.contains("return vec4<f32>(lit_color, 1.0);"));
         assert!(SHADER.contains("if (uniforms.leak_light != 0u)"));
-        assert!(SHADER.contains("0.10 + 0.90 * input.leak_intensity"));
+        assert!(SHADER.contains("exp2(-physical_distance /"));
+        assert!(SHADER.contains("input.leak_distance >= 0.0"));
         assert_eq!(size_of::<CompactQuad>(), 16);
-        assert_eq!(size_of::<PackedLeakLight>(), 4);
+        assert_eq!(size_of::<PackedLeakDistance>(), 8);
     }
 
     #[test]
@@ -2741,13 +3474,11 @@ mod tests {
         bridge.insert_chunk(
             tag(ChunkCoord::new(0, 0, 0), MeshUpdatePriority::Background),
             Vec::new(),
-            None,
             MeshUpdatePriority::Background,
         );
         bridge.insert_chunk(
             tag(ChunkCoord::new(1, 0, 0), MeshUpdatePriority::Live),
             Vec::new(),
-            None,
             MeshUpdatePriority::Live,
         );
         assert!(bridge.set_voxel_highlight(3, 6, vec![([2, 2, 2], VoxelHighlightKind::Paint)],));
@@ -2807,40 +3538,26 @@ mod tests {
         bridge.insert_chunk(
             tag(8, 1, replaced),
             Vec::new(),
-            None,
             MeshUpdatePriority::Background,
         );
         bridge.invalidate(4, 9, vec![replaced]);
         bridge.insert_chunk(
             tag(9, 1, background),
             Vec::new(),
-            None,
             MeshUpdatePriority::Background,
         );
         bridge.insert_chunk(
             tag(9, 2, replaced),
             Vec::new(),
-            None,
             MeshUpdatePriority::Background,
         );
         bridge.insert_chunk(
             tag(9, 3, replaced),
             Vec::new(),
-            None,
             MeshUpdatePriority::Background,
         );
-        bridge.insert_chunk(
-            tag(9, 3, replaced),
-            Vec::new(),
-            None,
-            MeshUpdatePriority::Live,
-        );
-        bridge.insert_chunk(
-            tag(9, 1, other_live),
-            Vec::new(),
-            None,
-            MeshUpdatePriority::Live,
-        );
+        bridge.insert_chunk(tag(9, 3, replaced), Vec::new(), MeshUpdatePriority::Live);
+        bridge.insert_chunk(tag(9, 1, other_live), Vec::new(), MeshUpdatePriority::Live);
 
         let state = bridge.state.lock().unwrap();
         assert_eq!(state.updates.len(), 6);
@@ -3539,7 +4256,7 @@ mod tests {
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
                 .expect("software Vulkan device must initialize");
         let format = wgpu::TextureFormat::Rgba8Unorm;
-        let mut renderer = GpuVolumeRenderer::new(&device, format);
+        let mut renderer = GpuVolumeRenderer::new(&device, format, false);
         // This is the sform from the craniofacial NIfTI that exposed the bug. Keeping
         // the large index coordinates and anisotropic affine is important: the old,
         // weak depth bias looked stable on a small identity-space test plane.
@@ -3581,7 +4298,6 @@ mod tests {
                     )
                     .expect("the test surface fits one greedy quad"),
                 ],
-                leak_light: None,
                 priority: MeshUpdatePriority::Background,
             },
         );
@@ -3811,7 +4527,8 @@ mod tests {
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
                 .expect("software Vulkan device must initialize");
-        let mut renderer = GpuVolumeRenderer::new(&device, wgpu::TextureFormat::Bgra8UnormSrgb);
+        let mut renderer =
+            GpuVolumeRenderer::new(&device, wgpu::TextureFormat::Bgra8UnormSrgb, false);
         let affine = SceneState::default().affine;
         let dimensions = [96, 32, 32];
         let visibility_uniforms = scene_uniforms(&SceneState {
@@ -3847,15 +4564,11 @@ mod tests {
                     CompactQuad::new([1, 0, 0], 1, 1, crate::mesh::FaceAxis::X, true, [0; 4])
                         .expect("unit face is representable"),
                 ],
-                leak_light: Some(vec![
-                    PackedLeakLight::new([0; 4]),
-                    PackedLeakLight::new([u8::MAX; 4]),
-                ]),
                 priority: MeshUpdatePriority::Background,
             },
         );
         assert!(renderer.chunks.contains_key(&chunk));
-        assert!(renderer.chunks.get(&chunk).unwrap().leak_light.is_some());
+        assert!(renderer.chunks.get(&chunk).unwrap().leak_distance.is_none());
         let initial_chunk_buffer = renderer
             .chunks
             .get(&chunk)
@@ -3881,7 +4594,6 @@ mod tests {
                     CompactQuad::new([2, 0, 0], 1, 1, crate::mesh::FaceAxis::Y, true, [0; 4])
                         .expect("unit face is representable"),
                 ],
-                leak_light: None,
                 priority: MeshUpdatePriority::Live,
             },
         );
@@ -3910,7 +4622,6 @@ mod tests {
                             .expect("unit face is representable")
                     })
                     .collect(),
-                leak_light: None,
                 priority: MeshUpdatePriority::Live,
             },
         );
@@ -3939,7 +4650,6 @@ mod tests {
                     chunk,
                 },
                 quads: vec![representative_quad; oversized_quad_count],
-                leak_light: None,
                 priority: MeshUpdatePriority::Live,
             },
         );
@@ -3963,7 +4673,6 @@ mod tests {
                     chunk,
                 },
                 quads: vec![representative_quad],
-                leak_light: None,
                 priority: MeshUpdatePriority::Live,
             },
         );
@@ -3990,7 +4699,6 @@ mod tests {
                     CompactQuad::new([64, 0, 0], 1, 1, crate::mesh::FaceAxis::X, true, [0; 4])
                         .expect("unit face is representable"),
                 ],
-                leak_light: None,
                 priority: MeshUpdatePriority::Background,
             },
         );
@@ -4084,7 +4792,6 @@ mod tests {
                     chunk,
                 },
                 quads: Vec::new(),
-                leak_light: None,
                 priority: MeshUpdatePriority::Live,
             },
         );
@@ -4107,7 +4814,6 @@ mod tests {
                     CompactQuad::new([0, 0, 0], 1, 1, crate::mesh::FaceAxis::X, true, [0; 4])
                         .expect("unit face is representable"),
                 ],
-                leak_light: None,
                 priority: MeshUpdatePriority::Background,
             },
         );
@@ -4226,5 +4932,122 @@ mod tests {
         assert!(renderer.chunk_visibility_view.is_none());
 
         let _ = queue.submit(std::iter::empty());
+    }
+
+    #[test]
+    fn headless_software_vulkan_prepares_packed_leak_distances_in_compute() {
+        if std::env::var_os("VOXEL_INK_REQUIRE_SOFTWARE_VULKAN").is_none() {
+            eprintln!("set VOXEL_INK_REQUIRE_SOFTWARE_VULKAN=1 to exercise Mesa Vulkan");
+            return;
+        }
+
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::VULKAN;
+        let instance = wgpu::Instance::new(descriptor);
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            force_fallback_adapter: true,
+            compatible_surface: None,
+        }))
+        .expect("Mesa software Vulkan adapter must be available");
+        assert!(leak_compute_supported(&adapter));
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("software Vulkan device must initialize");
+        let mut renderer =
+            GpuVolumeRenderer::new(&device, wgpu::TextureFormat::Bgra8UnormSrgb, true);
+        let dimensions = [3; 3];
+        renderer.apply_update(
+            &device,
+            &queue,
+            SceneUpdate::Reset {
+                epoch: 1,
+                revision: 2,
+                dimensions,
+                affine: SceneState::default().affine,
+            },
+        );
+        let coordinate = ChunkCoord::new(0, 0, 0);
+        renderer.apply_update(
+            &device,
+            &queue,
+            SceneUpdate::Chunk {
+                tag: MeshJobTag {
+                    document_epoch: 1,
+                    revision: 2,
+                    chunk_generation: 1,
+                    edit_generation: 0,
+                    chunk: coordinate,
+                },
+                quads: vec![
+                    CompactQuad::new([0, 0, 0], 1, 1, crate::mesh::FaceAxis::X, false, [0; 4])
+                        .unwrap(),
+                    CompactQuad::new([1, 1, 1], 1, 1, crate::mesh::FaceAxis::X, true, [0; 4])
+                        .unwrap(),
+                ],
+                priority: MeshUpdatePriority::Background,
+            },
+        );
+        let mut occupancy = vec![1_u8; 27];
+        occupancy[1 + 3 * (1 + 3)] = 0;
+        let field = Arc::new(
+            crate::volume::compute_leak_distance(
+                &occupancy,
+                dimensions,
+                &[1.0; 3],
+                &crate::cancel::CancellationToken::default(),
+            )
+            .unwrap(),
+        );
+        renderer.apply_update(
+            &device,
+            &queue,
+            SceneUpdate::LeakDistanceField {
+                epoch: 1,
+                revision: 2,
+                generation: 3,
+                field,
+            },
+        );
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("leak-distance compute test encoder"),
+        });
+        assert!(!renderer.prepare_leak_distances(&device, &mut encoder, 1));
+        assert!(renderer.leak_distance_ready());
+        let prepared = renderer
+            .chunks
+            .get(&coordinate)
+            .and_then(|chunk| chunk.leak_distance.as_ref())
+            .expect("compute must prepare the diagnostic buffer");
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("leak-distance compute test readback"),
+            size: 16,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_buffer_to_buffer(prepared, 0, &readback, 0, 16);
+        let submission = queue.submit([encoder.finish()]);
+        let slice = readback.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(std::time::Duration::from_secs(10)),
+            })
+            .expect("software Vulkan compute must complete");
+        receiver
+            .recv()
+            .expect("readback callback must run")
+            .expect("readback buffer must map");
+        let bytes = slice.get_mapped_range();
+        let words = bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(words, vec![0, 0, 0x8000_8000, 0x8000_8000]);
     }
 }

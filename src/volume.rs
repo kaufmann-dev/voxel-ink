@@ -10,8 +10,11 @@ use crate::{
 pub const HISTORY_TRANSACTIONS: usize = 256;
 pub const HISTORY_BYTES: usize = 128 * 1024 * 1024;
 const EXTERIOR_STACK_BYTES: usize = 64 * 1024 * 1024;
-const LEAK_LIGHT_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+const LEAK_DISTANCE_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 const CANCELLATION_CHECK_INTERVAL: usize = 64 * 1024;
+const MAX_LEAK_DISTANCE_STEPS: u16 = i16::MAX as u16;
+const SEALED_LEAK_DISTANCE: u16 = u16::MAX;
+const LEAK_DISTANCE_DIAGONALS: f64 = 8.0;
 
 pub type Matrix4 = [[f64; 4]; 4];
 
@@ -157,16 +160,22 @@ pub struct VolumeView<'a> {
     pub geometry: &'a VolumeGeometry,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LeakLightField {
-    intensities: Vec<u8>,
+#[derive(Clone, Debug, PartialEq)]
+pub struct LeakDistanceField {
+    steps: Vec<u16>,
+    distance_scale: f64,
     degraded: bool,
 }
 
-impl LeakLightField {
+impl LeakDistanceField {
     #[must_use]
-    pub fn intensities(&self) -> &[u8] {
-        &self.intensities
+    pub fn steps(&self) -> &[u16] {
+        &self.steps
+    }
+
+    #[must_use]
+    pub const fn distance_scale(&self) -> f64 {
+        self.distance_scale
     }
 
     #[must_use]
@@ -608,26 +617,15 @@ impl VolumeDocument {
         Ok(added)
     }
 
-    /// Computes a non-mutating approximation of outside light travelling through
-    /// six-connected empty voxels. Zero denotes occupied or enclosed space, one
-    /// is the guaranteed exterior-connected visibility floor, and higher values
-    /// form an affine-aware brightness gradient toward a volume boundary.
-    pub fn leak_light_field(
-        &self,
-        half_distance: f64,
-        cancel: &CancellationToken,
-    ) -> Result<LeakLightField> {
+    /// Computes reach-independent physical path distances from the volume boundary
+    /// through six-connected empty voxels. `u16::MAX` denotes occupied or enclosed
+    /// space; finite values are multiplied by the returned field's distance scale.
+    pub fn leak_distance_field(&self, cancel: &CancellationToken) -> Result<LeakDistanceField> {
         cancel.check()?;
-        if !half_distance.is_finite() || half_distance <= 0.0 {
-            return Err(AppError::InvalidDimensions(
-                "leak-light reach must be finite and positive".into(),
-            ));
-        }
-        compute_leak_light(
+        compute_leak_distance(
             &self.occupancy,
             self.geometry.dimensions,
             &self.geometry.spacing,
-            half_distance,
             cancel,
         )
     }
@@ -775,23 +773,14 @@ impl VolumeDocument {
     }
 }
 
-pub(crate) fn compute_leak_light(
+pub(crate) fn compute_leak_distance(
     occupancy: &[u8],
     dimensions: [u32; 3],
     spacing: &[f64; 3],
-    half_distance: f64,
     cancel: &CancellationToken,
-) -> Result<LeakLightField> {
+) -> Result<LeakDistanceField> {
     let dimensions = dimensions.map(|axis| axis as usize);
-    let exterior = classify_exterior_empty(occupancy, dimensions, cancel)?;
-    propagate_leak_light(
-        occupancy,
-        dimensions,
-        spacing,
-        half_distance,
-        &exterior,
-        cancel,
-    )
+    propagate_leak_distance(occupancy, dimensions, spacing, cancel)
 }
 
 #[derive(Debug)]
@@ -923,33 +912,59 @@ fn classify_exterior_empty(
     Ok(exterior)
 }
 
-fn propagate_leak_light(
+fn propagate_leak_distance(
     occupancy: &[u8],
     dimensions: [usize; 3],
     spacing: &[f64; 3],
-    half_distance: f64,
-    exterior: &VoxelBitSet,
     cancel: &CancellationToken,
-) -> Result<LeakLightField> {
-    let mut intensities = Vec::new();
-    intensities
+) -> Result<LeakDistanceField> {
+    propagate_leak_distance_with_queue_limit(
+        occupancy,
+        dimensions,
+        spacing,
+        LEAK_DISTANCE_QUEUE_BYTES / size_of::<u32>(),
+        cancel,
+    )
+}
+
+fn propagate_leak_distance_with_queue_limit(
+    occupancy: &[u8],
+    dimensions: [usize; 3],
+    spacing: &[f64; 3],
+    maximum_queued: usize,
+    cancel: &CancellationToken,
+) -> Result<LeakDistanceField> {
+    let distance_scale = leak_distance_scale(dimensions, spacing);
+    let axis_steps = spacing.map(|step| {
+        (step / distance_scale)
+            .round()
+            .clamp(1.0, f64::from(MAX_LEAK_DISTANCE_STEPS)) as u16
+    });
+
+    let distance_bytes = occupancy
+        .len()
+        .checked_mul(size_of::<u16>())
+        .ok_or(AppError::Allocation { bytes: usize::MAX })?;
+    let mut steps = Vec::new();
+    steps
         .try_reserve_exact(occupancy.len())
         .map_err(|_| AppError::Allocation {
-            bytes: occupancy.len(),
+            bytes: distance_bytes,
         })?;
-    intensities.resize(occupancy.len(), 0);
-    for (index, intensity) in intensities.iter_mut().enumerate() {
-        if index.is_multiple_of(CANCELLATION_CHECK_INTERVAL) {
-            cancel.check()?;
-        }
-        if exterior.contains(index) {
-            *intensity = 1;
-        }
-    }
+    steps.resize(occupancy.len(), SEALED_LEAK_DISTANCE);
 
-    let attenuation = spacing.map(|step| 0.5_f64.powf(step / half_distance));
-    let mut buckets: [Vec<u32>; 256] = std::array::from_fn(|_| Vec::new());
-    let maximum_queued = LEAK_LIGHT_QUEUE_BYTES / size_of::<u32>();
+    let bucket_count = usize::from(MAX_LEAK_DISTANCE_STEPS) + 1;
+    let bucket_bytes = bucket_count
+        .checked_mul(size_of::<Vec<u32>>())
+        .ok_or(AppError::Allocation { bytes: usize::MAX })?;
+    let mut buckets = Vec::new();
+    buckets
+        .try_reserve_exact(bucket_count)
+        .map_err(|_| AppError::Allocation {
+            bytes: bucket_bytes,
+        })?;
+    buckets.resize_with(bucket_count, Vec::new);
+
     let mut queued = 0_usize;
     let mut degraded = false;
     let [nx, ny, nz] = dimensions;
@@ -959,20 +974,20 @@ fn propagate_leak_light(
 
     {
         let mut seed = |index: usize| -> Result<()> {
-            if intensities[index] != 1 {
+            if occupancy[index] != 0 || steps[index] != SEALED_LEAK_DISTANCE {
                 return Ok(());
             }
-            intensities[index] = u8::MAX;
+            steps[index] = 0;
             if queued == maximum_queued {
                 degraded = true;
                 return Ok(());
             }
-            buckets[u8::MAX as usize]
+            buckets[0]
                 .try_reserve(1)
                 .map_err(|_| AppError::Allocation {
                     bytes: (queued + 1) * size_of::<u32>(),
                 })?;
-            buckets[u8::MAX as usize].push(index as u32);
+            buckets[0].push(index as u32);
             queued += 1;
             Ok(())
         };
@@ -1007,74 +1022,97 @@ fn propagate_leak_light(
         }
     }
 
-    if degraded {
-        return Ok(LeakLightField {
-            intensities,
-            degraded,
-        });
-    }
-
-    for level in (3_u8..=u8::MAX).rev() {
-        while let Some(index) = buckets[level as usize].pop() {
-            queued -= 1;
-            let index = index as usize;
-            if intensities[index] != level {
-                continue;
-            }
-            if index.is_multiple_of(CANCELLATION_CHECK_INTERVAL) {
-                cancel.check()?;
-            }
-            let z = index / plane;
-            let within_plane = index % plane;
-            let y = within_plane / nx;
-            let x = within_plane % nx;
-            for (axis, neighbor) in [
-                (0, (x > 0).then_some(index.wrapping_sub(1))),
-                (0, (x + 1 < nx).then_some(index + 1)),
-                (1, (y > 0).then_some(index.wrapping_sub(nx))),
-                (1, (y + 1 < ny).then_some(index + nx)),
-                (2, (z > 0).then_some(index.wrapping_sub(plane))),
-                (2, (z + 1 < nz).then_some(index + plane)),
-            ] {
-                let Some(neighbor) = neighbor else {
-                    continue;
-                };
-                if occupancy[neighbor] != 0 || !exterior.contains(neighbor) {
+    if !degraded {
+        for level in 0..=MAX_LEAK_DISTANCE_STEPS {
+            while let Some(index) = buckets[usize::from(level)].pop() {
+                queued -= 1;
+                let index = index as usize;
+                if steps[index] != level {
                     continue;
                 }
-                let attenuated = (f64::from(level) * attenuation[axis]).floor() as u8;
-                let candidate = attenuated.clamp(2, level - 1);
-                if candidate <= intensities[neighbor] {
-                    continue;
+                if index.is_multiple_of(CANCELLATION_CHECK_INTERVAL) {
+                    cancel.check()?;
                 }
-                intensities[neighbor] = candidate;
-                if queued == maximum_queued {
-                    degraded = true;
+                let z = index / plane;
+                let within_plane = index % plane;
+                let y = within_plane / nx;
+                let x = within_plane % nx;
+                for (axis, neighbor) in [
+                    (0, (x > 0).then_some(index.wrapping_sub(1))),
+                    (0, (x + 1 < nx).then_some(index + 1)),
+                    (1, (y > 0).then_some(index.wrapping_sub(nx))),
+                    (1, (y + 1 < ny).then_some(index + nx)),
+                    (2, (z > 0).then_some(index.wrapping_sub(plane))),
+                    (2, (z + 1 < nz).then_some(index + plane)),
+                ] {
+                    let Some(neighbor) = neighbor else {
+                        continue;
+                    };
+                    if occupancy[neighbor] != 0 {
+                        continue;
+                    }
+                    let candidate = level
+                        .saturating_add(axis_steps[axis])
+                        .min(MAX_LEAK_DISTANCE_STEPS);
+                    if candidate >= steps[neighbor] {
+                        continue;
+                    }
+                    steps[neighbor] = candidate;
+                    if queued == maximum_queued {
+                        degraded = true;
+                        break;
+                    }
+                    let bucket = &mut buckets[usize::from(candidate)];
+                    if bucket.len() == bucket.capacity() {
+                        bucket.try_reserve(1).map_err(|_| AppError::Allocation {
+                            bytes: (queued + 1) * size_of::<u32>(),
+                        })?;
+                    }
+                    bucket.push(neighbor as u32);
+                    queued += 1;
+                }
+                if degraded {
                     break;
                 }
-                if buckets[candidate as usize].len() == buckets[candidate as usize].capacity() {
-                    buckets[candidate as usize].try_reserve(1).map_err(|_| {
-                        AppError::Allocation {
-                            bytes: (queued + 1) * size_of::<u32>(),
-                        }
-                    })?;
-                }
-                buckets[candidate as usize].push(neighbor as u32);
-                queued += 1;
             }
+            // Distances only move to higher buckets, so this level can never
+            // receive another entry. Release its peak frontier allocation now
+            // instead of retaining every processed level for the whole volume.
+            buckets[usize::from(level)] = Vec::new();
             if degraded {
                 break;
             }
         }
-        if degraded {
-            break;
+    }
+
+    if degraded {
+        drop(buckets);
+        let exterior = classify_exterior_empty(occupancy, dimensions, cancel)?;
+        for (index, step) in steps.iter_mut().enumerate() {
+            if index.is_multiple_of(CANCELLATION_CHECK_INTERVAL) {
+                cancel.check()?;
+            }
+            if *step == SEALED_LEAK_DISTANCE && exterior.contains(index) {
+                *step = MAX_LEAK_DISTANCE_STEPS;
+            }
         }
     }
 
-    Ok(LeakLightField {
-        intensities,
+    Ok(LeakDistanceField {
+        steps,
+        distance_scale,
         degraded,
     })
+}
+
+fn leak_distance_scale(dimensions: [usize; 3], spacing: &[f64; 3]) -> f64 {
+    let diagonal = dimensions
+        .into_iter()
+        .zip(*spacing)
+        .fold(0.0_f64, |length, (dimension, step)| {
+            length.hypot(dimension as f64 * step)
+        });
+    (LEAK_DISTANCE_DIAGONALS * diagonal / f64::from(MAX_LEAK_DISTANCE_STEPS)).max(f64::MIN_POSITIVE)
 }
 
 fn flood_exterior_seed(
@@ -1419,7 +1457,7 @@ mod tests {
     }
 
     #[test]
-    fn leak_light_reaches_around_bends_but_not_into_sealed_space() {
+    fn leak_distance_reaches_around_bends_but_not_into_sealed_space() {
         let dimensions = [7, 7, 7];
         let mut occupancy = vec![1; dimensions.into_iter().product()];
         let index =
@@ -1428,26 +1466,25 @@ mod tests {
             occupancy[index(voxel)] = 0;
         }
         occupancy[index([5, 5, 5])] = 0;
-        let exterior =
-            classify_exterior_empty(&occupancy, dimensions, &CancellationToken::default()).unwrap();
-        let field = propagate_leak_light(
+        let field = propagate_leak_distance(
             &occupancy,
             dimensions,
             &[1.0; 3],
-            4.0,
-            &exterior,
             &CancellationToken::default(),
         )
         .unwrap();
 
-        assert_eq!(field.intensities()[index([0, 3, 3])], u8::MAX);
-        assert!(field.intensities()[index([2, 2, 2])] > 1);
-        assert_eq!(field.intensities()[index([5, 5, 5])], 0);
+        assert_eq!(field.steps()[index([0, 3, 3])], 0);
+        assert!(field.steps()[index([2, 2, 2])] > 0);
+        assert!(field.steps()[index([2, 2, 2])] < MAX_LEAK_DISTANCE_STEPS);
+        assert_eq!(field.steps()[index([5, 5, 5])], SEALED_LEAK_DISTANCE);
+        assert!(field.distance_scale().is_finite());
+        assert!(field.distance_scale() > 0.0);
         assert!(!field.degraded());
     }
 
     #[test]
-    fn leak_light_attenuation_respects_affine_axis_spacing() {
+    fn leak_distance_respects_affine_axis_spacing() {
         let dimensions = [5, 5, 5];
         let mut occupancy = vec![1; dimensions.into_iter().product()];
         let index =
@@ -1462,19 +1499,74 @@ mod tests {
         ] {
             occupancy[index(voxel)] = 0;
         }
-        let exterior =
-            classify_exterior_empty(&occupancy, dimensions, &CancellationToken::default()).unwrap();
-        let field = propagate_leak_light(
+        let field = propagate_leak_distance(
             &occupancy,
             dimensions,
             &[4.0, 1.0, 1.0],
-            4.0,
-            &exterior,
             &CancellationToken::default(),
         )
         .unwrap();
 
-        assert!(field.intensities()[index([3, 2, 2])] > field.intensities()[index([2, 1, 2])]);
+        assert!(field.steps()[index([3, 2, 2])] < field.steps()[index([2, 1, 2])]);
+    }
+
+    #[test]
+    fn leak_distance_connectivity_matches_naive_six_connected_floods() {
+        let dimensions = [5, 4, 3];
+        let voxel_count = dimensions.into_iter().product();
+        let mut random = 0x1ea5_d157_u64;
+
+        for _ in 0..64 {
+            let mut occupancy = Vec::with_capacity(voxel_count);
+            for _ in 0..voxel_count {
+                random = random
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                occupancy.push(u8::from(random >> 61 < 3));
+            }
+            let field = propagate_leak_distance(
+                &occupancy,
+                dimensions,
+                &[1.0, 2.0, 3.0],
+                &CancellationToken::default(),
+            )
+            .unwrap();
+            let expected = naive_exterior(&occupancy, dimensions);
+
+            for (index, &is_exterior) in expected.iter().enumerate() {
+                assert_eq!(
+                    field.steps()[index] != SEALED_LEAK_DISTANCE,
+                    is_exterior,
+                    "connectivity differed at index {index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn degraded_leak_distance_keeps_exterior_connectivity_exact() {
+        let dimensions = [7, 7, 7];
+        let mut occupancy = vec![1; dimensions.into_iter().product()];
+        let index =
+            |voxel: [usize; 3]| voxel[0] + dimensions[0] * (voxel[1] + dimensions[1] * voxel[2]);
+        for voxel in [[0, 3, 3], [1, 3, 3], [2, 3, 3], [2, 2, 3], [2, 2, 2]] {
+            occupancy[index(voxel)] = 0;
+        }
+        occupancy[index([5, 5, 5])] = 0;
+
+        let field = propagate_leak_distance_with_queue_limit(
+            &occupancy,
+            dimensions,
+            &[1.0; 3],
+            0,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+
+        assert!(field.degraded());
+        assert_eq!(field.steps()[index([0, 3, 3])], 0);
+        assert_eq!(field.steps()[index([2, 2, 2])], MAX_LEAK_DISTANCE_STEPS);
+        assert_eq!(field.steps()[index([5, 5, 5])], SEALED_LEAK_DISTANCE);
     }
 
     fn naive_exterior(occupancy: &[u8], dimensions: [usize; 3]) -> Vec<bool> {
