@@ -42,7 +42,6 @@ struct Uniforms {
 // Snorm16x4 exposes the connected 0..32767 step range as 0.0..1.0.
 // Restore the integer magnitude before converting steps to physical distance.
 const LEAK_DISTANCE_SNORM_STEP_RANGE: f32 = 32767.0;
-const LEAK_BANDS_PER_HALF_DISTANCE: f32 = 4.0;
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -177,17 +176,6 @@ fn voxel_seam(coordinate: f32) -> f32 {
     return antialiased_line * subpixel_fade;
 }
 
-fn band_leak_distance(physical_distance: f32, half_distance: f32) -> f32 {
-    let band_width = half_distance / LEAK_BANDS_PER_HALF_DISTANCE;
-    let band_coordinate = physical_distance / band_width;
-    let lower_band = floor(band_coordinate);
-    let lower_distance = lower_band * band_width;
-    let upper_distance = lower_distance + band_width;
-    let edge_width = clamp(fwidth(band_coordinate), 1.0e-4, 0.5);
-    let edge_blend = smoothstep(1.0 - edge_width, 1.0, fract(band_coordinate));
-    return mix(lower_distance, upper_distance, edge_blend);
-}
-
 fn srgb_to_linear(color: vec3<f32>) -> vec3<f32> {
     let low = color / 12.92;
     let high = pow((color + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
@@ -262,8 +250,7 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let physical_distance = max(input.leak_distance, 0.0) * LEAK_DISTANCE_SNORM_STEP_RANGE
             * uniforms.leak_distance_scale;
         let half_distance = max(uniforms.leak_half_distance, 1.0e-12);
-        let banded_distance = band_leak_distance(physical_distance, half_distance);
-        let leak_intensity = exp2(-banded_distance / half_distance);
+        let leak_intensity = exp2(-physical_distance / half_distance);
         let connected_light = select(0.0, leak_intensity, connected);
         let diagnostic_shading = (0.75 + 0.25 * base_lighting)
             * mix(1.0, surface_factor, 0.35)
@@ -3334,7 +3321,7 @@ mod tests {
         assert!(SHADER.contains("if (uniforms.voxel_seams == 0u)"));
         assert!(SHADER.contains("return vec4<f32>(lit_color, 1.0);"));
         assert!(SHADER.contains("if (uniforms.leak_light != 0u)"));
-        assert!(SHADER.contains("exp2(-banded_distance / half_distance)"));
+        assert!(SHADER.contains("exp2(-physical_distance / half_distance)"));
         assert!(SHADER.contains("input.leak_distance >= 0.0"));
         assert_eq!(size_of::<CompactQuad>(), 16);
         assert_eq!(size_of::<PackedLeakDistance>(), 8);
@@ -3355,16 +3342,14 @@ mod tests {
     }
 
     #[test]
-    fn leak_light_shader_uses_four_antialiased_distance_bands_per_half_distance() {
-        assert!(SHADER.contains("const LEAK_BANDS_PER_HALF_DISTANCE: f32 = 4.0;"));
-        assert!(SHADER.contains("let lower_band = floor(band_coordinate);"));
-        assert!(SHADER.contains("let edge_width = clamp(fwidth(band_coordinate), 1.0e-4, 0.5);"));
-        assert!(SHADER.contains("let banded_distance = band_leak_distance("));
-        assert!(SHADER.contains("exp2(-banded_distance / half_distance)"));
+    fn leak_light_shader_uses_continuous_physical_distance() {
+        assert!(SHADER.contains("exp2(-physical_distance / half_distance)"));
+        assert!(!SHADER.contains("band_leak_distance"));
+        assert!(!SHADER.contains("LEAK_BANDS_PER_HALF_DISTANCE"));
     }
 
     #[test]
-    fn leak_light_shader_uses_the_banded_inferno_heatmap_in_linear_color() {
+    fn leak_light_shader_uses_a_continuous_inferno_heatmap_in_linear_color() {
         for stop in [
             "vec3<f32>(0.0)",
             "vec3<f32>(87.0, 16.0, 110.0) / 255.0",
@@ -5580,8 +5565,8 @@ mod tests {
                 priority: MeshUpdatePriority::Background,
             },
         );
-        // At a 0.1 physical-distance scale and a half-distance of 1.0, steps 1
-        // and 2 share the first 0.25-wide band while step 3 begins the next.
+        // At a 0.1 physical-distance scale and a half-distance of 1.0, every
+        // successive step must produce a distinct continuously varying color.
         // Steps 10 and 20 land exactly on the crimson half-brightness and purple
         // quarter-brightness heatmap stops.
         let diagnostic_distances = [
@@ -5596,7 +5581,7 @@ mod tests {
         ];
         let diagnostic_distance_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("banded leak-distance test buffer"),
+                label: Some("continuous leak-distance test buffer"),
                 contents: bytemuck::cast_slice(&diagnostic_distances),
                 usage: wgpu::BufferUsages::VERTEX,
             });
@@ -5759,9 +5744,9 @@ mod tests {
         };
         let far = sample_rgb(sample_center(1));
         let near = sample_rgb(sample_center(2));
-        let second_band = sample_rgb(sample_center(3));
-        let first_band_a = sample_rgb(sample_center(4));
-        let first_band_b = sample_rgb(sample_center(5));
+        let distance_03 = sample_rgb(sample_center(3));
+        let distance_01 = sample_rgb(sample_center(4));
+        let distance_02 = sample_rgb(sample_center(5));
         let half_brightness = sample_rgb(sample_center(6));
         let quarter_brightness = sample_rgb(sample_center(7));
         let sealed = sample_rgb(sample_center(8));
@@ -5774,15 +5759,12 @@ mod tests {
             "a zero-distance surface must be pale yellow, got {near:?}"
         );
         assert!(
-            first_band_a
-                .into_iter()
-                .zip(first_band_b)
-                .all(|(left, right)| left.abs_diff(right) <= 2),
-            "distances within one band must share an RGB plateau, got {first_band_a:?} and {first_band_b:?}"
+            color_distance(distance_01, distance_02) >= 8,
+            "successive distances must not share a color plateau, got {distance_01:?} and {distance_02:?}"
         );
         assert!(
-            color_distance(first_band_b, second_band) >= 24,
-            "crossing a distance band must visibly change color, got {first_band_b:?} then {second_band:?}"
+            color_distance(distance_02, distance_03) >= 8,
+            "the gradient must continue changing at every step, got {distance_02:?} then {distance_03:?}"
         );
         assert!(
             half_brightness[0] > half_brightness[2] && half_brightness[2] > half_brightness[1],
