@@ -949,6 +949,7 @@ pub struct SceneBridge {
     state: Arc<Mutex<SceneState>>,
     needs_remesh: Arc<AtomicBool>,
     leak_distance_ready: Arc<AtomicBool>,
+    leak_distance_available: Arc<AtomicBool>,
     repaint: Arc<Mutex<Option<egui::Context>>>,
     highlight_generation: Arc<AtomicU64>,
     highlight_failure: Arc<Mutex<Option<VoxelHighlightFailure>>>,
@@ -981,6 +982,7 @@ impl SceneBridge {
         state.dimensions = dimensions;
         state.affine = affine;
         self.leak_distance_ready.store(false, Ordering::Release);
+        self.leak_distance_available.store(false, Ordering::Release);
         state.updates.clear();
         state.updates.push_back(SceneUpdate::Reset {
             epoch,
@@ -1226,6 +1228,11 @@ impl SceneBridge {
     #[must_use]
     pub fn leak_distance_ready(&self) -> bool {
         self.leak_distance_ready.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn leak_distance_available(&self) -> bool {
+        self.leak_distance_available.load(Ordering::Acquire)
     }
 
     pub fn orbit(&self, delta: egui::Vec2) {
@@ -1684,15 +1691,22 @@ impl CallbackTrait for VolumePaintCallback {
         }
         let leak_preparation_pending =
             renderer.prepare_leak_distances(device, encoder, MAX_LEAK_DISTANCE_CHUNKS_PER_FRAME);
+        if !has_pending_geometry_updates {
+            renderer.activate_pending_leak_distances();
+        }
+        let leak_distance_available = renderer.leak_distance_available();
         let leak_distance_ready = renderer.leak_distance_ready() && !has_pending_geometry_updates;
         let leak_readiness_changed = self
             .scene
             .leak_distance_ready
             .swap(leak_distance_ready, Ordering::AcqRel)
             != leak_distance_ready;
+        self.scene
+            .leak_distance_available
+            .store(leak_distance_available, Ordering::Release);
         let mut uniforms = uniforms;
         uniforms.leak_distance_scale = renderer.leak_distance_scale();
-        uniforms.leak_light = u32::from(uniforms.leak_light != 0 && leak_distance_ready);
+        uniforms.leak_light = u32::from(uniforms.leak_light != 0 && leak_distance_available);
         renderer.refresh_chunk_visibility(&uniforms);
         if renderer.uniforms != uniforms {
             queue.write_buffer(&renderer.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
@@ -1752,6 +1766,7 @@ impl CallbackTrait for VolumePaintCallback {
 struct GpuChunk {
     buffer: wgpu::Buffer,
     leak_distance: Option<wgpu::Buffer>,
+    pending_leak_distance: Option<wgpu::Buffer>,
     retained_quads: Option<Vec<CompactQuad>>,
     instances: u32,
     visible: bool,
@@ -1824,6 +1839,9 @@ struct GpuVolumeRenderer {
     leak_distance_field: Option<TaggedLeakDistanceField>,
     leak_distance_pending: VecDeque<ChunkCoord>,
     leak_distance_pending_set: HashSet<ChunkCoord>,
+    pending_leak_distance_field: Option<TaggedLeakDistanceField>,
+    pending_leak_distance_chunks: VecDeque<ChunkCoord>,
+    pending_leak_distance_set: HashSet<ChunkCoord>,
 }
 
 impl GpuVolumeRenderer {
@@ -2124,6 +2142,9 @@ impl GpuVolumeRenderer {
             leak_distance_field: None,
             leak_distance_pending: VecDeque::new(),
             leak_distance_pending_set: HashSet::new(),
+            pending_leak_distance_field: None,
+            pending_leak_distance_chunks: VecDeque::new(),
+            pending_leak_distance_set: HashSet::new(),
         }
     }
 
@@ -2149,7 +2170,7 @@ impl GpuVolumeRenderer {
             SceneUpdate::Invalidate { revision } => {
                 self.revision = revision;
                 self.clear_highlight();
-                self.clear_leak_distance_field();
+                self.clear_pending_leak_distance_field();
             }
             SceneUpdate::Chunk { tag, quads, .. } => {
                 if tag.document_epoch != self.epoch || tag.revision != self.revision {
@@ -2167,6 +2188,7 @@ impl GpuVolumeRenderer {
                 if quads.is_empty() {
                     self.chunks.remove(&tag.chunk);
                     self.leak_distance_pending_set.remove(&tag.chunk);
+                    self.pending_leak_distance_set.remove(&tag.chunk);
                     return;
                 }
                 let instances = quads.len() as u32;
@@ -2176,10 +2198,14 @@ impl GpuVolumeRenderer {
                 {
                     queue.write_buffer(&chunk.buffer, 0, contents);
                     chunk.leak_distance = None;
+                    chunk.pending_leak_distance = None;
                     chunk.retained_quads = self.leak_compute.is_none().then_some(quads);
                     chunk.instances = instances;
                     if self.leak_distance_field.is_some() {
                         self.enqueue_leak_distance(tag.chunk);
+                    }
+                    if self.pending_leak_distance_field.is_some() {
+                        self.enqueue_pending_leak_distance(tag.chunk);
                     }
                     return;
                 }
@@ -2204,6 +2230,7 @@ impl GpuVolumeRenderer {
                     GpuChunk {
                         buffer,
                         leak_distance: None,
+                        pending_leak_distance: None,
                         retained_quads,
                         instances,
                         visible,
@@ -2215,6 +2242,9 @@ impl GpuVolumeRenderer {
                         chunk.leak_distance = None;
                     }
                     self.enqueue_leak_distance(tag.chunk);
+                }
+                if self.pending_leak_distance_field.is_some() {
+                    self.enqueue_pending_leak_distance(tag.chunk);
                 }
             }
             SceneUpdate::LeakDistanceField {
@@ -2235,7 +2265,7 @@ impl GpuVolumeRenderer {
                 {
                     return;
                 }
-                if let Some(current) = self.leak_distance_field.as_mut()
+                if let Some(current) = self.pending_leak_distance_field.as_mut()
                     && current.epoch == epoch
                     && current.revision == revision
                 {
@@ -2247,20 +2277,20 @@ impl GpuVolumeRenderer {
                         return;
                     }
                 }
-                self.leak_distance_field = Some(TaggedLeakDistanceField {
+                self.pending_leak_distance_field = Some(TaggedLeakDistanceField {
                     epoch,
                     revision,
                     generation,
                     field,
                 });
-                self.leak_distance_pending.clear();
-                self.leak_distance_pending_set.clear();
+                self.pending_leak_distance_chunks.clear();
+                self.pending_leak_distance_set.clear();
                 let chunks = self.chunks.keys().copied().collect::<Vec<_>>();
                 for chunk in self.chunks.values_mut() {
-                    chunk.leak_distance = None;
+                    chunk.pending_leak_distance = None;
                 }
                 for chunk in chunks {
-                    self.enqueue_leak_distance(chunk);
+                    self.enqueue_pending_leak_distance(chunk);
                 }
             }
             SceneUpdate::Highlight {
@@ -2308,12 +2338,29 @@ impl GpuVolumeRenderer {
         self.leak_distance_pending_set.clear();
         for chunk in self.chunks.values_mut() {
             chunk.leak_distance = None;
+            chunk.pending_leak_distance = None;
+        }
+        self.clear_pending_leak_distance_field();
+    }
+
+    fn clear_pending_leak_distance_field(&mut self) {
+        self.pending_leak_distance_field = None;
+        self.pending_leak_distance_chunks.clear();
+        self.pending_leak_distance_set.clear();
+        for chunk in self.chunks.values_mut() {
+            chunk.pending_leak_distance = None;
         }
     }
 
     fn enqueue_leak_distance(&mut self, chunk: ChunkCoord) {
         if self.chunks.contains_key(&chunk) && self.leak_distance_pending_set.insert(chunk) {
             self.leak_distance_pending.push_back(chunk);
+        }
+    }
+
+    fn enqueue_pending_leak_distance(&mut self, chunk: ChunkCoord) {
+        if self.chunks.contains_key(&chunk) && self.pending_leak_distance_set.insert(chunk) {
+            self.pending_leak_distance_chunks.push_back(chunk);
         }
     }
 
@@ -2326,12 +2373,40 @@ impl GpuVolumeRenderer {
     }
 
     fn leak_distance_ready(&self) -> bool {
-        self.leak_distance_field.is_some()
+        self.leak_distance_field
+            .as_ref()
+            .is_some_and(|field| field.revision == self.revision)
             && self.leak_distance_pending_set.is_empty()
             && self
                 .chunks
                 .values()
                 .all(|chunk| chunk.leak_distance.is_some())
+    }
+
+    fn leak_distance_available(&self) -> bool {
+        self.leak_distance_field.is_some()
+            && self
+                .chunks
+                .values()
+                .any(|chunk| chunk.leak_distance.is_some())
+    }
+
+    fn activate_pending_leak_distances(&mut self) {
+        if self.pending_leak_distance_field.is_none()
+            || !self.pending_leak_distance_set.is_empty()
+            || self
+                .chunks
+                .values()
+                .any(|chunk| chunk.pending_leak_distance.is_none())
+        {
+            return;
+        }
+        self.leak_distance_field = self.pending_leak_distance_field.take();
+        self.leak_distance_pending.clear();
+        self.leak_distance_pending_set.clear();
+        for chunk in self.chunks.values_mut() {
+            chunk.leak_distance = chunk.pending_leak_distance.take();
+        }
     }
 
     /// Prepares at most `maximum_chunks` diagnostic buffers and returns whether
@@ -2344,11 +2419,12 @@ impl GpuVolumeRenderer {
         encoder: &mut wgpu::CommandEncoder,
         maximum_chunks: usize,
     ) -> bool {
-        if self.leak_distance_field.is_none() {
+        if self.leak_distance_field.is_none() && self.pending_leak_distance_field.is_none() {
             return false;
         }
         let mut failed = false;
-        for _ in 0..maximum_chunks {
+        let mut prepared_count = 0;
+        while prepared_count < maximum_chunks {
             let coordinate = loop {
                 let Some(coordinate) = self.leak_distance_pending.pop_front() else {
                     break None;
@@ -2360,6 +2436,7 @@ impl GpuVolumeRenderer {
             let Some(coordinate) = coordinate else {
                 break;
             };
+            prepared_count += 1;
             let Some(field) = self
                 .leak_distance_field
                 .as_ref()
@@ -2404,7 +2481,67 @@ impl GpuVolumeRenderer {
             self.clear_leak_distance_field();
             return false;
         }
-        !self.leak_distance_pending_set.is_empty()
+        while prepared_count < maximum_chunks {
+            let coordinate = loop {
+                let Some(coordinate) = self.pending_leak_distance_chunks.pop_front() else {
+                    break None;
+                };
+                if self.pending_leak_distance_set.remove(&coordinate) {
+                    break Some(coordinate);
+                }
+            };
+            let Some(coordinate) = coordinate else {
+                break;
+            };
+            prepared_count += 1;
+            let Some(field) = self
+                .pending_leak_distance_field
+                .as_ref()
+                .map(|tagged| Arc::clone(&tagged.field))
+            else {
+                break;
+            };
+            let Some((chunk_origin, halo_dimensions, halo_steps)) =
+                copy_leak_distance_halo(self.dimensions, coordinate, field.steps())
+            else {
+                failed = true;
+                break;
+            };
+            let prepared = if let Some(compute) = &self.leak_compute {
+                self.chunks.get(&coordinate).and_then(|chunk| {
+                    prepare_gpu_leak_distance(
+                        device,
+                        encoder,
+                        compute,
+                        chunk,
+                        chunk_origin,
+                        halo_dimensions,
+                        &halo_steps,
+                    )
+                })
+            } else {
+                self.chunks.get(&coordinate).and_then(|chunk| {
+                    prepare_cpu_leak_distance(
+                        device,
+                        chunk,
+                        chunk_origin,
+                        halo_dimensions,
+                        &halo_steps,
+                    )
+                })
+            };
+            let Some(prepared) = prepared else {
+                failed = true;
+                break;
+            };
+            if let Some(chunk) = self.chunks.get_mut(&coordinate) {
+                chunk.pending_leak_distance = Some(prepared);
+            }
+        }
+        if failed {
+            self.clear_pending_leak_distance_field();
+        }
+        !self.leak_distance_pending_set.is_empty() || !self.pending_leak_distance_set.is_empty()
     }
 
     fn clear_highlight(&mut self) {
@@ -5113,7 +5250,13 @@ mod tests {
             label: Some("leak-distance compute test encoder"),
         });
         assert!(!renderer.prepare_leak_distances(&device, &mut encoder, 1));
+        assert!(
+            !renderer.leak_distance_available(),
+            "a pending field must not become partially visible"
+        );
+        renderer.activate_pending_leak_distances();
         assert!(renderer.leak_distance_ready());
+        assert!(renderer.leak_distance_available());
         let prepared = renderer
             .chunks
             .get(&coordinate)
@@ -5150,6 +5293,16 @@ mod tests {
         assert_eq!(words, vec![0, 0, 0x8000_8000, 0x8000_8000]);
         drop(bytes);
         readback.unmap();
+
+        renderer.apply_update(&device, &queue, SceneUpdate::Invalidate { revision: 3 });
+        assert!(
+            renderer.leak_distance_available(),
+            "revision invalidation must retain the previous completed field"
+        );
+        assert!(
+            !renderer.leak_distance_ready(),
+            "the retained field must remain distinguishable from the current revision"
+        );
 
         renderer.apply_update(
             &device,

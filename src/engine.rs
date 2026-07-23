@@ -40,6 +40,7 @@ const MAX_BRIDGE_CHANGED_VOXELS: usize = 2_000_000;
 const MAX_BRIDGE_PREVIEW_WORK: usize = 16_000_000;
 const MAX_BRIDGE_COMMIT_WORK: usize = 64_000_000;
 const LIVE_FEEDBACK_GRACE: Duration = Duration::from_millis(10);
+const LEAK_LIGHT_RECOMPUTE_DEBOUNCE: Duration = Duration::from_millis(150);
 
 pub type JobId = u64;
 pub type EditId = u64;
@@ -683,7 +684,8 @@ struct EngineState {
     leak_light_requested: bool,
     leak_light_generation: u64,
     leak_light_cancel: CancellationToken,
-    leak_distance_field: Option<Arc<LeakDistanceField>>,
+    leak_distance_field: Option<(u64, Arc<LeakDistanceField>)>,
+    leak_light_recompute_at: Option<Instant>,
     pending_live_mesh_chunks: VecDeque<(MeshJobTag, Vec<CompactQuad>)>,
     pending_background_mesh_chunks: VecDeque<(MeshJobTag, Vec<CompactQuad>)>,
 }
@@ -744,6 +746,7 @@ impl EngineState {
             leak_light_generation: 0,
             leak_light_cancel: CancellationToken::default(),
             leak_distance_field: None,
+            leak_light_recompute_at: None,
             pending_live_mesh_chunks: VecDeque::new(),
             pending_background_mesh_chunks: VecDeque::new(),
         }
@@ -751,6 +754,7 @@ impl EngineState {
 
     fn run(mut self) {
         loop {
+            self.start_scheduled_leak_light_compute();
             self.flush_pending_mesh_chunk();
             self.dispatch_mesh_jobs();
             if self.live_feedback_pending()
@@ -759,11 +763,14 @@ impl EngineState {
             {
                 self.handle_mesh_result(result);
             }
-            let idle_wait = if self.has_pending_mesh_chunks() {
+            let mut idle_wait = if self.has_pending_mesh_chunks() {
                 Duration::from_millis(1)
             } else {
                 Duration::from_millis(25)
             };
+            if let Some(deadline) = self.leak_light_recompute_at {
+                idle_wait = idle_wait.min(deadline.saturating_duration_since(Instant::now()));
+            }
             select_biased! {
                 recv(self.command_rx) -> command => {
                     match command {
@@ -797,6 +804,7 @@ impl EngineState {
         self.mesh_cancel.cancel();
         self.mesh_background_cancel.cancel();
         self.leak_light_cancel.cancel();
+        self.leak_light_recompute_at = None;
     }
 
     fn handle_command(&mut self, command: EngineCommand) {
@@ -890,10 +898,14 @@ impl EngineState {
         self.leak_light_generation = self.leak_light_generation.saturating_add(1);
         self.leak_light_requested = enabled;
         if !enabled {
+            self.leak_light_recompute_at = None;
             self.emit_leak_light_status(LeakLightStatus::Off);
             return;
         }
-        if let Some(field) = self.leak_distance_field.clone() {
+        let revision = self.document.as_ref().map(VolumeDocument::revision);
+        if let Some((cached_revision, field)) = self.leak_distance_field.clone()
+            && Some(cached_revision) == revision
+        {
             self.emit_leak_light_status(LeakLightStatus::Ready {
                 degraded: field.degraded(),
             });
@@ -903,6 +915,7 @@ impl EngineState {
     }
 
     fn start_leak_light_compute(&mut self) {
+        self.leak_light_recompute_at = None;
         let Some(document) = &self.document else {
             self.leak_light_requested = false;
             self.emit_leak_light_status(LeakLightStatus::Off);
@@ -911,7 +924,6 @@ impl EngineState {
         self.leak_light_cancel.cancel();
         self.leak_light_cancel = CancellationToken::default();
         self.leak_light_generation = self.leak_light_generation.saturating_add(1);
-        self.leak_distance_field = None;
         let generation = self.leak_light_generation;
         let epoch = self.epoch;
         let revision = document.revision();
@@ -940,6 +952,15 @@ impl EngineState {
         });
     }
 
+    fn start_scheduled_leak_light_compute(&mut self) {
+        if self
+            .leak_light_recompute_at
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.start_leak_light_compute();
+        }
+    }
+
     fn handle_leak_light_result(&mut self, result: LeakLightResult) {
         let (epoch, revision, generation, result) = result;
         if !self.leak_light_requested
@@ -955,12 +976,13 @@ impl EngineState {
         match result {
             Ok(field) => {
                 let field = Arc::new(field);
-                self.leak_distance_field = Some(Arc::clone(&field));
+                self.leak_distance_field = Some((revision, Arc::clone(&field)));
                 self.publish_leak_distance_field(field);
             }
             Err(AppError::Cancelled) => {}
             Err(error) => {
                 self.leak_light_requested = false;
+                self.leak_light_recompute_at = None;
                 self.emit_error(None, error);
                 self.emit_leak_light_status(LeakLightStatus::Off);
             }
@@ -1028,6 +1050,7 @@ impl EngineState {
                 self.stroke = None;
                 self.leak_light_requested = false;
                 self.leak_distance_field = None;
+                self.leak_light_recompute_at = None;
                 self.mesh_generations.clear();
                 self.reset_mesh_preview();
                 self.emit(EngineEvent::DocumentReplaced {
@@ -1168,6 +1191,7 @@ impl EngineState {
         self.document = None;
         self.leak_light_requested = false;
         self.leak_distance_field = None;
+        self.leak_light_recompute_at = None;
         self.epoch = self.epoch.saturating_add(1);
         self.mesh_dirty.configure([0; 3]);
         self.mesh_scan_grid = [0; 3];
@@ -1955,9 +1979,6 @@ impl EngineState {
     fn reset_mesh_preview(&mut self) {
         self.mesh_cancel.cancel();
         self.mesh_background_cancel.cancel();
-        if !self.leak_light_requested {
-            self.leak_distance_field = None;
-        }
         self.mesh_dirty.clear();
         self.mesh_live_chunks.clear();
         self.mesh_recovery_chunks.clear();
@@ -2003,7 +2024,8 @@ impl EngineState {
             index_to_world,
         });
         if self.leak_light_requested
-            && let Some(field) = self.leak_distance_field.clone()
+            && let Some((cached_revision, field)) = self.leak_distance_field.clone()
+            && cached_revision == revision
         {
             self.publish_leak_distance_field(field);
         }
@@ -2014,7 +2036,6 @@ impl EngineState {
         self.mesh_background_cancel.cancel();
         self.leak_light_cancel.cancel();
         self.leak_light_generation = self.leak_light_generation.saturating_add(1);
-        self.leak_distance_field = None;
         self.mesh_cancel = CancellationToken::default();
         self.mesh_background_cancel = CancellationToken::default();
         self.progressive_live_jobs.clear();
@@ -2034,7 +2055,8 @@ impl EngineState {
             chunks: invalidated,
         });
         if self.leak_light_requested {
-            self.start_leak_light_compute();
+            self.leak_light_recompute_at = Some(Instant::now() + LEAK_LIGHT_RECOMPUTE_DEBOUNCE);
+            self.emit_leak_light_status(LeakLightStatus::Computing);
         }
     }
 
@@ -4130,6 +4152,21 @@ mod tests {
             state.next_mesh_chunk(),
             Some((invalidated, MeshUpdatePriority::Live))
         );
+    }
+
+    #[test]
+    fn leak_light_recompute_waits_for_the_edit_debounce() {
+        let mut state = state_with_empty_document([32, 1, 1]);
+        state.leak_light_requested = true;
+        let before = Instant::now();
+
+        state.restart_mesh_after_change(vec![ChunkCoord::new(0, 0, 0)], 2);
+
+        let deadline = state
+            .leak_light_recompute_at
+            .expect("an enabled leak light must schedule a refresh");
+        assert!(deadline >= before + LEAK_LIGHT_RECOMPUTE_DEBOUNCE);
+        assert!(deadline <= Instant::now() + LEAK_LIGHT_RECOMPUTE_DEBOUNCE);
     }
 
     #[test]

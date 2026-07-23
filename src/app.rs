@@ -657,10 +657,6 @@ impl VoxelInkApp {
                     {
                         self.bridge_commit = None;
                     }
-                    self.scene.set_leak_light(matches!(
-                        self.leak_light_status,
-                        LeakLightStatus::Ready { .. }
-                    ));
                 }
                 EngineEvent::DocumentReplaced {
                     epoch,
@@ -927,8 +923,7 @@ impl VoxelInkApp {
                         self.leak_light_requested = false;
                     }
                     self.leak_light_status = status;
-                    self.scene
-                        .set_leak_light(matches!(status, LeakLightStatus::Ready { .. }));
+                    self.scene.set_leak_light(self.leak_light_requested);
                     if matches!(status, LeakLightStatus::Ready { degraded: true }) {
                         self.preview_notice = Some(
                             "Leak light kept exact connectivity but simplified its brightness gradient at the memory limit."
@@ -1182,7 +1177,7 @@ impl VoxelInkApp {
     }
 
     fn configure_leak_light(&mut self, enabled: bool) {
-        self.scene.set_leak_light(false);
+        self.scene.set_leak_light(enabled);
         self.leak_light_requested = enabled;
         self.leak_light_status = if enabled {
             LeakLightStatus::Computing
@@ -1972,12 +1967,27 @@ impl VoxelInkApp {
                                 {
                                     ui.ctx().request_repaint();
                                 }
+                                let previous_available = self.scene.leak_distance_available();
+                                let editing = self.stroke.is_some() || self.bridge_commit.is_some();
                                 ui.label(
                                     egui::RichText::new(match self.leak_light_status {
                                         LeakLightStatus::Off => "Leak light is off.",
+                                        _ if editing && previous_available => {
+                                            "Editing… showing previous leak result."
+                                        }
+                                        LeakLightStatus::Computing if previous_available => {
+                                            "Updating leak paths… showing previous result."
+                                        }
                                         LeakLightStatus::Computing => "Computing leak paths…",
                                         LeakLightStatus::Preparing => {
                                             "Preparing leak-light shading…"
+                                        }
+                                        LeakLightStatus::Ready { .. }
+                                            if self.gpu_renderer_available
+                                                && !self.scene.leak_distance_ready()
+                                                && previous_available =>
+                                        {
+                                            "Updating leak-light shading… showing previous result."
                                         }
                                         LeakLightStatus::Ready { .. }
                                             if self.gpu_renderer_available
@@ -3798,7 +3808,6 @@ impl VoxelInkApp {
             initial_sample,
             cancel: cancel.clone(),
         }) {
-            self.scene.set_leak_light(false);
             self.stroke = Some(UiStroke {
                 edit_id,
                 space,
@@ -3892,7 +3901,6 @@ impl VoxelInkApp {
             cancel: commit.cancel.clone(),
         }) {
             Ok(()) => {
-                self.scene.set_leak_light(false);
                 if let Some(queued) = self
                     .bridge_commit
                     .as_mut()
