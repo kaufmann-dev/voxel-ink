@@ -2006,6 +2006,36 @@ impl VoxelInkApp {
                                     .color(MUTED),
                                 );
                             }
+                            if !self.leak_light_requested
+                                && self.leak_light_status != LeakLightStatus::Off
+                            {
+                                let previous_available = self.scene.leak_distance_available();
+                                ui.label(
+                                    egui::RichText::new(match self.leak_light_status {
+                                        LeakLightStatus::Computing if previous_available => {
+                                            "Updating leak paths in the background…"
+                                        }
+                                        LeakLightStatus::Computing => {
+                                            "Computing leak paths in the background…"
+                                        }
+                                        LeakLightStatus::Preparing => {
+                                            "Preparing leak-light shading in the background…"
+                                        }
+                                        LeakLightStatus::Ready { .. }
+                                            if self.gpu_renderer_available
+                                                && !self.scene.leak_distance_ready() =>
+                                        {
+                                            "Preparing leak-light shading in the background…"
+                                        }
+                                        LeakLightStatus::Ready { .. } => {
+                                            "Leak light is ready to show."
+                                        }
+                                        LeakLightStatus::Off => unreachable!(),
+                                    })
+                                    .small()
+                                    .color(MUTED),
+                                );
+                            }
                         });
                         view_card.response.widget_info(|| {
                             egui::WidgetInfo::labeled(

@@ -797,7 +797,7 @@ fn load_single_chunk(occupancy: Vec<u8>) -> (EngineHandle, u64, MeshJobTag, Vec<
 }
 
 #[test]
-fn leak_light_is_non_mutating_and_prepares_distances_without_remeshing() {
+fn leak_light_precomputes_without_mutating_or_remeshing_the_document() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("leak-light.binvox");
     let dimensions = [7, 7, 7];
@@ -818,17 +818,6 @@ fn leak_light_is_non_mutating_and_prepares_distances_without_remeshing() {
         unreachable!()
     };
     let original_count = summary.occupied_count;
-    let _baseline = wait_for_event(&engine, |event| {
-        matches!(
-            event,
-            EngineEvent::MeshChunk { tag, .. }
-                if tag.document_epoch == epoch && tag.revision == summary.revision
-        )
-    });
-    engine
-        .send(EngineCommand::ConfigureLeakLight { enabled: true })
-        .unwrap();
-
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut saw_computing = false;
     let mut saw_preparing = false;
@@ -861,19 +850,6 @@ fn leak_light_is_non_mutating_and_prepares_distances_without_remeshing() {
                     status: LeakLightStatus::Ready { .. },
                     ..
                 } if event_epoch == epoch => break,
-                EngineEvent::MeshReset {
-                    epoch: event_epoch, ..
-                }
-                | EngineEvent::MeshChunk {
-                    tag:
-                        voxel_ink::mesh::MeshJobTag {
-                            document_epoch: event_epoch,
-                            ..
-                        },
-                    ..
-                } if event_epoch == epoch => {
-                    panic!("leak-light activation must not rebuild geometry")
-                }
                 EngineEvent::Summary { summary, .. } => {
                     assert_eq!(summary.occupied_count, original_count);
                     assert_eq!(summary.revision, 1);
@@ -890,6 +866,20 @@ fn leak_light_is_non_mutating_and_prepares_distances_without_remeshing() {
     assert!(saw_computing);
     assert!(saw_preparing);
     assert!(saw_field);
+
+    engine
+        .send(EngineCommand::ConfigureLeakLight { enabled: true })
+        .unwrap();
+    let _ready = wait_for_event(&engine, |event| {
+        matches!(
+            event,
+            EngineEvent::LeakLightStatus {
+                epoch: event_epoch,
+                status: LeakLightStatus::Ready { .. },
+                ..
+            } if *event_epoch == epoch
+        )
+    });
 
     engine
         .send(EngineCommand::ConfigureLeakLight { enabled: false })
@@ -921,12 +911,12 @@ fn leak_light_is_non_mutating_and_prepares_distances_without_remeshing() {
                     status: LeakLightStatus::Computing,
                     ..
                 } if event_epoch == epoch => {
-                    panic!("re-enabling an unchanged revision recomputed topology")
+                    panic!("enabling a precomputed revision recomputed topology")
                 }
                 EngineEvent::LeakDistanceField {
                     epoch: event_epoch, ..
                 } if event_epoch == epoch => {
-                    panic!("re-enabling an unchanged revision re-streamed distances")
+                    panic!("enabling a precomputed revision re-streamed distances")
                 }
                 EngineEvent::MeshReset {
                     epoch: event_epoch, ..
@@ -939,7 +929,7 @@ fn leak_light_is_non_mutating_and_prepares_distances_without_remeshing() {
                         },
                     ..
                 } if event_epoch == epoch => {
-                    panic!("re-enabling an unchanged revision rebuilt geometry")
+                    panic!("enabling a precomputed revision rebuilt geometry")
                 }
                 _ => {}
             }

@@ -842,10 +842,12 @@ fn leak_light_control_prepares_once_and_reach_changes_immediately() {
     for _ in 0..3 {
         harness.step();
     }
+    wait_for_label(&mut harness, "Leak light is ready to show.");
     harness
         .get_by_label("Show leak light (C)")
         .click_accesskit();
     wait_for_label(&mut harness, "Leak light is ready.");
+    assert!(harness.query_by_label("Computing leak paths…").is_none());
     assert_eq!(
         harness
             .get_by_label("Show leak light (C)")
