@@ -1027,7 +1027,7 @@ impl VoxelInkApp {
             if has_edit_interaction {
                 self.cancel_edit_interaction();
             } else {
-                self.maximized_pane = None;
+                self.set_maximized_pane(None);
             }
             ctx.request_repaint();
         }
@@ -2482,8 +2482,8 @@ impl VoxelInkApp {
         });
         if maximize_response.clicked() {
             self.active_slice = axis;
-            self.maximized_pane = if maximized { None } else { Some(pane) };
-            ui.ctx().request_repaint();
+            self.set_maximized_pane(if maximized { None } else { Some(pane) });
+            return;
         }
         let fit_button_rect = egui::Rect::from_min_size(
             egui::pos2(button_rect.left() - 47.0, header_controls.top()),
@@ -2850,8 +2850,8 @@ impl VoxelInkApp {
             )
         });
         if maximize_response.clicked() {
-            self.maximized_pane = if maximized { None } else { Some(pane) };
-            ui.ctx().request_repaint();
+            self.set_maximized_pane(if maximized { None } else { Some(pane) });
+            return;
         }
         let reset_width = 58.0;
         let reset_rect = egui::Rect::from_min_size(
@@ -3216,7 +3216,7 @@ impl VoxelInkApp {
             }
         };
         let space = StrokeSpace::Volume3D;
-        if (view_mode == VolumeViewMode::Fly
+        if ((view_mode == VolumeViewMode::Fly && self.fly_captured)
             || response.hovered()
             || response.dragged_by(egui::PointerButton::Primary))
             && self.stroke.is_none()
@@ -3535,10 +3535,18 @@ impl VoxelInkApp {
         if self.last_preview_request == Some(template) {
             return;
         }
+        let retain_slice_preview = matches!(
+            (
+                self.last_preview_request.map(preview_request_space),
+                preview_request_space(template),
+            ),
+            (Some(StrokeSpace::Slice(_)), StrokeSpace::Slice(_),)
+        );
         self.brush_preview_generation = self.brush_preview_generation.saturating_add(1);
-        if self.brush_preview_kind.is_some()
-            || self.brush_preview_target.is_some()
-            || !self.brush_preview_voxels.is_empty()
+        if !retain_slice_preview
+            && (self.brush_preview_kind.is_some()
+                || self.brush_preview_target.is_some()
+                || !self.brush_preview_voxels.is_empty())
         {
             self.discard_current_brush_preview();
         }
@@ -3760,6 +3768,19 @@ impl VoxelInkApp {
         self.pending_preview = None;
         self.deferred_bridge_release = None;
         self.discard_current_brush_preview();
+    }
+
+    fn set_maximized_pane(&mut self, pane: Option<WorkspacePane>) {
+        if self.maximized_pane == pane {
+            return;
+        }
+        if self.has_edit_interaction() {
+            self.cancel_edit_interaction();
+        } else {
+            self.clear_brush_preview();
+        }
+        self.maximized_pane = pane;
+        self.egui_ctx.request_repaint();
     }
 
     fn cancel_edit_interaction(&mut self) {
@@ -4822,6 +4843,14 @@ fn preview_with_generation(request: BrushPreviewRequest, generation: u64) -> Bru
     }
 }
 
+const fn preview_request_space(request: BrushPreviewRequest) -> StrokeSpace {
+    match request {
+        BrushPreviewRequest::Brush { space, .. } | BrushPreviewRequest::Bridge { space, .. } => {
+            space
+        }
+    }
+}
+
 fn slice_physical_aspect(axis: SliceAxis, width: u32, height: u32, spacing: [f64; 3]) -> f32 {
     let [horizontal_axis, vertical_axis] = match axis {
         SliceAxis::Axial => [0, 1],
@@ -5373,6 +5402,99 @@ mod tests {
         assert_eq!(app.brush_preview_kind, Some(VoxelHighlightKind::Erase));
         assert_eq!(app.brush_preview_target, Some([5, 3, 4]));
         assert_eq!(app.brush_preview_voxels, vec![[5, 3, 4]]);
+    }
+
+    #[test]
+    fn replacing_slice_hover_preview_keeps_valid_voxels_until_latest_result_arrives() {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size([1_200.0, 800.0])
+            .build_eframe(|creation_context| VoxelInkApp::new(creation_context, None));
+        let old_request = BrushPreviewRequest::Brush {
+            generation: 0,
+            tool: Tool::Paint,
+            spec: BrushSpec::default(),
+            space: StrokeSpace::Slice(SliceAxis::Axial),
+            sample: PointerSample::Slice {
+                axis: SliceAxis::Axial,
+                voxel: [2, 3, 4],
+            },
+        };
+        let replacement = BrushPreviewRequest::Brush {
+            generation: 0,
+            tool: Tool::Paint,
+            spec: BrushSpec::default(),
+            space: StrokeSpace::Slice(SliceAxis::Axial),
+            sample: PointerSample::Slice {
+                axis: SliceAxis::Axial,
+                voxel: [3, 3, 4],
+            },
+        };
+        let app = harness.state_mut();
+        app.brush_preview_generation = 7;
+        app.last_preview_request = Some(old_request);
+        app.brush_preview_kind = Some(VoxelHighlightKind::Paint);
+        app.brush_preview_target = Some([2, 3, 4]);
+        app.brush_preview_voxels = vec![[2, 3, 4], [2, 4, 4]];
+
+        app.request_brush_preview(replacement);
+
+        assert_eq!(app.brush_preview_generation, 8);
+        assert_eq!(app.last_preview_request, Some(replacement));
+        assert_eq!(app.brush_preview_kind, Some(VoxelHighlightKind::Paint));
+        assert_eq!(app.brush_preview_target, Some([2, 3, 4]));
+        assert_eq!(app.brush_preview_voxels, vec![[2, 3, 4], [2, 4, 4]]);
+
+        app.accept_brush_preview(0, 0, 7, Tool::Paint, Some([8, 8, 8]), vec![[8, 8, 8]]);
+        assert_eq!(
+            app.brush_preview_voxels,
+            vec![[2, 3, 4], [2, 4, 4]],
+            "the superseded result must not replace the retained slice preview"
+        );
+
+        app.accept_brush_preview(0, 0, 8, Tool::Paint, Some([3, 3, 4]), vec![[3, 3, 4]]);
+        assert_eq!(app.brush_preview_target, Some([3, 3, 4]));
+        assert_eq!(app.brush_preview_voxels, vec![[3, 3, 4]]);
+    }
+
+    #[test]
+    fn changing_workspace_layout_invalidates_in_flight_3d_preview_work() {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size([1_200.0, 800.0])
+            .build_eframe(|creation_context| VoxelInkApp::new(creation_context, None));
+        let request = BrushPreviewRequest::Brush {
+            generation: 0,
+            tool: Tool::Erase,
+            spec: BrushSpec::default(),
+            space: StrokeSpace::Volume3D,
+            sample: PointerSample::Ray {
+                ray: Ray {
+                    origin: [0.0, 0.0, 0.0],
+                    direction: [1.0, 0.0, 0.0],
+                },
+            },
+        };
+        let app = harness.state_mut();
+        app.maximized_pane = Some(WorkspacePane::Volume3D);
+        app.brush_preview_generation = 11;
+        app.last_preview_request = Some(request);
+        app.brush_preview_kind = Some(VoxelHighlightKind::Erase);
+        app.brush_preview_target = Some([2, 3, 4]);
+        app.brush_preview_voxels = vec![[2, 3, 4]];
+
+        app.set_maximized_pane(None);
+
+        assert_eq!(app.maximized_pane, None);
+        assert_eq!(app.brush_preview_generation, 12);
+        assert_eq!(app.last_preview_request, None);
+        assert_eq!(app.brush_preview_kind, None);
+        assert_eq!(app.brush_preview_target, None);
+        assert!(app.brush_preview_voxels.is_empty());
+
+        app.accept_brush_preview(0, 0, 11, Tool::Erase, Some([8, 8, 8]), vec![[8, 8, 8]]);
+        assert!(
+            app.brush_preview_voxels.is_empty(),
+            "a stale 3D result must not repopulate the restored slice workspace"
+        );
     }
 
     #[test]

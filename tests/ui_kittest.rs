@@ -578,6 +578,49 @@ fn slice_bridge_preview_keeps_anchor_and_path_visible_across_intersections() {
 }
 
 #[test]
+fn slice_tool_previews_recover_after_restoring_the_3d_view() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("slice-preview-after-3d.binvox");
+    let dimensions = [33, 33, 33];
+    let mut occupancy = vec![0; 33 * 33 * 33];
+    occupancy[16 + 33 * (16 + 33 * 16)] = 1;
+    write_binvox(&path, dimensions, &occupancy);
+    let mut harness = app_harness(Some(path));
+    wait_for_label(&mut harness, "33 × 33 × 33");
+    harness.get_by_label("Fly view").click_accesskit();
+    harness.step();
+    let pane_labels = [
+        "Axial slice editor",
+        "Coronal slice editor",
+        "Sagittal slice editor",
+    ];
+
+    for (tool_key, kind) in [
+        (egui::Key::B, VoxelHighlightKind::Paint),
+        (egui::Key::E, VoxelHighlightKind::Erase),
+        (egui::Key::L, VoxelHighlightKind::BridgeAnchor),
+    ] {
+        harness.key_press(tool_key);
+        harness.step();
+        harness.get_by_label("Full screen 3D").click_accesskit();
+        harness.step();
+        harness.step();
+        let volume = harness.get_by_label("Interactive 3D volume editor").rect();
+        harness.hover_at(volume.center());
+        harness.step();
+
+        harness.get_by_label("Restore four views").click_accesskit();
+        harness.step();
+        harness.step();
+        let axial = harness
+            .get_by_role_and_label(Role::Image, pane_labels[0])
+            .rect();
+        harness.hover_at(axial.center());
+        wait_for_slice_preview_kind(&mut harness, kind, &pane_labels, Duration::from_secs(3));
+    }
+}
+
+#[test]
 fn loaded_document_has_synchronized_named_panes_and_keyboard_editing() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("keyboard.binvox");
