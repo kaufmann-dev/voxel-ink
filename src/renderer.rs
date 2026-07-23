@@ -452,6 +452,23 @@ fn highlight_fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+const DEPTH_RESET_SHADER: &str = r#"
+@vertex
+fn depth_reset_vertex(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4<f32> {
+    let positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0),
+    );
+    return vec4<f32>(positions[vertex_index], 0.0, 1.0);
+}
+
+@fragment
+fn depth_reset_fragment() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0);
+}
+"#;
+
 const MAX_GPU_UPDATES_PER_FRAME: usize = 4;
 const MAX_LEAK_DISTANCE_CHUNKS_PER_FRAME: usize = 2;
 const LEAK_COMPUTE_WORKGROUP_SIZE: u32 = 64;
@@ -463,6 +480,7 @@ const MAX_CHUNK_QUAD_BYTES: u64 = MAX_CHUNK_QUADS * size_of::<CompactQuad>() as 
 const MAX_CHUNK_LEAK_WORKGROUPS: u32 =
     MAX_CHUNK_QUADS.div_ceil(LEAK_COMPUTE_WORKGROUP_SIZE as u64) as u32;
 pub const MSAA_SAMPLES: u32 = 4;
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const ORBIT_FIELD_OF_VIEW_RADIANS: f32 = 45_f32.to_radians();
 const FLY_FIELD_OF_VIEW_RADIANS: f32 = 70_f32.to_radians();
 const FLY_LOOK_SENSITIVITY: f32 = 0.0025;
@@ -571,15 +589,25 @@ fn highlight_color_target(format: wgpu::TextureFormat) -> wgpu::ColorTargetState
 
 fn highlight_depth_stencil_state() -> wgpu::DepthStencilState {
     wgpu::DepthStencilState {
-        format: wgpu::TextureFormat::Depth24Plus,
+        format: DEPTH_FORMAT,
         depth_write_enabled: Some(false),
-        depth_compare: Some(wgpu::CompareFunction::LessEqual),
+        depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
         stencil: wgpu::StencilState::default(),
         bias: wgpu::DepthBiasState {
-            constant: -64,
+            constant: 64,
             slope_scale: 0.0,
             clamp: 0.0,
         },
+    }
+}
+
+fn volume_depth_stencil_state() -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        format: DEPTH_FORMAT,
+        depth_write_enabled: Some(true),
+        depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState::default(),
     }
 }
 
@@ -1450,8 +1478,8 @@ impl SceneBridge {
         let state = self.state.lock().expect("3D scene state poisoned");
         let (view, projection, _, _, _, eye, forward) = scene_camera(&state);
         let inverse = (projection * view).inverse();
-        let far = inverse.project_point3(Vec3::new(normalized[0], normalized[1], 1.0));
-        let direction = (far - eye).try_normalize().unwrap_or(forward);
+        let near = inverse.project_point3(Vec3::new(normalized[0], normalized[1], 1.0));
+        let direction = (near - eye).try_normalize().unwrap_or(forward);
         Ray {
             origin: eye.as_dvec3().to_array(),
             direction: direction.as_dvec3().to_array(),
@@ -1745,6 +1773,8 @@ impl CallbackTrait for VolumePaintCallback {
         let Some(renderer) = resources.get::<GpuVolumeRenderer>() else {
             return;
         };
+        render_pass.set_pipeline(&renderer.depth_reset_pipeline);
+        render_pass.draw(0..3, 0..1);
         render_pass.set_bind_group(0, &renderer.bind_group, &[]);
         for chunk in renderer.chunks.values() {
             if !chunk.visible {
@@ -1831,6 +1861,7 @@ impl ChunkVisibilityView {
 }
 
 struct GpuVolumeRenderer {
+    depth_reset_pipeline: wgpu::RenderPipeline,
     pipeline: wgpu::RenderPipeline,
     leak_pipeline: wgpu::RenderPipeline,
     highlight_pipeline: wgpu::RenderPipeline,
@@ -1897,6 +1928,48 @@ impl GpuVolumeRenderer {
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
+        let depth_reset_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("VoxelInk reverse-Z depth reset shader"),
+            source: wgpu::ShaderSource::Wgsl(DEPTH_RESET_SHADER.into()),
+        });
+        let depth_reset_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("VoxelInk reverse-Z depth reset pipeline"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &depth_reset_shader,
+                entry_point: Some("depth_reset_vertex"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &depth_reset_shader,
+                entry_point: Some("depth_reset_fragment"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::empty(),
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: MSAA_SAMPLES,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: None,
+        });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("VoxelInk compact quad pipeline"),
             layout: Some(&pipeline_layout),
@@ -1936,13 +2009,7 @@ impl GpuVolumeRenderer {
                 cull_mode: None,
                 ..Default::default()
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24Plus,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
+            depth_stencil: Some(volume_depth_stencil_state()),
             multisample: wgpu::MultisampleState {
                 count: MSAA_SAMPLES,
                 mask: !0,
@@ -2001,13 +2068,7 @@ impl GpuVolumeRenderer {
                 cull_mode: None,
                 ..Default::default()
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24Plus,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
+            depth_stencil: Some(volume_depth_stencil_state()),
             multisample: wgpu::MultisampleState {
                 count: MSAA_SAMPLES,
                 mask: !0,
@@ -2134,6 +2195,7 @@ impl GpuVolumeRenderer {
             }
         });
         Self {
+            depth_reset_pipeline,
             pipeline,
             leak_pipeline,
             highlight_pipeline,
@@ -2895,11 +2957,10 @@ fn orbit_camera(state: &SceneState, bounds: SceneBounds) -> (Vec3, Vec3, Mat4, M
     let view = Mat4::look_at_rh(eye, bounds.center, Vec3::Z);
     let projection =
         Mat4::from_translation(Vec3::new(state.orbit.pan_ndc.x, state.orbit.pan_ndc.y, 0.0))
-            * Mat4::perspective_rh(
+            * Mat4::perspective_infinite_reverse_rh(
                 ORBIT_FIELD_OF_VIEW_RADIANS,
                 state.aspect,
                 bounds.radius * 0.01,
-                bounds.radius * 12.0,
             );
     (eye, forward, view, projection)
 }
@@ -2908,8 +2969,10 @@ fn fly_camera_from_orbit(state: &SceneState) -> FlyCameraState {
     let bounds = scene_bounds(state);
     let (position, fallback_forward, view, projection) = orbit_camera(state, bounds);
     let inverse = (projection * view).inverse();
-    let far = inverse.project_point3(Vec3::new(0.0, 0.0, 1.0));
-    let forward = (far - position).try_normalize().unwrap_or(fallback_forward);
+    let near = inverse.project_point3(Vec3::new(0.0, 0.0, 1.0));
+    let forward = (near - position)
+        .try_normalize()
+        .unwrap_or(fallback_forward);
     let yaw = forward.y.atan2(forward.x);
     let pitch = forward
         .z
@@ -2985,9 +3048,12 @@ fn scene_camera(state: &SceneState) -> (Mat4, Mat4, Mat4, f32, f32, Vec3, Vec3) 
         (VolumeViewMode::Fly, Some(fly)) => {
             let forward = fly_forward(fly.yaw, fly.pitch);
             let view = Mat4::look_at_rh(fly.position, fly.position + forward, Vec3::Z);
-            let (near, far) = fly_clip_planes(view, bounds);
-            let projection =
-                Mat4::perspective_rh(FLY_FIELD_OF_VIEW_RADIANS, state.aspect, near, far);
+            let (near, _) = fly_clip_planes(view, bounds);
+            let projection = Mat4::perspective_infinite_reverse_rh(
+                FLY_FIELD_OF_VIEW_RADIANS,
+                state.aspect,
+                near,
+            );
             (fly.position, forward, view, projection)
         }
         _ => orbit_camera(state, bounds),
@@ -3216,6 +3282,13 @@ mod tests {
     fn production_renderer_uses_four_sample_msaa() {
         assert_eq!(MSAA_SAMPLES, 4);
         assert!(MSAA_SAMPLES.is_power_of_two());
+        assert_eq!(DEPTH_FORMAT, wgpu::TextureFormat::Depth32Float);
+        assert_eq!(
+            volume_depth_stencil_state().depth_compare,
+            Some(wgpu::CompareFunction::GreaterEqual)
+        );
+        assert_eq!(volume_depth_stencil_state().depth_write_enabled, Some(true));
+        assert!(DEPTH_RESET_SHADER.contains("vec4<f32>(positions[vertex_index], 0.0, 1.0)"));
         assert_eq!(size_of::<Uniforms>(), 304);
     }
 
@@ -3390,6 +3463,36 @@ mod tests {
     }
 
     #[test]
+    fn orbit_and_fly_use_infinite_reverse_z_projection() {
+        let mut state = SceneState::default();
+        let bounds = scene_bounds(&state);
+        let (orbit_view, orbit_projection, _, _, _, orbit_eye, orbit_forward) =
+            scene_camera(&state);
+        let orbit_near = bounds.radius * 0.01;
+        let orbit_near_depth = (orbit_projection * orbit_view)
+            .project_point3(orbit_eye + orbit_forward * orbit_near)
+            .z;
+        let orbit_far_depth = (orbit_projection * orbit_view)
+            .project_point3(orbit_eye + orbit_forward * bounds.radius * 10.0)
+            .z;
+        assert!((orbit_near_depth - 1.0).abs() < 1.0e-5);
+        assert!(orbit_far_depth > 0.0 && orbit_far_depth < orbit_near_depth);
+
+        state.fly = Some(fly_camera_from_orbit(&state));
+        state.view_mode = VolumeViewMode::Fly;
+        let (fly_view, fly_projection, _, _, _, fly_eye, fly_forward) = scene_camera(&state);
+        let (fly_near, _) = fly_clip_planes(fly_view, bounds);
+        let fly_near_depth = (fly_projection * fly_view)
+            .project_point3(fly_eye + fly_forward * fly_near)
+            .z;
+        let fly_far_depth = (fly_projection * fly_view)
+            .project_point3(fly_eye + fly_forward * bounds.radius * 10.0)
+            .z;
+        assert!((fly_near_depth - 1.0).abs() < 1.0e-5);
+        assert!(fly_far_depth > 0.0 && fly_far_depth < fly_near_depth);
+    }
+
+    #[test]
     fn highlight_pipeline_alpha_blends_without_writing_depth() {
         assert_eq!(
             highlight_color_target(wgpu::TextureFormat::Bgra8UnormSrgb).blend,
@@ -3401,9 +3504,10 @@ mod tests {
         );
         assert_eq!(
             highlight_depth_stencil_state().depth_compare,
-            Some(wgpu::CompareFunction::LessEqual)
+            Some(wgpu::CompareFunction::GreaterEqual)
         );
-        assert_eq!(highlight_depth_stencil_state().bias.constant, -64);
+        assert_eq!(highlight_depth_stencil_state().format, DEPTH_FORMAT);
+        assert_eq!(highlight_depth_stencil_state().bias.constant, 64);
         assert_eq!(highlight_depth_stencil_state().bias.slope_scale, 0.0);
         assert!(VOXEL_HIGHLIGHT_SHADER.contains("230.0 / 255.0"));
         assert!(!VOXEL_HIGHLIGHT_SHADER.contains("0.0, 0.82, 1.0"));
@@ -4490,6 +4594,300 @@ mod tests {
     }
 
     #[test]
+    fn headless_software_vulkan_keeps_the_nearer_thin_sheet_at_long_fly_range() {
+        if std::env::var_os("VOXEL_INK_REQUIRE_SOFTWARE_VULKAN").is_none() {
+            eprintln!("set VOXEL_INK_REQUIRE_SOFTWARE_VULKAN=1 to exercise Mesa Vulkan");
+            return;
+        }
+
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::VULKAN;
+        let instance = wgpu::Instance::new(descriptor);
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            force_fallback_adapter: true,
+            compatible_surface: None,
+        }))
+        .expect("Mesa software Vulkan adapter must be available");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("software Vulkan device must initialize");
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut renderer = GpuVolumeRenderer::new(&device, format, false);
+        let coordinate = ChunkCoord::new(0, 0, 0);
+        renderer.apply_update(
+            &device,
+            &queue,
+            SceneUpdate::Reset {
+                epoch: 1,
+                revision: 1,
+                dimensions: [1, 1, 4_096],
+                affine: SceneState::default().affine,
+            },
+        );
+        let quads = [
+            CompactQuad::new_with_shading_normal(
+                [0, 0, 1],
+                1,
+                1,
+                crate::mesh::FaceAxis::Z,
+                true,
+                [0; 4],
+                Vec3::Z.to_array(),
+            )
+            .unwrap(),
+            CompactQuad::new_with_shading_normal(
+                [0, 0, 0],
+                1,
+                1,
+                crate::mesh::FaceAxis::Z,
+                true,
+                [0; 4],
+                Vec3::NEG_Z.to_array(),
+            )
+            .unwrap(),
+        ];
+        renderer.apply_update(
+            &device,
+            &queue,
+            SceneUpdate::Chunk {
+                tag: MeshJobTag {
+                    document_epoch: 1,
+                    revision: 1,
+                    chunk_generation: 1,
+                    edit_generation: 0,
+                    chunk: coordinate,
+                },
+                // Draw the nearer bright face first and the farther dark face
+                // second. Conventional 24-bit depth collapses these one-unit-
+                // separated surfaces at this range and lets the later face win.
+                quads: quads.to_vec(),
+                priority: MeshUpdatePriority::Background,
+            },
+        );
+        let mut leak_renderer = GpuVolumeRenderer::new(&device, format, false);
+        leak_renderer.apply_update(
+            &device,
+            &queue,
+            SceneUpdate::Reset {
+                epoch: 1,
+                revision: 1,
+                dimensions: [1, 1, 4_096],
+                affine: SceneState::default().affine,
+            },
+        );
+        leak_renderer.apply_update(
+            &device,
+            &queue,
+            SceneUpdate::Chunk {
+                tag: MeshJobTag {
+                    document_epoch: 1,
+                    revision: 1,
+                    chunk_generation: 1,
+                    edit_generation: 0,
+                    chunk: coordinate,
+                },
+                quads: quads.to_vec(),
+                priority: MeshUpdatePriority::Background,
+            },
+        );
+        let leak_distances = [
+            PackedLeakDistance::new([0; 4]).unwrap(),
+            PackedLeakDistance::new([20; 4]).unwrap(),
+        ];
+        leak_renderer
+            .chunks
+            .get_mut(&coordinate)
+            .unwrap()
+            .leak_distance = Some(
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("distant thin-sheet leak distances"),
+                contents: bytemuck::cast_slice(&leak_distances),
+                usage: wgpu::BufferUsages::VERTEX,
+            }),
+        );
+
+        let index_to_world = Mat4::from_scale(Vec3::new(2_048.0, 2_048.0, 1.0))
+            * Mat4::from_translation(Vec3::new(0.0, 0.0, -4_096.0));
+        let projection =
+            Mat4::perspective_infinite_reverse_rh(FLY_FIELD_OF_VIEW_RADIANS, 1.0, 0.01);
+        let uniforms = Uniforms {
+            view_projection: projection.to_cols_array_2d(),
+            index_to_world: index_to_world.to_cols_array_2d(),
+            index_normal_to_view: normal_matrix(index_to_world).to_cols_array_2d(),
+            leak_half_distance: 1.0,
+            leak_distance_scale: 0.1,
+            voxel_seams: 0,
+            ..Uniforms::default()
+        };
+        queue.write_buffer(&renderer.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        let leak_uniforms = Uniforms {
+            leak_light: 1,
+            ..uniforms
+        };
+        queue.write_buffer(
+            &leak_renderer.uniform_buffer,
+            0,
+            bytemuck::bytes_of(&leak_uniforms),
+        );
+
+        const PANE_SIZE: u32 = 64;
+        const WIDTH: u32 = PANE_SIZE * 2;
+        const HEIGHT: u32 = PANE_SIZE;
+        let multisampled_color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("distant thin-sheet multisampled color"),
+            size: wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: MSAA_SAMPLES,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let resolved_color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("distant thin-sheet resolved color"),
+            size: wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("distant thin-sheet depth"),
+            size: wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: MSAA_SAMPLES,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let multisampled_view = multisampled_color.create_view(&Default::default());
+        let resolved_view = resolved_color.create_view(&Default::default());
+        let depth_view = depth.create_view(&Default::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("distant thin-sheet encoder"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("distant thin-sheet pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &multisampled_view,
+                    depth_slice: None,
+                    resolve_target: Some(&resolved_view),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Discard,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        // Match egui's shared render pass. The renderer resets
+                        // each pane to the reverse-Z far value before drawing.
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            for pane in 0..2 {
+                let x = pane * PANE_SIZE;
+                pass.set_viewport(x as f32, 0.0, PANE_SIZE as f32, PANE_SIZE as f32, 0.0, 1.0);
+                pass.set_scissor_rect(x, 0, PANE_SIZE, PANE_SIZE);
+                pass.set_pipeline(&renderer.depth_reset_pipeline);
+                pass.draw(0..3, 0..1);
+                if pane == 0 {
+                    let chunk = renderer.chunks.get(&coordinate).unwrap();
+                    pass.set_bind_group(0, &renderer.bind_group, &[]);
+                    pass.set_pipeline(&renderer.pipeline);
+                    pass.set_vertex_buffer(0, chunk.buffer.slice(..));
+                    pass.draw(0..6, 0..chunk.instances);
+                } else {
+                    let chunk = leak_renderer.chunks.get(&coordinate).unwrap();
+                    pass.set_bind_group(0, &leak_renderer.bind_group, &[]);
+                    pass.set_pipeline(&leak_renderer.leak_pipeline);
+                    pass.set_vertex_buffer(1, chunk.leak_distance.as_ref().unwrap().slice(..));
+                    pass.set_vertex_buffer(0, chunk.buffer.slice(..));
+                    pass.draw(0..6, 0..chunk.instances);
+                }
+            }
+        }
+
+        let bytes_per_row = WIDTH * size_of::<u32>() as u32;
+        let output = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("distant thin-sheet readback"),
+            size: u64::from(bytes_per_row * HEIGHT),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            resolved_color.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &output,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+        );
+        let submission = queue.submit([encoder.finish()]);
+        let slice = output.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(std::time::Duration::from_secs(10)),
+            })
+            .expect("software Vulkan distant thin-sheet render must complete");
+        receiver
+            .recv()
+            .expect("readback callback must run")
+            .expect("distant thin-sheet readback buffer must map");
+        let pixels = slice.get_mapped_range();
+        let sample = |x: u32| {
+            let offset = ((HEIGHT / 2 * WIDTH + x) * 4) as usize;
+            [pixels[offset], pixels[offset + 1], pixels[offset + 2]]
+        };
+        let normal = sample(PANE_SIZE / 2);
+        let leak = sample(PANE_SIZE + PANE_SIZE / 2);
+        assert!(
+            normal.into_iter().map(u16::from).sum::<u16>() > 230,
+            "the farther dark face replaced the nearer surface: {normal:?}"
+        );
+        assert!(
+            leak[0] > 180 && leak[1] > 180 && leak[2] > 50,
+            "the farther leak-light face replaced the nearer zero-distance surface: {leak:?}"
+        );
+    }
+
+    #[test]
     fn headless_software_vulkan_keeps_close_coplanar_highlights_rectangular() {
         if std::env::var_os("VOXEL_INK_REQUIRE_SOFTWARE_VULKAN").is_none() {
             eprintln!("set VOXEL_INK_REQUIRE_SOFTWARE_VULKAN=1 to exercise Mesa Vulkan");
@@ -4581,7 +4979,8 @@ mod tests {
         let normal = affine.transform_vector3(Vec3::Z).normalize();
         let eye = target - tangent * 5.0 + normal * 2.0;
         let view = Mat4::look_at_rh(eye, target, normal);
-        let projection = Mat4::perspective_rh(FLY_FIELD_OF_VIEW_RADIANS, 1.0, 0.01, 1_000.0);
+        let projection =
+            Mat4::perspective_infinite_reverse_rh(FLY_FIELD_OF_VIEW_RADIANS, 1.0, 0.01);
         let uniforms = Uniforms {
             view_projection: (projection * view).to_cols_array_2d(),
             index_to_world: affine.to_cols_array_2d(),
@@ -4629,7 +5028,7 @@ mod tests {
             mip_level_count: 1,
             sample_count: MSAA_SAMPLES,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth24Plus,
+            format: DEPTH_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
@@ -4663,6 +5062,8 @@ mod tests {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            pass.set_pipeline(&renderer.depth_reset_pipeline);
+            pass.draw(0..3, 0..1);
             pass.set_pipeline(&renderer.pipeline);
             pass.set_bind_group(0, &renderer.bind_group, &[]);
             for chunk in renderer.chunks.values() {
@@ -4879,7 +5280,7 @@ mod tests {
             mip_level_count: 1,
             sample_count: MSAA_SAMPLES,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth24Plus,
+            format: DEPTH_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
@@ -4913,6 +5314,8 @@ mod tests {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            pass.set_pipeline(&renderer.depth_reset_pipeline);
+            pass.draw(0..3, 0..1);
             let chunk = renderer.chunks.get(&coordinate).unwrap();
             pass.set_pipeline(&renderer.pipeline);
             pass.set_bind_group(0, &renderer.bind_group, &[]);
@@ -5646,7 +6049,7 @@ mod tests {
             mip_level_count: 1,
             sample_count: MSAA_SAMPLES,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth24Plus,
+            format: DEPTH_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
@@ -5680,6 +6083,8 @@ mod tests {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            pass.set_pipeline(&renderer.depth_reset_pipeline);
+            pass.draw(0..3, 0..1);
             let chunk = renderer.chunks.get(&coordinate).unwrap();
             pass.set_pipeline(&renderer.leak_pipeline);
             pass.set_bind_group(0, &renderer.bind_group, &[]);

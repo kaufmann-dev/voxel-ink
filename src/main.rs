@@ -57,7 +57,7 @@ fn main() -> eframe::Result {
             .with_icon(icon),
         renderer: eframe::Renderer::Wgpu,
         multisampling: MSAA_SAMPLES as u16,
-        depth_buffer: 24,
+        depth_buffer: 32,
         centered: true,
         ..Default::default()
     };
