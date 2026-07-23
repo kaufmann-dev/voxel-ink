@@ -164,6 +164,42 @@ fn band_leak_distance(physical_distance: f32, half_distance: f32) -> f32 {
     return mix(lower_distance, upper_distance, edge_blend);
 }
 
+fn srgb_to_linear(color: vec3<f32>) -> vec3<f32> {
+    let low = color / 12.92;
+    let high = pow((color + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+    return select(high, low, color <= vec3<f32>(0.04045));
+}
+
+fn heatmap_segment(
+    value: f32,
+    lower_edge: f32,
+    upper_edge: f32,
+    lower_color: vec3<f32>,
+    upper_color: vec3<f32>,
+) -> vec3<f32> {
+    let amount = clamp((value - lower_edge) / (upper_edge - lower_edge), 0.0, 1.0);
+    return srgb_to_linear(mix(lower_color, upper_color, amount));
+}
+
+fn leak_heatmap(intensity: f32) -> vec3<f32> {
+    let value = clamp(intensity, 0.0, 1.0);
+    let black = vec3<f32>(0.0);
+    let purple = vec3<f32>(87.0, 16.0, 110.0) / 255.0;
+    let crimson = vec3<f32>(188.0, 55.0, 84.0) / 255.0;
+    let orange = vec3<f32>(249.0, 142.0, 9.0) / 255.0;
+    let yellow = vec3<f32>(252.0, 255.0, 164.0) / 255.0;
+    if (value < 0.25) {
+        return heatmap_segment(value, 0.0, 0.25, black, purple);
+    }
+    if (value < 0.5) {
+        return heatmap_segment(value, 0.25, 0.5, purple, crimson);
+    }
+    if (value < 0.75) {
+        return heatmap_segment(value, 0.5, 0.75, crimson, orange);
+    }
+    return heatmap_segment(value, 0.75, 1.0, orange, yellow);
+}
+
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let view_direction = normalize(-input.view_position);
@@ -195,7 +231,8 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     );
     let depth_factor = mix(1.0, 0.62, normalized_scene_depth);
     let voxel_ao_factor = mix(1.0, 0.76, clamp(input.corner_occlusion / 3.0, 0.0, 1.0));
-    var lighting = base_lighting * depth_factor * surface_factor * voxel_ao_factor;
+    let lighting = base_lighting * depth_factor * surface_factor * voxel_ao_factor;
+    var lit_color = uniforms.material_color.rgb * lighting;
     if (uniforms.leak_light != 0u) {
         let connected = input.leak_distance >= 0.0;
         let physical_distance = max(input.leak_distance, 0.0) * LEAK_DISTANCE_SNORM_STEP_RANGE
@@ -204,10 +241,15 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let banded_distance = band_leak_distance(physical_distance, half_distance);
         let leak_intensity = exp2(-banded_distance / half_distance);
         let connected_light = select(0.0, leak_intensity, connected);
-        lighting = connected_light * (0.35 + 0.65 * base_lighting) * surface_factor
-            * voxel_ao_factor;
+        let diagnostic_shading = (0.75 + 0.25 * base_lighting)
+            * mix(1.0, surface_factor, 0.35)
+            * mix(1.0, voxel_ao_factor, 0.5);
+        lit_color = select(
+            vec3<f32>(0.0),
+            leak_heatmap(connected_light) * diagnostic_shading,
+            connected,
+        );
     }
-    let lit_color = uniforms.material_color.rgb * lighting;
     if (uniforms.voxel_seams == 0u) {
         return vec4<f32>(lit_color, 1.0);
     }
@@ -3153,8 +3195,29 @@ mod tests {
     }
 
     #[test]
+    fn leak_light_shader_uses_the_banded_inferno_heatmap_in_linear_color() {
+        for stop in [
+            "vec3<f32>(0.0)",
+            "vec3<f32>(87.0, 16.0, 110.0) / 255.0",
+            "vec3<f32>(188.0, 55.0, 84.0) / 255.0",
+            "vec3<f32>(249.0, 142.0, 9.0) / 255.0",
+            "vec3<f32>(252.0, 255.0, 164.0) / 255.0",
+        ] {
+            assert!(SHADER.contains(stop), "missing heatmap stop {stop}");
+        }
+        assert!(SHADER.contains("fn srgb_to_linear(color: vec3<f32>)"));
+        assert!(SHADER.contains("return srgb_to_linear(mix(lower_color, upper_color, amount));"));
+        assert!(SHADER.contains("leak_heatmap(connected_light) * diagnostic_shading"));
+        assert!(SHADER.contains("0.75 + 0.25 * base_lighting"));
+        assert!(SHADER.contains("mix(1.0, surface_factor, 0.35)"));
+        assert!(SHADER.contains("mix(1.0, voxel_ao_factor, 0.5)"));
+    }
+
+    #[test]
     fn leak_light_shader_uses_a_black_unlit_baseline() {
         assert!(SHADER.contains("select(0.0, leak_intensity, connected)"));
+        assert!(SHADER.contains("lit_color = select("));
+        assert!(SHADER.contains("vec3<f32>(0.0),"));
         assert!(!SHADER.contains("0.10 + 0.90 * leak_intensity"));
     }
 
@@ -5094,7 +5157,7 @@ mod tests {
             SceneUpdate::Reset {
                 epoch: 1,
                 revision: 3,
-                dimensions: [8, 3, 3],
+                dimensions: [10, 3, 3],
                 affine: SceneState::default().affine,
             },
         );
@@ -5109,7 +5172,7 @@ mod tests {
                     edit_generation: 0,
                     chunk: coordinate,
                 },
-                quads: (1..=6)
+                quads: (1..=8)
                     .map(|x| {
                         CompactQuad::new([x, 1, 1], 1, 1, crate::mesh::FaceAxis::Z, true, [0; 4])
                             .unwrap()
@@ -5120,14 +5183,16 @@ mod tests {
         );
         // At a 0.1 physical-distance scale and a half-distance of 1.0, steps 1
         // and 2 share the first 0.25-wide band while step 3 begins the next.
-        // The first and last values retain coverage for far-connected and sealed
-        // black surfaces; zero remains the brightest connected value.
+        // Steps 10 and 20 land exactly on the crimson half-brightness and purple
+        // quarter-brightness heatmap stops.
         let diagnostic_distances = [
             PackedLeakDistance::new([i16::MAX as u16; 4]).unwrap(),
             PackedLeakDistance::new([0; 4]).unwrap(),
+            PackedLeakDistance::new([3; 4]).unwrap(),
             PackedLeakDistance::new([1; 4]).unwrap(),
             PackedLeakDistance::new([2; 4]).unwrap(),
-            PackedLeakDistance::new([3; 4]).unwrap(),
+            PackedLeakDistance::new([10; 4]).unwrap(),
+            PackedLeakDistance::new([20; 4]).unwrap(),
             PackedLeakDistance::new([u16::MAX; 4]).unwrap(),
         ];
         let diagnostic_distance_buffer =
@@ -5143,9 +5208,9 @@ mod tests {
             .leak_distance = Some(diagnostic_distance_buffer);
 
         let index_to_world = Mat4::from_scale_rotation_translation(
-            Vec3::new(0.28, 1.5, 1.0),
+            Vec3::new(0.22, 1.5, 1.0),
             glam::Quat::IDENTITY,
-            Vec3::new(-0.98, -1.5, 0.0),
+            Vec3::new(-0.99, -1.5, 0.0),
         );
         let uniforms = Uniforms {
             index_to_world: index_to_world.to_cols_array_2d(),
@@ -5279,33 +5344,56 @@ mod tests {
             .expect("readback callback must run")
             .expect("leak-light readback buffer must map");
         let pixels = slice.get_mapped_range();
-        let maximum_channel = |x: u32| {
+        let sample_rgb = |x: u32| {
             let pixel = ((HEIGHT / 2 * WIDTH + x) * 4) as usize;
-            pixels[pixel..pixel + 3].iter().copied().max().unwrap()
+            [pixels[pixel + 2], pixels[pixel + 1], pixels[pixel]]
         };
         let sample_center = |x: u32| {
-            let world_x = 0.28 * x as f32 - 0.98;
+            let world_x = 0.22 * x as f32 - 0.99;
             ((world_x + 1.0) * WIDTH as f32 * 0.5).round() as u32
         };
-        let far = maximum_channel(sample_center(1));
-        let near = maximum_channel(sample_center(2));
-        let first_band_a = maximum_channel(sample_center(3));
-        let first_band_b = maximum_channel(sample_center(4));
-        let second_band = maximum_channel(sample_center(5));
-        let sealed = maximum_channel(sample_center(6));
-        assert_eq!(far, 0, "a fully faded connected surface must be #000000");
-        assert!(
-            near > 80,
-            "a zero-distance connected surface must remain visibly lit, got {near}"
+        let color_distance = |left: [u8; 3], right: [u8; 3]| {
+            left.into_iter()
+                .zip(right)
+                .map(|(left, right)| u16::from(left.abs_diff(right)))
+                .sum::<u16>()
+        };
+        let far = sample_rgb(sample_center(1));
+        let near = sample_rgb(sample_center(2));
+        let second_band = sample_rgb(sample_center(3));
+        let first_band_a = sample_rgb(sample_center(4));
+        let first_band_b = sample_rgb(sample_center(5));
+        let half_brightness = sample_rgb(sample_center(6));
+        let quarter_brightness = sample_rgb(sample_center(7));
+        let sealed = sample_rgb(sample_center(8));
+        assert_eq!(
+            far, [0; 3],
+            "a fully faded connected surface must be #000000"
         );
         assert!(
-            first_band_a.abs_diff(first_band_b) <= 2,
-            "distances within one band must share a plateau, got {first_band_a} and {first_band_b}"
+            near[0] > 160 && near[1] > 160 && near[2] > 80,
+            "a zero-distance surface must be pale yellow, got {near:?}"
         );
         assert!(
-            first_band_b >= second_band.saturating_add(8),
-            "crossing a distance band must visibly reduce brightness, got {first_band_b} then {second_band}"
+            first_band_a
+                .into_iter()
+                .zip(first_band_b)
+                .all(|(left, right)| left.abs_diff(right) <= 2),
+            "distances within one band must share an RGB plateau, got {first_band_a:?} and {first_band_b:?}"
         );
-        assert_eq!(sealed, 0, "a sealed surface must remain #000000");
+        assert!(
+            color_distance(first_band_b, second_band) >= 24,
+            "crossing a distance band must visibly change color, got {first_band_b:?} then {second_band:?}"
+        );
+        assert!(
+            half_brightness[0] > half_brightness[2] && half_brightness[2] > half_brightness[1],
+            "half-brightness must be crimson, got {half_brightness:?}"
+        );
+        assert!(
+            quarter_brightness[2] > quarter_brightness[0]
+                && quarter_brightness[0] > quarter_brightness[1],
+            "quarter-brightness must be purple, got {quarter_brightness:?}"
+        );
+        assert_eq!(sealed, [0; 3], "a sealed surface must remain #000000");
     }
 }

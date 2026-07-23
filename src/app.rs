@@ -1905,7 +1905,7 @@ impl VoxelInkApp {
                                     ),
                                 )
                                 .on_hover_text(
-                                    "Propagate outside light through face-connected empty voxels. Natural and accidental openings are treated alike.",
+                                    "Propagate outside light through face-connected empty voxels. Yellow is nearest outside; orange, crimson, and purple are progressively farther away. Black is sealed or fully faded. Natural and accidental openings are treated alike.",
                                 )
                                 .changed()
                             {
