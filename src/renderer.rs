@@ -54,6 +54,26 @@ struct VertexOutput {
     @location(5) leak_distance: f32,
 };
 
+fn octahedral_sign_not_zero(value: f32) -> f32 {
+    return select(1.0, -1.0, value < 0.0);
+}
+
+fn decode_shading_normal(packed: u32) -> vec3<f32> {
+    let encoded = (packed >> 22u) & 0x3ffu;
+    var normal = vec3<f32>(
+        (f32(encoded & 0x1fu) - 15.0) / 15.0,
+        (f32((encoded >> 5u) & 0x1fu) - 15.0) / 15.0,
+        0.0,
+    );
+    normal.z = 1.0 - abs(normal.x) - abs(normal.y);
+    if (normal.z < 0.0) {
+        let original = normal.xy;
+        normal.x = (1.0 - abs(original.y)) * octahedral_sign_not_zero(original.x);
+        normal.y = (1.0 - abs(original.x)) * octahedral_sign_not_zero(original.y);
+    }
+    return normalize(normal);
+}
+
 fn expand_vertex(
     vertex_index: u32,
     origin: vec3<u32>,
@@ -108,6 +128,10 @@ fn expand_vertex(
     if (!positive) {
         index_normal = -index_normal;
     }
+    // The occupancy-derived normal restores local curvature cues that the six
+    // geometric voxel normals cannot express. Retaining a geometric component
+    // keeps silhouettes and step changes visibly voxel-like.
+    index_normal = normalize(0.35 * index_normal + 0.65 * decode_shading_normal(packed));
 
     let world_position = uniforms.index_to_world * vec4<f32>(index_position, 1.0);
     let view_position = uniforms.world_to_view * world_position;
@@ -3317,6 +3341,14 @@ mod tests {
     }
 
     #[test]
+    fn occupancy_surface_normals_are_decoded_and_blended_with_voxel_faces() {
+        assert!(SHADER.contains("fn decode_shading_normal(packed: u32)"));
+        assert!(SHADER.contains("let encoded = (packed >> 22u) & 0x3ffu;"));
+        assert!(SHADER.contains("index_normal = normalize("));
+        assert!(SHADER.contains("0.35 * index_normal + 0.65 * decode_shading_normal(packed)"));
+    }
+
+    #[test]
     fn leak_distance_shader_restores_the_snorm_step_range() {
         assert!(SHADER.contains("const LEAK_DISTANCE_SNORM_STEP_RANGE: f32 = 32767.0;"));
         assert!(SHADER.contains("max(input.leak_distance, 0.0) * LEAK_DISTANCE_SNORM_STEP_RANGE"));
@@ -4738,6 +4770,220 @@ mod tests {
         assert!(
             highlighted_pixels * 1_000 >= surface_pixels * 985,
             "coplanar highlight coverage was only {highlighted_pixels}/{surface_pixels} pixels"
+        );
+    }
+
+    #[test]
+    fn headless_software_vulkan_shades_equal_faces_from_occupancy_normals() {
+        if std::env::var_os("VOXEL_INK_REQUIRE_SOFTWARE_VULKAN").is_none() {
+            eprintln!("set VOXEL_INK_REQUIRE_SOFTWARE_VULKAN=1 to exercise Mesa Vulkan");
+            return;
+        }
+
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::VULKAN;
+        let instance = wgpu::Instance::new(descriptor);
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            force_fallback_adapter: true,
+            compatible_surface: None,
+        }))
+        .expect("Mesa software Vulkan adapter must be available");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("software Vulkan device must initialize");
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut renderer = GpuVolumeRenderer::new(&device, format, false);
+        let coordinate = ChunkCoord::new(0, 0, 0);
+        renderer.apply_update(
+            &device,
+            &queue,
+            SceneUpdate::Reset {
+                epoch: 1,
+                revision: 1,
+                dimensions: [2, 1, 1],
+                affine: SceneState::default().affine,
+            },
+        );
+        renderer.apply_update(
+            &device,
+            &queue,
+            SceneUpdate::Chunk {
+                tag: MeshJobTag {
+                    document_epoch: 1,
+                    revision: 1,
+                    chunk_generation: 1,
+                    edit_generation: 0,
+                    chunk: coordinate,
+                },
+                quads: vec![
+                    CompactQuad::new_with_shading_normal(
+                        [0, 0, 0],
+                        1,
+                        1,
+                        crate::mesh::FaceAxis::Z,
+                        true,
+                        [0; 4],
+                        [0.0, 0.707_106_77, 0.707_106_77],
+                    )
+                    .unwrap(),
+                    CompactQuad::new_with_shading_normal(
+                        [1, 0, 0],
+                        1,
+                        1,
+                        crate::mesh::FaceAxis::Z,
+                        true,
+                        [0; 4],
+                        [0.0, -0.707_106_77, 0.707_106_77],
+                    )
+                    .unwrap(),
+                ],
+                priority: MeshUpdatePriority::Background,
+            },
+        );
+
+        let index_to_world = Mat4::from_scale_rotation_translation(
+            Vec3::new(0.9, 1.6, 1.0),
+            glam::Quat::IDENTITY,
+            Vec3::new(-0.45, 0.0, 0.5),
+        );
+        let world_to_view = Mat4::from_translation(Vec3::new(0.0, 0.0, -1.0));
+        let uniforms = Uniforms {
+            index_to_world: index_to_world.to_cols_array_2d(),
+            world_to_view: world_to_view.to_cols_array_2d(),
+            index_normal_to_view: normal_matrix(world_to_view * index_to_world).to_cols_array_2d(),
+            ..Uniforms::default()
+        };
+        queue.write_buffer(&renderer.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+
+        const WIDTH: u32 = 64;
+        const HEIGHT: u32 = 32;
+        let texture = |label, sample_count, usage| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: WIDTH,
+                    height: HEIGHT,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let multisampled_color = texture(
+            "occupancy-normal multisampled color",
+            MSAA_SAMPLES,
+            wgpu::TextureUsages::RENDER_ATTACHMENT,
+        );
+        let resolved_color = texture(
+            "occupancy-normal resolved color",
+            1,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("occupancy-normal depth"),
+            size: wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: MSAA_SAMPLES,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth24Plus,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let multisampled_view = multisampled_color.create_view(&Default::default());
+        let resolved_view = resolved_color.create_view(&Default::default());
+        let depth_view = depth.create_view(&Default::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("occupancy-normal encoder"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("occupancy-normal pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &multisampled_view,
+                    depth_slice: None,
+                    resolve_target: Some(&resolved_view),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Discard,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            let chunk = renderer.chunks.get(&coordinate).unwrap();
+            pass.set_pipeline(&renderer.pipeline);
+            pass.set_bind_group(0, &renderer.bind_group, &[]);
+            pass.set_vertex_buffer(0, chunk.buffer.slice(..));
+            pass.draw(0..6, 0..chunk.instances);
+        }
+
+        let bytes_per_row = WIDTH * size_of::<u32>() as u32;
+        let output = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("occupancy-normal readback"),
+            size: u64::from(bytes_per_row * HEIGHT),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            resolved_color.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &output,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+        );
+        let submission = queue.submit([encoder.finish()]);
+        let slice = output.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(std::time::Duration::from_secs(10)),
+            })
+            .expect("software Vulkan normal render must complete");
+        receiver
+            .recv()
+            .expect("readback callback must run")
+            .expect("occupancy-normal readback buffer must map");
+        let pixels = slice.get_mapped_range();
+        let luminance = |x: u32| {
+            let pixel = ((HEIGHT / 2 * WIDTH + x) * 4) as usize;
+            u16::from(pixels[pixel]) + u16::from(pixels[pixel + 1]) + u16::from(pixels[pixel + 2])
+        };
+        let upper_bent = luminance(WIDTH / 4);
+        let lower_bent = luminance(WIDTH * 3 / 4);
+        assert!(
+            upper_bent > lower_bent + 80,
+            "occupancy normals did not create enough relief contrast: {upper_bent} vs {lower_bent}"
         );
     }
 

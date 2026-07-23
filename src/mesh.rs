@@ -15,6 +15,9 @@ pub const MAX_MESH_BYTES: usize = 256 * 1024 * 1024;
 
 const HALO_WIDTH: u32 = 1;
 const MAX_FACE_CELLS: usize = CHUNK_SIZE as usize * CHUNK_SIZE as usize;
+const MAX_HALO_VOXELS: usize = (CHUNK_SIZE as usize + 2).pow(3);
+const UNCOMPUTED_SHADING_NORMAL: u16 = u16::MAX;
+const NO_OCCUPANCY_GRADIENT: u16 = u16::MAX - 1;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ChunkCoord {
@@ -284,6 +287,8 @@ impl FaceAxis {
 ///
 /// `origin` is an integer grid boundary. Expansion subtracts 0.5 on every axis
 /// so voxel index coordinates remain voxel centers under the document affine.
+/// The packed word also carries four AO levels and a 10-bit octahedral normal
+/// derived from the surrounding occupancy field.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Pod, Zeroable)]
 pub struct CompactQuad {
@@ -359,6 +364,8 @@ impl CompactQuad {
     const OCCLUSION_SHIFT: u32 = 13;
     const OCCLUSION_MASK: u32 = 0x3;
     const FLIPPED_DIAGONAL_SHIFT: u32 = 21;
+    const SHADING_NORMAL_SHIFT: u32 = 22;
+    const SHADING_NORMAL_MASK: u32 = 0x3ff;
 
     #[must_use]
     pub fn new(
@@ -369,9 +376,52 @@ impl CompactQuad {
         positive: bool,
         corner_occlusion: [u8; 4],
     ) -> Option<Self> {
+        let mut geometric_normal = [0.0; 3];
+        geometric_normal[normal_axis.index()] = if positive { 1.0 } else { -1.0 };
+        Self::new_with_shading_normal(
+            origin,
+            u_length,
+            v_length,
+            normal_axis,
+            positive,
+            corner_occlusion,
+            geometric_normal,
+        )
+    }
+
+    pub(crate) fn new_with_shading_normal(
+        origin: [u32; 3],
+        u_length: u32,
+        v_length: u32,
+        normal_axis: FaceAxis,
+        positive: bool,
+        corner_occlusion: [u8; 4],
+        shading_normal: [f32; 3],
+    ) -> Option<Self> {
+        Self::new_with_encoded_shading_normal(
+            origin,
+            u_length,
+            v_length,
+            normal_axis,
+            positive,
+            corner_occlusion,
+            encode_octahedral_normal(shading_normal)?,
+        )
+    }
+
+    fn new_with_encoded_shading_normal(
+        origin: [u32; 3],
+        u_length: u32,
+        v_length: u32,
+        normal_axis: FaceAxis,
+        positive: bool,
+        corner_occlusion: [u8; 4],
+        shading_normal: u16,
+    ) -> Option<Self> {
         if !(1..=CHUNK_SIZE).contains(&u_length)
             || !(1..=CHUNK_SIZE).contains(&v_length)
             || corner_occlusion.into_iter().any(|level| level > 3)
+            || u32::from(shading_normal) > Self::SHADING_NORMAL_MASK
         {
             return None;
         }
@@ -385,6 +435,7 @@ impl CompactQuad {
         let diagonal_02 = u16::from(corner_occlusion[0]) + u16::from(corner_occlusion[2]);
         let diagonal_13 = u16::from(corner_occlusion[1]) + u16::from(corner_occlusion[3]);
         packed |= u32::from(diagonal_02 > diagonal_13) << Self::FLIPPED_DIAGONAL_SHIFT;
+        packed |= u32::from(shading_normal) << Self::SHADING_NORMAL_SHIFT;
         Some(Self { origin, packed })
     }
 
@@ -428,6 +479,13 @@ impl CompactQuad {
     }
 
     #[must_use]
+    pub fn shading_normal(self) -> [f32; 3] {
+        decode_octahedral_normal(
+            ((self.packed >> Self::SHADING_NORMAL_SHIFT) & Self::SHADING_NORMAL_MASK) as u16,
+        )
+    }
+
+    #[must_use]
     pub const fn area(self) -> u32 {
         self.u_length() * self.v_length()
     }
@@ -452,6 +510,61 @@ impl CompactQuad {
         }
         Some(vertex)
     }
+}
+
+const OCTAHEDRAL_NORMAL_SCALE: f32 = 15.0;
+
+fn encode_octahedral_normal(normal: [f32; 3]) -> Option<u16> {
+    if normal.into_iter().any(|component| !component.is_finite()) {
+        return None;
+    }
+    let magnitude = normal
+        .into_iter()
+        .map(f32::abs)
+        .fold(0.0, |sum, component| sum + component);
+    if magnitude <= f32::EPSILON {
+        return None;
+    }
+    let mut projected = [normal[0] / magnitude, normal[1] / magnitude];
+    if normal[2] < 0.0 {
+        projected = [
+            (1.0 - projected[1].abs()) * sign_not_zero(projected[0]),
+            (1.0 - projected[0].abs()) * sign_not_zero(projected[1]),
+        ];
+    }
+    let encode_component = |component: f32| {
+        (component * OCTAHEDRAL_NORMAL_SCALE)
+            .round()
+            .clamp(-OCTAHEDRAL_NORMAL_SCALE, OCTAHEDRAL_NORMAL_SCALE) as i32
+            + OCTAHEDRAL_NORMAL_SCALE as i32
+    };
+    let x = encode_component(projected[0]) as u16;
+    let y = encode_component(projected[1]) as u16;
+    Some(x | (y << 5))
+}
+
+fn decode_octahedral_normal(encoded: u16) -> [f32; 3] {
+    let mut normal = [
+        (f32::from(encoded & 0x1f) - OCTAHEDRAL_NORMAL_SCALE) / OCTAHEDRAL_NORMAL_SCALE,
+        (f32::from((encoded >> 5) & 0x1f) - OCTAHEDRAL_NORMAL_SCALE) / OCTAHEDRAL_NORMAL_SCALE,
+        0.0,
+    ];
+    normal[2] = 1.0 - normal[0].abs() - normal[1].abs();
+    if normal[2] < 0.0 {
+        let original = normal;
+        normal[0] = (1.0 - original[1].abs()) * sign_not_zero(original[0]);
+        normal[1] = (1.0 - original[0].abs()) * sign_not_zero(original[1]);
+    }
+    let magnitude = normal
+        .into_iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    normal.map(|component| component / magnitude)
+}
+
+fn sign_not_zero(value: f32) -> f32 {
+    if value < 0.0 { -1.0 } else { 1.0 }
 }
 
 /// Packs the outside-voxel distance at every corner of each greedy quad.
@@ -663,13 +776,15 @@ pub fn mesh_chunk(
             bytes: 6 * size_of::<CompactQuad>(),
         })?;
     let mut exposed_voxel_faces = 0_u32;
-    let mut mask = [0_i8; MAX_FACE_CELLS];
+    let mut mask = [FaceCell::EMPTY; MAX_FACE_CELLS];
+    let mut shading_normal_cache = [UNCOMPUTED_SHADING_NORMAL; MAX_HALO_VOXELS];
 
     for normal_axis in FaceAxis::ALL {
         mesh_axis(
             input,
             normal_axis,
             &mut mask,
+            &mut shading_normal_cache,
             &mut quads,
             &mut exposed_voxel_faces,
             cancellation,
@@ -700,10 +815,37 @@ struct PlaneLayout {
     halo_strides: [usize; 3],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FaceCell {
+    direction: i8,
+    corner_occlusion: [u8; 4],
+    shading_normal: u16,
+}
+
+impl FaceCell {
+    const EMPTY: Self = Self {
+        direction: 0,
+        corner_occlusion: [0; 4],
+        shading_normal: 0,
+    };
+
+    fn can_merge(self, other: Self) -> bool {
+        // Bilinear AO is exact across a larger quad only when every contributing
+        // unit face has one matching constant level. Nonuniform AO remains on a
+        // unit face so a wall corner cannot cast a ramp across an entire floor.
+        self == other
+            && self
+                .corner_occlusion
+                .iter()
+                .all(|&level| level == self.corner_occlusion[0])
+    }
+}
+
 fn mesh_axis(
     input: &ChunkInput,
     normal_axis: FaceAxis,
-    mask: &mut [i8; MAX_FACE_CELLS],
+    mask: &mut [FaceCell; MAX_FACE_CELLS],
+    shading_normal_cache: &mut [u16; MAX_HALO_VOXELS],
     quads: &mut Vec<CompactQuad>,
     exposed_voxel_faces: &mut u32,
     cancellation: &CancellationToken,
@@ -734,13 +876,18 @@ fn mesh_axis(
             halo_strides,
         };
         let active_mask = &mut mask[..u_extent * v_extent];
-        fill_face_mask(input, layout, active_mask);
+        fill_face_mask(input, layout, active_mask, shading_normal_cache);
         emit_greedy_quads(input, layout, active_mask, quads, exposed_voxel_faces)?;
     }
     Ok(())
 }
 
-fn fill_face_mask(input: &ChunkInput, layout: PlaneLayout, mask: &mut [i8]) {
+fn fill_face_mask(
+    input: &ChunkInput,
+    layout: PlaneLayout,
+    mask: &mut [FaceCell],
+    shading_normal_cache: &mut [u16; MAX_HALO_VOXELS],
+) {
     let normal_stride = layout.halo_strides[layout.normal_axis_index];
     let u_stride = layout.halo_strides[layout.u_axis];
     let v_stride = layout.halo_strides[layout.v_axis];
@@ -752,12 +899,45 @@ fn fill_face_mask(input: &ChunkInput, layout: PlaneLayout, mask: &mut [i8]) {
             let occupied_negative = input.occupancy[negative_index] != 0;
             let occupied_positive = input.occupancy[negative_index + normal_stride] != 0;
 
-            mask[v * layout.u_extent + u] = match (occupied_negative, occupied_positive) {
+            let direction = match (occupied_negative, occupied_positive) {
                 // A neighboring chunk owns a face when the occupied voxel is
                 // in that chunk, even though it appears in this chunk's halo.
                 (true, false) if layout.plane > 0 => 1,
                 (false, true) if layout.plane < layout.normal_extent => -1,
                 _ => 0,
+            };
+            if direction == 0 {
+                mask[v * layout.u_extent + u] = FaceCell::EMPTY;
+                continue;
+            }
+            let positive = direction > 0;
+            let corner_occlusion = unit_face_corner_occlusion(input, layout, u, v, positive);
+            let occupied_index = if positive {
+                negative_index
+            } else {
+                negative_index + normal_stride
+            };
+            if shading_normal_cache[occupied_index] == UNCOMPUTED_SHADING_NORMAL {
+                shading_normal_cache[occupied_index] =
+                    occupancy_surface_normal(input, occupied_index, layout.halo_strides)
+                        .and_then(encode_octahedral_normal)
+                        .unwrap_or(NO_OCCUPANCY_GRADIENT);
+            }
+            let mut geometric = [0.0; 3];
+            geometric[layout.normal_axis_index] = if positive { 1.0 } else { -1.0 };
+            let cached_normal = shading_normal_cache[occupied_index];
+            let shading_normal = if cached_normal == NO_OCCUPANCY_GRADIENT
+                || dot(decode_octahedral_normal(cached_normal), geometric) <= 0.0
+            {
+                encode_octahedral_normal(geometric)
+                    .expect("geometric surface normals are finite and nonzero")
+            } else {
+                cached_normal
+            };
+            mask[v * layout.u_extent + u] = FaceCell {
+                direction,
+                corner_occlusion,
+                shading_normal,
             };
         }
     }
@@ -766,7 +946,7 @@ fn fill_face_mask(input: &ChunkInput, layout: PlaneLayout, mask: &mut [i8]) {
 fn emit_greedy_quads(
     input: &ChunkInput,
     layout: PlaneLayout,
-    mask: &mut [i8],
+    mask: &mut [FaceCell],
     quads: &mut Vec<CompactQuad>,
     exposed_voxel_faces: &mut u32,
 ) -> Result<()> {
@@ -775,41 +955,43 @@ fn emit_greedy_quads(
         let mut u = 0;
         while u < layout.u_extent {
             let face = mask[v * layout.u_extent + u];
-            if face == 0 {
+            if face.direction == 0 {
                 u += 1;
                 continue;
             }
 
             let mut width = 1;
-            while u + width < layout.u_extent && mask[v * layout.u_extent + u + width] == face {
+            while u + width < layout.u_extent
+                && face.can_merge(mask[v * layout.u_extent + u + width])
+            {
                 width += 1;
             }
             let mut height = 1;
             'height: while v + height < layout.v_extent {
                 for offset in 0..width {
-                    if mask[(v + height) * layout.u_extent + u + offset] != face {
+                    if !face.can_merge(mask[(v + height) * layout.u_extent + u + offset]) {
                         break 'height;
                     }
                 }
                 height += 1;
             }
             for row in v..v + height {
-                mask[row * layout.u_extent + u..row * layout.u_extent + u + width].fill(0);
+                mask[row * layout.u_extent + u..row * layout.u_extent + u + width]
+                    .fill(FaceCell::EMPTY);
             }
 
             let mut origin = input.origin;
             origin[layout.normal_axis_index] += chunk_u32(layout.plane)?;
             origin[layout.u_axis] += chunk_u32(u)?;
             origin[layout.v_axis] += chunk_u32(v)?;
-            let corner_occlusion =
-                quad_corner_occlusion(input, layout, u, v, width, height, face > 0);
-            let quad = CompactQuad::new(
+            let quad = CompactQuad::new_with_encoded_shading_normal(
                 origin,
                 chunk_u32(width)?,
                 chunk_u32(height)?,
                 layout.normal_axis,
-                face > 0,
-                corner_occlusion,
+                face.direction > 0,
+                face.corner_occlusion,
+                face.shading_normal,
             )
             .ok_or_else(|| {
                 AppError::InvalidDimensions("greedy quad exceeded chunk bounds".into())
@@ -830,6 +1012,97 @@ fn emit_greedy_quads(
     Ok(())
 }
 
+fn occupancy_surface_normal(
+    input: &ChunkInput,
+    occupied_index: usize,
+    halo_strides: [usize; 3],
+) -> Option<[f32; 3]> {
+    let mut outward = [0.0; 3];
+    let center = occupied_index as isize;
+    for z in -1_isize..=1 {
+        for y in -1_isize..=1 {
+            for x in -1_isize..=1 {
+                if [x, y, z] == [0; 3] {
+                    continue;
+                }
+                let offsets = [x, y, z];
+                let neighbor = usize::try_from(
+                    center
+                        + x * halo_strides[0] as isize
+                        + y * halo_strides[1] as isize
+                        + z * halo_strides[2] as isize,
+                )
+                .expect("padded occupancy neighborhood stays nonnegative");
+                let occupied = f32::from(input.occupancy[neighbor]);
+                for axis in 0..3 {
+                    let [first_tangent, second_tangent] = match axis {
+                        0 => [1, 2],
+                        1 => [2, 0],
+                        _ => [0, 1],
+                    };
+                    let smoothing_weight = (2 - offsets[first_tangent].unsigned_abs())
+                        * (2 - offsets[second_tangent].unsigned_abs());
+                    outward[axis] -= offsets[axis] as f32 * smoothing_weight as f32 * occupied;
+                }
+            }
+        }
+    }
+
+    let magnitude = outward
+        .into_iter()
+        .map(|component| component * component)
+        .sum::<f32>()
+        .sqrt();
+    if magnitude <= f32::EPSILON {
+        return None;
+    }
+    Some(outward.map(|component| component / magnitude))
+}
+
+fn dot(left: [f32; 3], right: [f32; 3]) -> f32 {
+    left.into_iter()
+        .zip(right)
+        .map(|(left, right)| left * right)
+        .sum()
+}
+
+fn unit_face_corner_occlusion(
+    input: &ChunkInput,
+    layout: PlaneLayout,
+    u: usize,
+    v: usize,
+    positive: bool,
+) -> [u8; 4] {
+    let normal_offset =
+        (layout.plane + usize::from(positive)) * layout.halo_strides[layout.normal_axis_index];
+    let u_stride = layout.halo_strides[layout.u_axis];
+    let v_stride = layout.halo_strides[layout.v_axis];
+    let outside = normal_offset + (u + 1) * u_stride + (v + 1) * v_stride;
+    let negative_u = input.occupancy[outside - u_stride] != 0;
+    let positive_u = input.occupancy[outside + u_stride] != 0;
+    let negative_v = input.occupancy[outside - v_stride] != 0;
+    let positive_v = input.occupancy[outside + v_stride] != 0;
+    let negative_u_negative_v = input.occupancy[outside - u_stride - v_stride] != 0;
+    let positive_u_negative_v = input.occupancy[outside + u_stride - v_stride] != 0;
+    let positive_u_positive_v = input.occupancy[outside + u_stride + v_stride] != 0;
+    let negative_u_positive_v = input.occupancy[outside - u_stride + v_stride] != 0;
+    [
+        corner_occlusion_level(negative_u, negative_v, negative_u_negative_v),
+        corner_occlusion_level(positive_u, negative_v, positive_u_negative_v),
+        corner_occlusion_level(positive_u, positive_v, positive_u_positive_v),
+        corner_occlusion_level(negative_u, positive_v, negative_u_positive_v),
+    ]
+}
+
+fn corner_occlusion_level(side_u: bool, side_v: bool, diagonal: bool) -> u8 {
+    if side_u && side_v {
+        3
+    } else {
+        u8::from(side_u) + u8::from(side_v) + u8::from(diagonal)
+    }
+}
+
+#[cfg(test)]
 fn quad_corner_occlusion(
     input: &ChunkInput,
     layout: PlaneLayout,
@@ -868,13 +1141,11 @@ fn quad_corner_occlusion(
             (false, true) => outside - u_stride + v_stride,
             (false, false) => outside - u_stride - v_stride,
         };
-        let occupied_u = input.occupancy[side_u] != 0;
-        let occupied_v = input.occupancy[side_v] != 0;
-        levels[corner] = if occupied_u && occupied_v {
-            3
-        } else {
-            u8::from(occupied_u) + u8::from(occupied_v) + u8::from(input.occupancy[diagonal] != 0)
-        };
+        levels[corner] = corner_occlusion_level(
+            input.occupancy[side_u] != 0,
+            input.occupancy[side_v] != 0,
+            input.occupancy[diagonal] != 0,
+        );
     }
     levels
 }
@@ -888,11 +1159,7 @@ fn corner_occlusion(
 ) -> u8 {
     let occupied_u = input.occupied(side_u);
     let occupied_v = input.occupied(side_v);
-    if occupied_u && occupied_v {
-        3
-    } else {
-        u8::from(occupied_u) + u8::from(occupied_v) + u8::from(input.occupied(diagonal))
-    }
+    corner_occlusion_level(occupied_u, occupied_v, input.occupied(diagonal))
 }
 
 fn chunk_u32(value: usize) -> Result<u32> {
@@ -1398,6 +1665,79 @@ mod tests {
     }
 
     #[test]
+    fn shared_occupancy_gradient_pass_matches_the_full_sobel_reference() {
+        let dimensions = [7, 6, 5];
+        let mut occupancy = vec![0; 7 * 6 * 5];
+        let mut state = 0x9e37_79b9_u32;
+        for voxel in &mut occupancy {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *voxel = u8::from(state & 1 != 0);
+        }
+        let input = input(dimensions, &occupancy, ChunkCoord::new(0, 0, 0));
+        let width = input.halo_dimensions[0] as usize;
+        let height = input.halo_dimensions[1] as usize;
+        let strides = [1, width, width * height];
+        let reference = |center: usize| {
+            let mut outward = [0.0; 3];
+            for axis in 0..3 {
+                let tangent_axes = match axis {
+                    0 => [1, 2],
+                    1 => [2, 0],
+                    _ => [0, 1],
+                };
+                for first_offset in -1_isize..=1 {
+                    for second_offset in -1_isize..=1 {
+                        let weight =
+                            (2 - first_offset.unsigned_abs()) * (2 - second_offset.unsigned_abs());
+                        let tangent_offset = first_offset * strides[tangent_axes[0]] as isize
+                            + second_offset * strides[tangent_axes[1]] as isize;
+                        let axis_stride = strides[axis] as isize;
+                        let negative =
+                            usize::try_from(center as isize + tangent_offset - axis_stride)
+                                .unwrap();
+                        let positive =
+                            usize::try_from(center as isize + tangent_offset + axis_stride)
+                                .unwrap();
+                        outward[axis] += weight as f32
+                            * (f32::from(input.occupancy[negative])
+                                - f32::from(input.occupancy[positive]));
+                    }
+                }
+            }
+            let magnitude = outward
+                .into_iter()
+                .map(|component| component * component)
+                .sum::<f32>()
+                .sqrt();
+            (magnitude > f32::EPSILON).then(|| outward.map(|component| component / magnitude))
+        };
+
+        for z in 0..dimensions[2] as usize {
+            for y in 0..dimensions[1] as usize {
+                for x in 0..dimensions[0] as usize {
+                    let center = x + 1 + width * (y + 1 + height * (z + 1));
+                    let expected = reference(center);
+                    let actual = occupancy_surface_normal(&input, center, strides);
+                    match (actual, expected) {
+                        (Some(actual), Some(expected)) => {
+                            assert!(
+                                actual
+                                    .into_iter()
+                                    .zip(expected)
+                                    .all(|(left, right)| (left - right).abs() < 1.0e-6)
+                            );
+                        }
+                        (None, None) => {}
+                        mismatch => panic!("Sobel mismatch at {:?}: {mismatch:?}", [x, y, z]),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn empty_chunk_has_no_surface() {
         let mesh = mesh(
             [32, 32, 32],
@@ -1421,17 +1761,42 @@ mod tests {
     }
 
     #[test]
-    fn greedy_mesher_collapses_solid_chunk_to_six_quads() {
+    fn greedy_mesher_keeps_solid_faces_compact_while_rounding_their_edges() {
         let mesh = mesh(
             [32, 32, 32],
             &vec![1; CHUNK_VOXELS],
             ChunkCoord::new(0, 0, 0),
         );
-        assert_eq!(mesh.quads.len(), 6);
+        assert_eq!(mesh.quads.len(), 54);
         assert_eq!(mesh.exposed_voxel_faces, 6 * 32 * 32);
-        assert!(mesh.quads.iter().all(|quad| quad.u_length() == 32
-            && quad.v_length() == 32
-            && (0..4).all(|corner| quad.corner_occlusion(corner) == Some(0))));
+        assert!(
+            mesh.quads
+                .iter()
+                .all(|quad| (0..4).all(|corner| quad.corner_occlusion(corner) == Some(0)))
+        );
+        for axis in FaceAxis::ALL {
+            for positive in [false, true] {
+                let face_quads = mesh
+                    .quads
+                    .iter()
+                    .filter(|quad| quad.normal_axis() == axis && quad.positive() == positive)
+                    .collect::<Vec<_>>();
+                assert_eq!(face_quads.len(), 9);
+                assert_eq!(
+                    face_quads.iter().map(|quad| quad.area()).max(),
+                    Some(30 * 30)
+                );
+                let alignments = face_quads.iter().map(|quad| {
+                    quad.shading_normal()
+                        .into_iter()
+                        .zip(quad.normal())
+                        .map(|(left, right)| left * right)
+                        .sum::<f32>()
+                });
+                assert!(alignments.clone().any(|alignment| alignment > 0.999));
+                assert!(alignments.into_iter().any(|alignment| alignment < 0.9));
+            }
+        }
     }
 
     #[test]
@@ -1494,6 +1859,73 @@ mod tests {
         assert!(quad.flipped_diagonal());
         assert_eq!(quad.expanded_vertex(2), Some([5.5, 6.5, 8.5]));
         assert!(CompactQuad::new([0; 3], 1, 1, FaceAxis::Z, true, [0, 1, 2, 4]).is_none());
+    }
+
+    #[test]
+    fn compact_quad_round_trips_quantized_surface_normals() {
+        for normal in [
+            [1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, -1.0],
+            [0.577_350_26; 3],
+            [-0.436_435_76, 0.872_871_5, 0.218_217_88],
+        ] {
+            let quad = CompactQuad::new_with_shading_normal(
+                [0; 3],
+                1,
+                1,
+                FaceAxis::Z,
+                true,
+                [0; 4],
+                normal,
+            )
+            .unwrap();
+            let decoded = quad.shading_normal();
+            let alignment = decoded
+                .into_iter()
+                .zip(normal)
+                .map(|(left, right)| left * right)
+                .sum::<f32>();
+            assert!(alignment > 0.995, "{normal:?} decoded as {decoded:?}");
+        }
+    }
+
+    #[test]
+    fn varying_corner_occlusion_never_smears_across_a_greedy_quad() {
+        let dimensions = [16, 16, 8];
+        let mut occupancy = vec![0; 16 * 16 * 8];
+        let index = |x: usize, y: usize, z: usize| x + 16 * (y + 16 * z);
+        for y in 0_usize..16 {
+            for x in 0_usize..16 {
+                occupancy[index(x, y, 0)] = 1;
+            }
+        }
+        for z in 1_usize..8 {
+            for x in 0_usize..16 {
+                occupancy[index(x, 15, z)] = 1;
+            }
+        }
+
+        let mesh = mesh(dimensions, &occupancy, ChunkCoord::new(0, 0, 0));
+        let floor = mesh.quads.iter().filter(|quad| {
+            quad.normal_axis() == FaceAxis::Z && quad.positive() && quad.origin[2] == 1
+        });
+        let mut saw_local_occlusion = false;
+        let mut saw_large_clear_quad = false;
+        for quad in floor {
+            let levels =
+                std::array::from_fn::<_, 4, _>(|corner| quad.corner_occlusion(corner).unwrap());
+            let varies = levels.iter().any(|&level| level != levels[0]);
+            if varies {
+                saw_local_occlusion = true;
+                assert_eq!(quad.area(), 1, "varying AO crossed a greedy face");
+            }
+            if levels == [0; 4] && quad.area() > 1 {
+                saw_large_clear_quad = true;
+            }
+        }
+        assert!(saw_local_occlusion);
+        assert!(saw_large_clear_quad);
     }
 
     #[test]
