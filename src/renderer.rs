@@ -42,6 +42,7 @@ struct Uniforms {
 // Snorm16x4 exposes the connected 0..32767 step range as 0.0..1.0.
 // Restore the integer magnitude before converting steps to physical distance.
 const LEAK_DISTANCE_SNORM_STEP_RANGE: f32 = 32767.0;
+const LEAK_BANDS_PER_HALF_DISTANCE: f32 = 4.0;
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -152,6 +153,17 @@ fn voxel_seam(coordinate: f32) -> f32 {
     return antialiased_line * subpixel_fade;
 }
 
+fn band_leak_distance(physical_distance: f32, half_distance: f32) -> f32 {
+    let band_width = half_distance / LEAK_BANDS_PER_HALF_DISTANCE;
+    let band_coordinate = physical_distance / band_width;
+    let lower_band = floor(band_coordinate);
+    let lower_distance = lower_band * band_width;
+    let upper_distance = lower_distance + band_width;
+    let edge_width = clamp(fwidth(band_coordinate), 1.0e-4, 0.5);
+    let edge_blend = smoothstep(1.0 - edge_width, 1.0, fract(band_coordinate));
+    return mix(lower_distance, upper_distance, edge_blend);
+}
+
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let view_direction = normalize(-input.view_position);
@@ -188,7 +200,9 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let connected = input.leak_distance >= 0.0;
         let physical_distance = max(input.leak_distance, 0.0) * LEAK_DISTANCE_SNORM_STEP_RANGE
             * uniforms.leak_distance_scale;
-        let leak_intensity = exp2(-physical_distance / max(uniforms.leak_half_distance, 1.0e-12));
+        let half_distance = max(uniforms.leak_half_distance, 1.0e-12);
+        let banded_distance = band_leak_distance(physical_distance, half_distance);
+        let leak_intensity = exp2(-banded_distance / half_distance);
         let connected_light = select(0.0, leak_intensity, connected);
         lighting = connected_light * (0.35 + 0.65 * base_lighting) * surface_factor
             * voxel_ao_factor;
@@ -3117,7 +3131,7 @@ mod tests {
         assert!(SHADER.contains("if (uniforms.voxel_seams == 0u)"));
         assert!(SHADER.contains("return vec4<f32>(lit_color, 1.0);"));
         assert!(SHADER.contains("if (uniforms.leak_light != 0u)"));
-        assert!(SHADER.contains("exp2(-physical_distance /"));
+        assert!(SHADER.contains("exp2(-banded_distance / half_distance)"));
         assert!(SHADER.contains("input.leak_distance >= 0.0"));
         assert_eq!(size_of::<CompactQuad>(), 16);
         assert_eq!(size_of::<PackedLeakDistance>(), 8);
@@ -3127,6 +3141,15 @@ mod tests {
     fn leak_distance_shader_restores_the_snorm_step_range() {
         assert!(SHADER.contains("const LEAK_DISTANCE_SNORM_STEP_RANGE: f32 = 32767.0;"));
         assert!(SHADER.contains("max(input.leak_distance, 0.0) * LEAK_DISTANCE_SNORM_STEP_RANGE"));
+    }
+
+    #[test]
+    fn leak_light_shader_uses_four_antialiased_distance_bands_per_half_distance() {
+        assert!(SHADER.contains("const LEAK_BANDS_PER_HALF_DISTANCE: f32 = 4.0;"));
+        assert!(SHADER.contains("let lower_band = floor(band_coordinate);"));
+        assert!(SHADER.contains("let edge_width = clamp(fwidth(band_coordinate), 1.0e-4, 0.5);"));
+        assert!(SHADER.contains("let banded_distance = band_leak_distance("));
+        assert!(SHADER.contains("exp2(-banded_distance / half_distance)"));
     }
 
     #[test]
@@ -5068,30 +5091,48 @@ mod tests {
         renderer.apply_update(
             &device,
             &queue,
+            SceneUpdate::Reset {
+                epoch: 1,
+                revision: 3,
+                dimensions: [8, 3, 3],
+                affine: SceneState::default().affine,
+            },
+        );
+        renderer.apply_update(
+            &device,
+            &queue,
             SceneUpdate::Chunk {
                 tag: MeshJobTag {
                     document_epoch: 1,
-                    revision: 2,
+                    revision: 3,
                     chunk_generation: 2,
                     edit_generation: 0,
                     chunk: coordinate,
                 },
-                quads: [[1, 1, 1], [2, 1, 1]]
-                    .map(|origin| {
-                        CompactQuad::new(origin, 1, 1, crate::mesh::FaceAxis::Z, true, [0; 4])
+                quads: (1..=6)
+                    .map(|x| {
+                        CompactQuad::new([x, 1, 1], 1, 1, crate::mesh::FaceAxis::Z, true, [0; 4])
                             .unwrap()
                     })
-                    .into(),
+                    .collect(),
                 priority: MeshUpdatePriority::Background,
             },
         );
+        // At a 0.1 physical-distance scale and a half-distance of 1.0, steps 1
+        // and 2 share the first 0.25-wide band while step 3 begins the next.
+        // The first and last values retain coverage for far-connected and sealed
+        // black surfaces; zero remains the brightest connected value.
         let diagnostic_distances = [
             PackedLeakDistance::new([i16::MAX as u16; 4]).unwrap(),
             PackedLeakDistance::new([0; 4]).unwrap(),
+            PackedLeakDistance::new([1; 4]).unwrap(),
+            PackedLeakDistance::new([2; 4]).unwrap(),
+            PackedLeakDistance::new([3; 4]).unwrap(),
+            PackedLeakDistance::new([u16::MAX; 4]).unwrap(),
         ];
         let diagnostic_distance_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("black baseline leak-distance test buffer"),
+                label: Some("banded leak-distance test buffer"),
                 contents: bytemuck::cast_slice(&diagnostic_distances),
                 usage: wgpu::BufferUsages::VERTEX,
             });
@@ -5102,9 +5143,9 @@ mod tests {
             .leak_distance = Some(diagnostic_distance_buffer);
 
         let index_to_world = Mat4::from_scale_rotation_translation(
-            Vec3::new(0.75, 1.5, 1.0),
+            Vec3::new(0.28, 1.5, 1.0),
             glam::Quat::IDENTITY,
-            Vec3::new(-1.125, -1.5, 0.0),
+            Vec3::new(-0.98, -1.5, 0.0),
         );
         let uniforms = Uniforms {
             index_to_world: index_to_world.to_cols_array_2d(),
@@ -5116,7 +5157,7 @@ mod tests {
         };
         queue.write_buffer(&renderer.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
-        const WIDTH: u32 = 64;
+        const WIDTH: u32 = 128;
         const HEIGHT: u32 = 64;
         let multisampled_color = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("far connected leak-light multisampled color"),
@@ -5238,16 +5279,33 @@ mod tests {
             .expect("readback callback must run")
             .expect("leak-light readback buffer must map");
         let pixels = slice.get_mapped_range();
-        let maximum_channel = |x| {
+        let maximum_channel = |x: u32| {
             let pixel = ((HEIGHT / 2 * WIDTH + x) * 4) as usize;
             pixels[pixel..pixel + 3].iter().copied().max().unwrap()
         };
-        let far = maximum_channel(WIDTH / 4);
-        let near = maximum_channel(WIDTH * 3 / 4);
+        let sample_center = |x: u32| {
+            let world_x = 0.28 * x as f32 - 0.98;
+            ((world_x + 1.0) * WIDTH as f32 * 0.5).round() as u32
+        };
+        let far = maximum_channel(sample_center(1));
+        let near = maximum_channel(sample_center(2));
+        let first_band_a = maximum_channel(sample_center(3));
+        let first_band_b = maximum_channel(sample_center(4));
+        let second_band = maximum_channel(sample_center(5));
+        let sealed = maximum_channel(sample_center(6));
         assert_eq!(far, 0, "a fully faded connected surface must be #000000");
         assert!(
             near > 80,
             "a zero-distance connected surface must remain visibly lit, got {near}"
         );
+        assert!(
+            first_band_a.abs_diff(first_band_b) <= 2,
+            "distances within one band must share a plateau, got {first_band_a} and {first_band_b}"
+        );
+        assert!(
+            first_band_b >= second_band.saturating_add(8),
+            "crossing a distance band must visibly reduce brightness, got {first_band_b} then {second_band}"
+        );
+        assert_eq!(sealed, 0, "a sealed surface must remain #000000");
     }
 }
