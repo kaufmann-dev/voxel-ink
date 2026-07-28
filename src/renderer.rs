@@ -51,6 +51,7 @@ struct VertexOutput {
     @location(3) index_position: vec3<f32>,
     @location(4) @interpolate(flat) face_axis: u32,
     @location(5) leak_distance: f32,
+    @location(6) @interpolate(flat) view_geometric_normal: vec3<f32>,
 };
 
 fn octahedral_sign_not_zero(value: f32) -> f32 {
@@ -127,6 +128,7 @@ fn expand_vertex(
     if (!positive) {
         index_normal = -index_normal;
     }
+    let geometric_index_normal = index_normal;
     // The occupancy-derived normal restores local curvature cues that the six
     // geometric voxel normals cannot express. Retaining a geometric component
     // keeps silhouettes and step changes visibly voxel-like.
@@ -138,6 +140,9 @@ fn expand_vertex(
     output.clip_position = uniforms.view_projection * world_position;
     output.view_normal = normalize(
         (uniforms.index_normal_to_view * vec4<f32>(index_normal, 0.0)).xyz,
+    );
+    output.view_geometric_normal = normalize(
+        (uniforms.index_normal_to_view * vec4<f32>(geometric_index_normal, 0.0)).xyz,
     );
     output.view_position = view_position.xyz;
     output.corner_occlusion = f32((packed >> (13u + corner * 2u)) & 3u);
@@ -216,7 +221,8 @@ fn leak_heatmap(intensity: f32) -> vec3<f32> {
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let view_direction = normalize(-input.view_position);
     var normal = normalize(input.view_normal);
-    let geometric_back_facing = dot(normal, view_direction) < 0.0;
+    let geometric_back_facing =
+        dot(normalize(input.view_geometric_normal), view_direction) < 0.0;
     let surface_factor = select(1.0, 0.68, geometric_back_facing);
     if (geometric_back_facing) {
         normal = -normal;
@@ -3406,6 +3412,14 @@ mod tests {
         assert!(SHADER.contains("let encoded = (packed >> 22u) & 0x3ffu;"));
         assert!(SHADER.contains("index_normal = normalize("));
         assert!(SHADER.contains("0.35 * index_normal + 0.65 * decode_shading_normal(packed)"));
+        assert!(
+            SHADER.contains("@location(6) @interpolate(flat) view_geometric_normal: vec3<f32>")
+        );
+        assert!(SHADER.contains("output.view_geometric_normal = normalize("));
+        assert!(
+            SHADER.contains("dot(normalize(input.view_geometric_normal), view_direction) < 0.0")
+        );
+        assert!(!SHADER.contains("let geometric_back_facing = dot(normal, view_direction) < 0.0;"));
     }
 
     #[test]
@@ -5372,6 +5386,275 @@ mod tests {
         assert!(
             upper_bent > lower_bent + 80,
             "occupancy normals did not create enough relief contrast: {upper_bent} vs {lower_bent}"
+        );
+    }
+
+    #[test]
+    fn headless_software_vulkan_keeps_grazing_front_faces_exterior_shaded() {
+        if std::env::var_os("VOXEL_INK_REQUIRE_SOFTWARE_VULKAN").is_none() {
+            eprintln!("set VOXEL_INK_REQUIRE_SOFTWARE_VULKAN=1 to exercise Mesa Vulkan");
+            return;
+        }
+
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::VULKAN;
+        let instance = wgpu::Instance::new(descriptor);
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            force_fallback_adapter: true,
+            compatible_surface: None,
+        }))
+        .expect("Mesa software Vulkan adapter must be available");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("software Vulkan device must initialize");
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let coordinate = ChunkCoord::new(0, 0, 0);
+        let quad = CompactQuad::new_with_shading_normal(
+            [0, 0, 0],
+            1,
+            1,
+            crate::mesh::FaceAxis::Z,
+            true,
+            [0; 4],
+            [0.0, 0.707_106_77, 0.707_106_77],
+        )
+        .unwrap();
+        let mut renderer = GpuVolumeRenderer::new(&device, format, false);
+        let mut leak_renderer = GpuVolumeRenderer::new(&device, format, false);
+        for target in [&mut renderer, &mut leak_renderer] {
+            target.apply_update(
+                &device,
+                &queue,
+                SceneUpdate::Reset {
+                    epoch: 1,
+                    revision: 1,
+                    dimensions: [1; 3],
+                    affine: SceneState::default().affine,
+                },
+            );
+            target.apply_update(
+                &device,
+                &queue,
+                SceneUpdate::Chunk {
+                    tag: MeshJobTag {
+                        document_epoch: 1,
+                        revision: 1,
+                        chunk_generation: 1,
+                        edit_generation: 0,
+                        chunk: coordinate,
+                    },
+                    quads: vec![quad],
+                    priority: MeshUpdatePriority::Background,
+                },
+            );
+        }
+        let leak_distance = [PackedLeakDistance::new([0; 4]).unwrap()];
+        let leak_distance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("grazing front-face leak distance"),
+            contents: bytemuck::cast_slice(&leak_distance),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        leak_renderer
+            .chunks
+            .get_mut(&coordinate)
+            .unwrap()
+            .leak_distance = Some(leak_distance_buffer);
+
+        let index_to_world = Mat4::from_scale_rotation_translation(
+            Vec3::splat(1.6),
+            glam::Quat::IDENTITY,
+            Vec3::new(0.0, 0.0, 0.8),
+        );
+        // At this Fly angle, the true +Z face still points toward the camera
+        // while its occupancy-smoothed normal has crossed slightly behind it.
+        let world_to_view = Mat4::from_translation(Vec3::new(0.0, 0.0, -2.0))
+            * Mat4::from_rotation_x((-63.0_f32).to_radians());
+        let index_normal_to_view = normal_matrix(world_to_view * index_to_world);
+        let view_geometric_normal = index_normal_to_view.transform_vector3(Vec3::Z).normalize();
+        let decoded_shading_normal = Vec3::from_array(quad.shading_normal());
+        let view_shading_normal = index_normal_to_view
+            .transform_vector3((0.35 * Vec3::Z + 0.65 * decoded_shading_normal).normalize())
+            .normalize();
+        assert!(
+            view_geometric_normal.z > 0.4,
+            "the test face must remain geometrically front-facing"
+        );
+        assert!(
+            view_shading_normal.z < -0.02,
+            "the smooth normal must point slightly away from the camera"
+        );
+
+        let projection =
+            Mat4::perspective_infinite_reverse_rh(FLY_FIELD_OF_VIEW_RADIANS, 1.0, 0.01);
+        let uniforms = Uniforms {
+            view_projection: (projection * world_to_view).to_cols_array_2d(),
+            index_to_world: index_to_world.to_cols_array_2d(),
+            world_to_view: world_to_view.to_cols_array_2d(),
+            index_normal_to_view: index_normal_to_view.to_cols_array_2d(),
+            inverse_scene_depth_span: 0.0,
+            ..Uniforms::default()
+        };
+        queue.write_buffer(&renderer.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        let leak_uniforms = Uniforms {
+            leak_light: 1,
+            ..uniforms
+        };
+        queue.write_buffer(
+            &leak_renderer.uniform_buffer,
+            0,
+            bytemuck::bytes_of(&leak_uniforms),
+        );
+
+        const PANE_SIZE: u32 = 64;
+        const WIDTH: u32 = PANE_SIZE * 2;
+        const HEIGHT: u32 = PANE_SIZE;
+        let texture = |label, sample_count, usage| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: WIDTH,
+                    height: HEIGHT,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let multisampled_color = texture(
+            "grazing front-face multisampled color",
+            MSAA_SAMPLES,
+            wgpu::TextureUsages::RENDER_ATTACHMENT,
+        );
+        let resolved_color = texture(
+            "grazing front-face resolved color",
+            1,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("grazing front-face depth"),
+            size: wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: MSAA_SAMPLES,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let multisampled_view = multisampled_color.create_view(&Default::default());
+        let resolved_view = resolved_color.create_view(&Default::default());
+        let depth_view = depth.create_view(&Default::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("grazing front-face encoder"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("grazing front-face pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &multisampled_view,
+                    depth_slice: None,
+                    resolve_target: Some(&resolved_view),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Discard,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            for pane in 0..2 {
+                let x = pane * PANE_SIZE;
+                pass.set_viewport(x as f32, 0.0, PANE_SIZE as f32, PANE_SIZE as f32, 0.0, 1.0);
+                pass.set_scissor_rect(x, 0, PANE_SIZE, PANE_SIZE);
+                pass.set_pipeline(&renderer.depth_reset_pipeline);
+                pass.draw(0..3, 0..1);
+                if pane == 0 {
+                    let chunk = renderer.chunks.get(&coordinate).unwrap();
+                    pass.set_bind_group(0, &renderer.bind_group, &[]);
+                    pass.set_pipeline(&renderer.pipeline);
+                    pass.set_vertex_buffer(0, chunk.buffer.slice(..));
+                    pass.draw(0..6, 0..chunk.instances);
+                } else {
+                    let chunk = leak_renderer.chunks.get(&coordinate).unwrap();
+                    pass.set_bind_group(0, &leak_renderer.bind_group, &[]);
+                    pass.set_pipeline(&leak_renderer.leak_pipeline);
+                    pass.set_vertex_buffer(1, chunk.leak_distance.as_ref().unwrap().slice(..));
+                    pass.set_vertex_buffer(0, chunk.buffer.slice(..));
+                    pass.draw(0..6, 0..chunk.instances);
+                }
+            }
+        }
+
+        let bytes_per_row = WIDTH * size_of::<u32>() as u32;
+        let output = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("grazing front-face readback"),
+            size: u64::from(bytes_per_row * HEIGHT),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            resolved_color.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &output,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+        );
+        let submission = queue.submit([encoder.finish()]);
+        let slice = output.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(std::time::Duration::from_secs(10)),
+            })
+            .expect("software Vulkan grazing front-face render must complete");
+        receiver
+            .recv()
+            .expect("readback callback must run")
+            .expect("grazing front-face readback buffer must map");
+        let pixels = slice.get_mapped_range();
+        let sample = |x: u32| {
+            let offset = ((HEIGHT / 2 * WIDTH + x) * 4) as usize;
+            [pixels[offset], pixels[offset + 1], pixels[offset + 2]]
+        };
+        let normal = sample(PANE_SIZE / 2);
+        let leak = sample(PANE_SIZE + PANE_SIZE / 2);
+        assert!(
+            normal.into_iter().map(u16::from).sum::<u16>() > 350,
+            "the grazing front face received interior material shading: {normal:?}"
+        );
+        assert!(
+            leak[0] > 215 && leak[1] > 220 && leak[2] > 75,
+            "the grazing front face received interior leak-light shading: {leak:?}"
         );
     }
 
