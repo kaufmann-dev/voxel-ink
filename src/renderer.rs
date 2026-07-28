@@ -13,12 +13,15 @@ use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
 use crate::{
-    brush::Ray,
+    brush::{Ray, SegmentSweep, segment_surface_hit_with_occupancy},
     mesh::{
         CHUNK_SIZE, ChunkCoord, CompactQuad, MeshJobTag, MeshUpdatePriority, PackedLeakDistance,
         pack_leak_distances,
     },
-    volume::{LeakDistanceField, Matrix4},
+    volume::{
+        LeakDistanceField, Matrix4, SharedOccupancy, SharedOccupancyRead, linear_index,
+        transform_point, transform_vector,
+    },
 };
 
 const SHADER: &str = r#"
@@ -499,6 +502,9 @@ const FLY_INITIAL_SPEED_RADIUS_FACTOR: f32 = 0.15;
 const FLY_MAX_SPEED_RADIUS_FACTOR: f32 = 2.0;
 const FLY_CLIP_EPSILON_RADIUS_FACTOR: f32 = 1.0e-4;
 const FLY_CLIP_MARGIN_RADIUS_FACTOR: f32 = 0.01;
+const FLY_COLLISION_SKIN_VOXELS: f64 = 1.0e-4;
+const MAX_FLY_COLLISION_CONTACTS: usize = 3;
+const MAX_FLY_COLLISION_VOXEL_STEPS: usize = 65_536;
 // These independent caps keep CPU adjacency work and GPU boundary work bounded.
 // Four million 16-byte faces occupy 64 MB and invoke at most 24 million vertices;
 // the sample scan's 50 mm volume is about 1.64 M voxels but only 92,160 faces.
@@ -558,6 +564,16 @@ pub enum FlyMovementBasis {
     Level,
     /// Follow the camera's full yaw-and-pitch view direction.
     ViewRelative,
+}
+
+/// Whether Fly movement passes through or collides with occupied voxels.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FlyCollisionMode {
+    /// Preserve unrestricted flight through all volume geometry.
+    #[default]
+    PassThrough,
+    /// Sweep the camera viewpoint against occupied voxels.
+    SolidVoxels,
 }
 
 /// Signed movement axes for one Fly-mode frame.
@@ -953,15 +969,27 @@ struct SceneState {
     revision: u64,
     dimensions: [u32; 3],
     affine: Matrix4,
+    world_to_index: Matrix4,
+    occupancy: Option<SharedOccupancy>,
     view_mode: VolumeViewMode,
     orbit: OrbitCameraState,
     fly: Option<FlyCameraState>,
     fly_movement_basis: FlyMovementBasis,
+    fly_collision_mode: FlyCollisionMode,
     voxel_seams: bool,
     leak_light: bool,
     leak_half_distance: f32,
     aspect: f32,
     updates: VecDeque<SceneUpdate>,
+}
+
+struct SceneReset {
+    epoch: u64,
+    revision: u64,
+    dimensions: [u32; 3],
+    affine: Matrix4,
+    world_to_index: Matrix4,
+    occupancy: Option<SharedOccupancy>,
 }
 
 impl Default for SceneState {
@@ -976,10 +1004,18 @@ impl Default for SceneState {
                 [0.0, 0.0, 1.0, 0.0],
                 [0.0, 0.0, 0.0, 1.0],
             ],
+            world_to_index: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            occupancy: None,
             view_mode: VolumeViewMode::Orbit,
             orbit: OrbitCameraState::default(),
             fly: None,
             fly_movement_basis: FlyMovementBasis::default(),
+            fly_collision_mode: FlyCollisionMode::default(),
             voxel_seams: true,
             leak_light: false,
             leak_half_distance: 1.0,
@@ -1005,18 +1041,37 @@ impl SceneBridge {
         *self.repaint.lock().expect("3D repaint context poisoned") = Some(context);
     }
 
-    pub fn reset(&self, epoch: u64, revision: u64, dimensions: [u32; 3], affine: Matrix4) {
-        self.reset_scene(epoch, revision, dimensions, affine, false);
-    }
-
-    fn reset_scene(
+    pub fn reset(
         &self,
         epoch: u64,
         revision: u64,
         dimensions: [u32; 3],
         affine: Matrix4,
-        force_navigation_reset: bool,
+        world_to_index: Matrix4,
+        occupancy: SharedOccupancy,
     ) {
+        self.reset_scene(
+            SceneReset {
+                epoch,
+                revision,
+                dimensions,
+                affine,
+                world_to_index,
+                occupancy: Some(occupancy),
+            },
+            false,
+        );
+    }
+
+    fn reset_scene(&self, reset: SceneReset, force_navigation_reset: bool) {
+        let SceneReset {
+            epoch,
+            revision,
+            dimensions,
+            affine,
+            world_to_index,
+            occupancy,
+        } = reset;
         let mut state = self.state.lock().expect("3D scene state poisoned");
         self.cancel_highlight_build_locked();
         if force_navigation_reset || state.epoch != epoch {
@@ -1026,6 +1081,8 @@ impl SceneBridge {
         state.revision = revision;
         state.dimensions = dimensions;
         state.affine = affine;
+        state.world_to_index = world_to_index;
+        state.occupancy = occupancy;
         self.leak_distance_ready.store(false, Ordering::Release);
         self.leak_distance_available.store(false, Ordering::Release);
         state.updates.clear();
@@ -1124,7 +1181,18 @@ impl SceneBridge {
     }
 
     pub fn clear(&self) {
-        self.reset_scene(0, 0, [1; 3], SceneState::default().affine, true);
+        let default = SceneState::default();
+        self.reset_scene(
+            SceneReset {
+                epoch: 0,
+                revision: 0,
+                dimensions: [1; 3],
+                affine: default.affine,
+                world_to_index: default.world_to_index,
+                occupancy: None,
+            },
+            true,
+        );
     }
 
     /// Returns and clears the latest failure from a current highlight request.
@@ -1173,6 +1241,41 @@ impl SceneBridge {
         state.fly_movement_basis = basis;
         drop(state);
         self.request_repaint();
+    }
+
+    #[must_use]
+    pub fn fly_collision_mode(&self) -> FlyCollisionMode {
+        self.state
+            .lock()
+            .expect("3D scene state poisoned")
+            .fly_collision_mode
+    }
+
+    pub fn set_fly_collision_mode(&self, mode: FlyCollisionMode) {
+        let mut state = self.state.lock().expect("3D scene state poisoned");
+        if state.fly_collision_mode == mode {
+            return;
+        }
+        state.fly_collision_mode = mode;
+        if mode == FlyCollisionMode::SolidVoxels {
+            let _ = recover_fly_if_inside(&mut state);
+        }
+        drop(state);
+        self.request_repaint();
+    }
+
+    /// Moves an overlapping collision-enabled Fly camera back to its safe home.
+    ///
+    /// This is called after engine events so edits that fill the camera voxel
+    /// cannot leave the next rendered frame inside solid geometry.
+    pub fn reconcile_fly_collision(&self) -> bool {
+        let mut state = self.state.lock().expect("3D scene state poisoned");
+        let changed = recover_fly_if_inside(&mut state);
+        drop(state);
+        if changed {
+            self.request_repaint();
+        }
+        changed
     }
 
     #[must_use]
@@ -1375,22 +1478,29 @@ impl SceneBridge {
         self.request_repaint();
     }
 
-    pub fn fly_move(&self, movement: FlyMovement, delta_seconds: f32) {
+    pub fn fly_move(&self, movement: FlyMovement, delta_seconds: f32) -> bool {
         if !delta_seconds.is_finite()
             || delta_seconds <= 0.0
             || !movement.forward.is_finite()
             || !movement.right.is_finite()
             || !movement.world_up.is_finite()
         {
-            return;
+            return false;
         }
         let mut state = self.state.lock().expect("3D scene state poisoned");
         if state.view_mode != VolumeViewMode::Fly {
-            return;
+            return false;
+        }
+        if state.fly_collision_mode == FlyCollisionMode::SolidVoxels
+            && recover_fly_if_inside(&mut state)
+        {
+            drop(state);
+            self.request_repaint();
+            return true;
         }
         let movement_basis = state.fly_movement_basis;
-        let Some(fly) = state.fly.as_mut() else {
-            return;
+        let Some(fly) = state.fly else {
+            return false;
         };
         let forward_axis = movement.forward.clamp(-1.0, 1.0);
         let right_axis = movement.right.clamp(-1.0, 1.0);
@@ -1403,7 +1513,7 @@ impl SceneBridge {
         let direction = (forward * forward_axis + right * right_axis + Vec3::Z * world_up_axis)
             .normalize_or_zero();
         if direction == Vec3::ZERO {
-            return;
+            return false;
         }
         let boost = if movement.boost {
             FLY_BOOST_MULTIPLIER
@@ -1411,13 +1521,40 @@ impl SceneBridge {
             1.0
         };
         let delta_seconds = delta_seconds.min(MAX_FLY_FRAME_DELTA_SECONDS);
-        let position = fly.position + direction * fly.speed * boost * delta_seconds;
+        let displacement = direction * fly.speed * boost * delta_seconds;
+        let position = match state.fly_collision_mode {
+            FlyCollisionMode::PassThrough => fly.position + displacement,
+            FlyCollisionMode::SolidVoxels => {
+                let Some(occupancy) = state.occupancy.clone() else {
+                    return false;
+                };
+                let Some(occupancy) = occupancy.try_read() else {
+                    return false;
+                };
+                resolve_fly_collision(
+                    state.dimensions,
+                    state.affine,
+                    state.world_to_index,
+                    fly.position,
+                    displacement,
+                    &occupancy,
+                )
+            }
+        };
         if !position.is_finite() {
-            return;
+            return false;
         }
-        fly.position = position;
+        if position == fly.position {
+            return false;
+        }
+        state
+            .fly
+            .as_mut()
+            .expect("the Fly camera remains initialized")
+            .position = position;
         drop(state);
         self.request_repaint();
+        true
     }
 
     pub fn adjust_fly_speed(&self, wheel_delta: f32) {
@@ -1660,6 +1797,174 @@ fn queue_chunk_update(
         })
         .unwrap_or(updates.len());
     updates.insert(insertion_index, update);
+}
+
+fn recover_fly_if_inside(state: &mut SceneState) -> bool {
+    if state.fly_collision_mode != FlyCollisionMode::SolidVoxels {
+        return false;
+    }
+    let Some(fly) = state.fly else {
+        return false;
+    };
+    let Some(occupancy) = state.occupancy.clone() else {
+        return false;
+    };
+    let Some(occupancy) = occupancy.try_read() else {
+        return false;
+    };
+    if fly_position_occupied(
+        state.dimensions,
+        state.world_to_index,
+        fly.position,
+        &occupancy,
+    ) != Some(true)
+    {
+        return false;
+    }
+    state
+        .fly
+        .as_mut()
+        .expect("the checked Fly camera remains initialized")
+        .position = fly.home.position;
+    true
+}
+
+fn fly_position_occupied(
+    dimensions: [u32; 3],
+    world_to_index: Matrix4,
+    position: Vec3,
+    occupancy: &SharedOccupancyRead<'_>,
+) -> Option<bool> {
+    if occupancy.dimensions() != dimensions {
+        return None;
+    }
+    let index = transform_point(
+        world_to_index,
+        [
+            f64::from(position.x),
+            f64::from(position.y),
+            f64::from(position.z),
+        ],
+    );
+    if !index.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    let voxel = index.map(|value| (value + 0.5).floor());
+    if voxel
+        .iter()
+        .zip(dimensions)
+        .any(|(&coordinate, dimension)| coordinate < 0.0 || coordinate >= f64::from(dimension))
+    {
+        return Some(false);
+    }
+    let voxel = voxel.map(|coordinate| coordinate as u32);
+    occupancy.occupied(linear_index(dimensions, voxel)?)
+}
+
+fn resolve_fly_collision(
+    dimensions: [u32; 3],
+    index_to_world: Matrix4,
+    world_to_index: Matrix4,
+    position: Vec3,
+    displacement: Vec3,
+    occupancy: &SharedOccupancyRead<'_>,
+) -> Vec3 {
+    if occupancy.dimensions() != dimensions {
+        return position;
+    }
+    let mut current = transform_point(
+        world_to_index,
+        [
+            f64::from(position.x),
+            f64::from(position.y),
+            f64::from(position.z),
+        ],
+    );
+    let mut remaining = transform_vector(
+        world_to_index,
+        [
+            f64::from(displacement.x),
+            f64::from(displacement.y),
+            f64::from(displacement.z),
+        ],
+    );
+    if !current
+        .iter()
+        .chain(&remaining)
+        .all(|value| value.is_finite())
+    {
+        return position;
+    }
+
+    for _ in 0..MAX_FLY_COLLISION_CONTACTS {
+        if remaining
+            .iter()
+            .all(|component| component.abs() <= f64::EPSILON)
+        {
+            break;
+        }
+        match segment_surface_hit_with_occupancy(
+            dimensions,
+            current,
+            remaining,
+            MAX_FLY_COLLISION_VOXEL_STEPS,
+            |index| occupancy.occupied(index),
+        ) {
+            SegmentSweep::Clear => {
+                for axis in 0..3 {
+                    current[axis] += remaining[axis];
+                }
+                break;
+            }
+            SegmentSweep::Indeterminate => break,
+            SegmentSweep::Hit(hit) => {
+                let entry_t = hit.entry_t.clamp(0.0, 1.0);
+                let mut contact =
+                    std::array::from_fn(|axis| current[axis] + remaining[axis] * entry_t);
+                let mut blocked = hit.entry_axes;
+                if !blocked.contains(&true) {
+                    let tolerance = f64::EPSILON
+                        * contact
+                            .iter()
+                            .chain(&remaining)
+                            .map(|value| value.abs())
+                            .fold(1.0_f64, f64::max)
+                        * 32.0;
+                    for axis in 0..3 {
+                        let minimum = f64::from(hit.voxel[axis]) - 0.5;
+                        let maximum = f64::from(hit.voxel[axis]) + 0.5;
+                        blocked[axis] = (remaining[axis] > 0.0
+                            && (contact[axis] - minimum).abs() <= tolerance)
+                            || (remaining[axis] < 0.0
+                                && (contact[axis] - maximum).abs() <= tolerance);
+                    }
+                }
+                if !blocked.contains(&true) {
+                    break;
+                }
+                let unconsumed = 1.0 - entry_t;
+                let incoming = remaining;
+                for axis in 0..3 {
+                    remaining[axis] *= unconsumed;
+                    if !blocked[axis] {
+                        continue;
+                    }
+                    if incoming[axis] > 0.0 {
+                        contact[axis] =
+                            f64::from(hit.voxel[axis]) - 0.5 - FLY_COLLISION_SKIN_VOXELS;
+                    } else if incoming[axis] < 0.0 {
+                        contact[axis] =
+                            f64::from(hit.voxel[axis]) + 0.5 + FLY_COLLISION_SKIN_VOXELS;
+                    }
+                    remaining[axis] = 0.0;
+                }
+                current = contact;
+            }
+        }
+    }
+
+    let world = transform_point(index_to_world, current);
+    Vec3::new(world[0] as f32, world[1] as f32, world[2] as f32)
 }
 
 fn reset_document_navigation(state: &mut SceneState) {
@@ -3117,6 +3422,72 @@ fn affine_mat4(matrix: Matrix4) -> Mat4 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        codecs::{BinvoxMetadata, CodecSaveState, SourceVariant},
+        volume::{SourceIdentity, SpatialUnits, VolumeDocument, VolumeGeometry},
+    };
+    use std::{path::PathBuf, time::SystemTime};
+
+    fn reset_bridge(
+        bridge: &SceneBridge,
+        epoch: u64,
+        revision: u64,
+        dimensions: [u32; 3],
+        affine: Matrix4,
+    ) {
+        let voxel_count = dimensions.into_iter().map(|axis| axis as usize).product();
+        let occupancy = vec![0; voxel_count];
+        let _ =
+            reset_bridge_with_occupancy(bridge, epoch, revision, dimensions, affine, &occupancy);
+    }
+
+    fn reset_bridge_with_occupancy(
+        bridge: &SceneBridge,
+        epoch: u64,
+        revision: u64,
+        dimensions: [u32; 3],
+        affine: Matrix4,
+        occupancy: &[u8],
+    ) -> SharedOccupancy {
+        let geometry = VolumeGeometry::new(dimensions, affine, SpatialUnits::Unknown).unwrap();
+        let (occupancy, _) = SharedOccupancy::from_binary(dimensions, occupancy).unwrap();
+        bridge.reset(
+            epoch,
+            revision,
+            dimensions,
+            affine,
+            geometry.world_to_index,
+            occupancy.clone(),
+        );
+        occupancy
+    }
+
+    fn test_document(dimensions: [u32; 3], occupancy: Vec<u8>) -> VolumeDocument {
+        VolumeDocument::new(
+            VolumeGeometry::new(
+                dimensions,
+                SceneState::default().affine,
+                SpatialUnits::Millimeter,
+            )
+            .unwrap(),
+            occupancy,
+            SourceIdentity {
+                canonical_path: PathBuf::from("/tmp/renderer-collision.binvox"),
+                size: 0,
+                modified: SystemTime::UNIX_EPOCH,
+                sha256: [0; 32],
+            },
+            SourceVariant::Binvox { version: 1 },
+            CodecSaveState::Binvox(BinvoxMetadata {
+                version: 1,
+                dimensions,
+                translation: [0.0; 3],
+                scale: 1.0,
+            }),
+            false,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn row_major_affine_is_transposed_for_wgsl_columns() {
@@ -3345,7 +3716,7 @@ mod tests {
     #[test]
     fn latest_leak_field_generation_replaces_queued_work_and_clears_readiness() {
         let bridge = SceneBridge::default();
-        bridge.reset(7, 3, [2; 3], SceneState::default().affine);
+        reset_bridge(&bridge, 7, 3, [2; 3], SceneState::default().affine);
         let field = Arc::new(
             crate::volume::compute_leak_distance(
                 &[0; 8],
@@ -3577,7 +3948,7 @@ mod tests {
     #[test]
     fn invalidation_queues_only_a_revision_advance() {
         let bridge = SceneBridge::default();
-        bridge.reset(4, 8, [32; 3], SceneState::default().affine);
+        reset_bridge(&bridge, 4, 8, [32; 3], SceneState::default().affine);
         bridge.invalidate(4, 9, vec![ChunkCoord::new(0, 0, 0)]);
         let state = bridge.state.lock().unwrap();
         assert_eq!(state.revision, 9);
@@ -3591,7 +3962,7 @@ mod tests {
     #[test]
     fn highlight_replaces_pending_highlight_and_removes_shared_internal_faces() {
         let bridge = SceneBridge::default();
-        bridge.reset(4, 8, [4, 5, 6], SceneState::default().affine);
+        reset_bridge(&bridge, 4, 8, [4, 5, 6], SceneState::default().affine);
         assert!(bridge.set_voxel_highlight(
             4,
             8,
@@ -3800,7 +4171,7 @@ mod tests {
     #[test]
     fn stale_highlight_is_ignored_and_invalidation_clears_a_pending_highlight() {
         let bridge = SceneBridge::default();
-        bridge.reset(7, 11, [8; 3], SceneState::default().affine);
+        reset_bridge(&bridge, 7, 11, [8; 3], SceneState::default().affine);
         let highlight = vec![([1, 1, 1], VoxelHighlightKind::Paint)];
         assert!(!bridge.set_voxel_highlight(6, 11, highlight.clone()));
         assert!(!bridge.set_voxel_highlight(7, 10, highlight.clone()));
@@ -3834,7 +4205,7 @@ mod tests {
     #[test]
     fn highlight_follows_live_chunks_and_precedes_background_backlog() {
         let bridge = SceneBridge::default();
-        bridge.reset(3, 6, [64, 8, 8], SceneState::default().affine);
+        reset_bridge(&bridge, 3, 6, [64, 8, 8], SceneState::default().affine);
         let tag = |chunk, priority| MeshJobTag {
             document_epoch: 3,
             revision: 6,
@@ -3905,7 +4276,7 @@ mod tests {
             edit_generation: 0,
             chunk,
         };
-        bridge.reset(4, 8, [128, 32, 32], affine);
+        reset_bridge(&bridge, 4, 8, [128, 32, 32], affine);
         bridge.insert_chunk(
             tag(8, 1, replaced),
             Vec::new(),
@@ -3968,7 +4339,7 @@ mod tests {
     #[test]
     fn only_current_highlight_failures_are_reported_once() {
         let bridge = SceneBridge::default();
-        bridge.reset(3, 6, [8; 3], SceneState::default().affine);
+        reset_bridge(&bridge, 3, 6, [8; 3], SceneState::default().affine);
         let generation = bridge.highlight_generation.load(Ordering::Acquire);
         bridge.finish_highlight_build(
             3,
@@ -4001,7 +4372,7 @@ mod tests {
     #[test]
     fn clearing_highlight_replaces_pending_highlight_after_document_transition() {
         let bridge = SceneBridge::default();
-        bridge.reset(2, 3, [8; 3], SceneState::default().affine);
+        reset_bridge(&bridge, 2, 3, [8; 3], SceneState::default().affine);
         assert!(bridge.set_voxel_highlight(2, 3, vec![([4, 4, 4], VoxelHighlightKind::Paint)],));
         bridge.clear_voxel_highlight();
 
@@ -4074,7 +4445,8 @@ mod tests {
     #[test]
     fn first_fly_entry_preserves_the_pan_aware_orbit_viewpoint() {
         let bridge = SceneBridge::default();
-        bridge.reset(
+        reset_bridge(
+            &bridge,
             3,
             7,
             [31, 17, 9],
@@ -4114,7 +4486,8 @@ mod tests {
     #[test]
     fn unpanned_affine_fly_center_ray_points_at_the_transformed_volume_center() {
         let bridge = SceneBridge::default();
-        bridge.reset(
+        reset_bridge(
+            &bridge,
             2,
             1,
             [13, 9, 7],
@@ -4140,7 +4513,7 @@ mod tests {
     fn mode_switches_and_revision_resets_preserve_both_cameras() {
         let bridge = SceneBridge::default();
         let affine = SceneState::default().affine;
-        bridge.reset(4, 1, [32; 3], affine);
+        reset_bridge(&bridge, 4, 1, [32; 3], affine);
         bridge.orbit(egui::vec2(25.0, -14.0));
         bridge.pan(egui::vec2(30.0, -20.0), egui::vec2(800.0, 600.0));
         bridge.set_view_mode(VolumeViewMode::Fly);
@@ -4156,7 +4529,7 @@ mod tests {
 
         bridge.set_view_mode(VolumeViewMode::Fly);
         assert_eq!(bridge.state.lock().unwrap().fly, Some(remembered_fly));
-        bridge.reset(4, 2, [32; 3], affine);
+        reset_bridge(&bridge, 4, 2, [32; 3], affine);
         {
             let state = bridge.state.lock().unwrap();
             assert_eq!(state.view_mode, VolumeViewMode::Fly);
@@ -4164,7 +4537,7 @@ mod tests {
             assert_eq!(state.orbit, remembered_orbit);
         }
 
-        bridge.reset(5, 1, [32; 3], affine);
+        reset_bridge(&bridge, 5, 1, [32; 3], affine);
         {
             let state = bridge.state.lock().unwrap();
             assert_eq!(state.view_mode, VolumeViewMode::Orbit);
@@ -4194,7 +4567,7 @@ mod tests {
         assert_eq!(bridge.fly_movement_basis(), FlyMovementBasis::Level);
 
         bridge.set_fly_movement_basis(FlyMovementBasis::ViewRelative);
-        bridge.reset(3, 1, [12; 3], SceneState::default().affine);
+        reset_bridge(&bridge, 3, 1, [12; 3], SceneState::default().affine);
         assert_eq!(bridge.fly_movement_basis(), FlyMovementBasis::ViewRelative);
 
         bridge.set_view_mode(VolumeViewMode::Fly);
@@ -4208,7 +4581,7 @@ mod tests {
     #[test]
     fn reset_view_only_restores_the_active_camera() {
         let bridge = SceneBridge::default();
-        bridge.reset(8, 1, [24, 18, 12], SceneState::default().affine);
+        reset_bridge(&bridge, 8, 1, [24, 18, 12], SceneState::default().affine);
         bridge.orbit(egui::vec2(42.0, -17.0));
         bridge.pan(egui::vec2(55.0, 21.0), egui::vec2(800.0, 600.0));
         let orbit_at_fly_entry = bridge.state.lock().unwrap().orbit;
@@ -4239,7 +4612,7 @@ mod tests {
     #[test]
     fn fly_look_and_speed_are_bounded_and_reject_non_finite_input() {
         let bridge = SceneBridge::default();
-        bridge.reset(6, 1, [40, 30, 20], SceneState::default().affine);
+        reset_bridge(&bridge, 6, 1, [40, 30, 20], SceneState::default().affine);
         bridge.set_view_mode(VolumeViewMode::Fly);
         bridge.fly_look(egui::vec2(f32::MAX, f32::MAX));
         {
@@ -4290,7 +4663,7 @@ mod tests {
         assert!(bridge.voxel_seams());
 
         bridge.set_voxel_seams(false);
-        bridge.reset(12, 1, [8; 3], SceneState::default().affine);
+        reset_bridge(&bridge, 12, 1, [8; 3], SceneState::default().affine);
         bridge.set_view_mode(VolumeViewMode::Fly);
         bridge.reset_view();
         bridge.set_view_mode(VolumeViewMode::Orbit);
@@ -4309,17 +4682,17 @@ mod tests {
         bridge.set_leak_light(true);
         assert!(bridge.leak_light());
         assert_eq!(scene_uniforms(&bridge.state.lock().unwrap()).leak_light, 1);
-        bridge.reset(0, 1, [8; 3], SceneState::default().affine);
+        reset_bridge(&bridge, 0, 1, [8; 3], SceneState::default().affine);
         assert!(bridge.leak_light());
 
-        bridge.reset(1, 1, [8; 3], SceneState::default().affine);
+        reset_bridge(&bridge, 1, 1, [8; 3], SceneState::default().affine);
         assert!(!bridge.leak_light());
     }
 
     #[test]
     fn fly_movement_bases_use_expected_forward_strafe_world_z_boost_and_delta() {
         let bridge = SceneBridge::default();
-        bridge.reset(9, 1, [20; 3], SceneState::default().affine);
+        reset_bridge(&bridge, 9, 1, [20; 3], SceneState::default().affine);
         bridge.set_view_mode(VolumeViewMode::Fly);
         let start = Vec3::new(11.0, -7.0, 3.0);
         let yaw = 0.4;
@@ -4379,6 +4752,256 @@ mod tests {
         bridge.fly_move(FlyMovement::new(f32::NAN, 0.0, 0.0, false), 0.05);
         bridge.fly_move(FlyMovement::new(1.0, 0.0, 0.0, false), f32::NAN);
         assert_eq!(position(), before_invalid);
+    }
+
+    #[test]
+    fn fly_collision_defaults_to_pass_through_and_blocks_high_speed_tunneling_when_enabled() {
+        let dimensions = [6, 5, 5];
+        let mut occupancy = vec![0; dimensions.into_iter().product::<u32>() as usize];
+        occupancy[linear_index(dimensions, [2, 2, 2]).unwrap() as usize] = 1;
+        let bridge = SceneBridge::default();
+        let _ = reset_bridge_with_occupancy(
+            &bridge,
+            1,
+            1,
+            dimensions,
+            SceneState::default().affine,
+            &occupancy,
+        );
+        bridge.set_view_mode(VolumeViewMode::Fly);
+        let set_pose = || {
+            let mut state = bridge.state.lock().unwrap();
+            let fly = state.fly.as_mut().unwrap();
+            fly.position = Vec3::new(0.0, 2.0, 2.0);
+            fly.yaw = 0.0;
+            fly.pitch = 0.0;
+            fly.speed = 50.0;
+        };
+
+        assert_eq!(bridge.fly_collision_mode(), FlyCollisionMode::PassThrough);
+        set_pose();
+        assert!(bridge.fly_move(FlyMovement::new(1.0, 0.0, 0.0, false), 0.1));
+        assert_vec3_close(
+            bridge.state.lock().unwrap().fly.unwrap().position,
+            Vec3::new(5.0, 2.0, 2.0),
+            1.0e-5,
+        );
+
+        set_pose();
+        bridge.set_fly_collision_mode(FlyCollisionMode::SolidVoxels);
+        assert!(bridge.fly_move(FlyMovement::new(1.0, 0.0, 0.0, false), 0.1));
+        let collided = bridge.state.lock().unwrap().fly.unwrap().position;
+        assert!((collided.x - (1.5 - FLY_COLLISION_SKIN_VOXELS as f32)).abs() < 1.0e-5);
+        assert!((collided.y - 2.0).abs() < 1.0e-5);
+        assert!((collided.z - 2.0).abs() < 1.0e-5);
+
+        assert!(
+            !bridge.fly_move(FlyMovement::new(1.0, 0.0, 0.0, false), 0.1),
+            "repeated movement into the same wall should remain at the contact skin"
+        );
+        assert_vec3_close(
+            bridge.state.lock().unwrap().fly.unwrap().position,
+            collided,
+            1.0e-6,
+        );
+    }
+
+    #[test]
+    fn fly_collision_slides_along_voxel_walls() {
+        let dimensions = [6, 6, 5];
+        let mut occupancy = vec![0; dimensions.into_iter().product::<u32>() as usize];
+        for y in 0..dimensions[1] {
+            occupancy[linear_index(dimensions, [2, y, 2]).unwrap() as usize] = 1;
+        }
+        let bridge = SceneBridge::default();
+        let _ = reset_bridge_with_occupancy(
+            &bridge,
+            2,
+            1,
+            dimensions,
+            SceneState::default().affine,
+            &occupancy,
+        );
+        bridge.set_view_mode(VolumeViewMode::Fly);
+        bridge.set_fly_collision_mode(FlyCollisionMode::SolidVoxels);
+        {
+            let mut state = bridge.state.lock().unwrap();
+            let fly = state.fly.as_mut().unwrap();
+            fly.position = Vec3::new(0.0, 1.1, 2.0);
+            fly.yaw = 0.0;
+            fly.pitch = 0.0;
+            fly.speed = 30.0 * std::f32::consts::SQRT_2;
+        }
+
+        assert!(bridge.fly_move(FlyMovement::new(1.0, -1.0, 0.0, false), 0.1));
+        let position = bridge.state.lock().unwrap().fly.unwrap().position;
+        assert!((position.x - (1.5 - FLY_COLLISION_SKIN_VOXELS as f32)).abs() < 1.0e-5);
+        assert!((position.y - 4.1).abs() < 1.0e-5, "{position:?}");
+        assert!((position.z - 2.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn fly_collision_uses_the_complete_affine_for_sweeping_and_sliding() {
+        let dimensions = [6, 6, 5];
+        let affine = [
+            [-2.0, 0.5, 0.1, 10.0],
+            [0.0, 3.0, 0.2, -4.0],
+            [0.0, 0.0, 1.5, 2.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let geometry = VolumeGeometry::new(dimensions, affine, SpatialUnits::Millimeter).unwrap();
+        let mut bytes = vec![0; dimensions.into_iter().product::<u32>() as usize];
+        for y in 0..dimensions[1] {
+            bytes[linear_index(dimensions, [2, y, 2]).unwrap() as usize] = 1;
+        }
+        let (occupancy, _) = SharedOccupancy::from_binary(dimensions, &bytes).unwrap();
+        let occupancy = occupancy.try_read().unwrap();
+        let start_index = [0.0, 1.0, 2.0];
+        let displacement_index = [4.0, 2.0, 0.0];
+        let start_world = transform_point(geometry.index_to_world, start_index);
+        let displacement_world = transform_vector(geometry.index_to_world, displacement_index);
+        let resolved = resolve_fly_collision(
+            dimensions,
+            geometry.index_to_world,
+            geometry.world_to_index,
+            Vec3::new(
+                start_world[0] as f32,
+                start_world[1] as f32,
+                start_world[2] as f32,
+            ),
+            Vec3::new(
+                displacement_world[0] as f32,
+                displacement_world[1] as f32,
+                displacement_world[2] as f32,
+            ),
+            &occupancy,
+        );
+        let resolved_index = transform_point(
+            geometry.world_to_index,
+            [
+                f64::from(resolved.x),
+                f64::from(resolved.y),
+                f64::from(resolved.z),
+            ],
+        );
+        assert!(
+            (resolved_index[0] - (1.5 - FLY_COLLISION_SKIN_VOXELS)).abs() < 2.0e-5,
+            "{resolved_index:?}"
+        );
+        assert!(
+            (resolved_index[1] - 3.0).abs() < 2.0e-5,
+            "{resolved_index:?}"
+        );
+        assert!(
+            (resolved_index[2] - 2.0).abs() < 2.0e-5,
+            "{resolved_index:?}"
+        );
+    }
+
+    #[test]
+    fn fly_collision_keeps_empty_and_outside_paths_free_and_bounds_extreme_traversal() {
+        let identity = SceneState::default().affine;
+        let dimensions = [8, 1, 1];
+        let (occupancy, _) = SharedOccupancy::from_binary(dimensions, &[0; 8]).unwrap();
+        let occupancy = occupancy.try_read().unwrap();
+        assert_vec3_close(
+            resolve_fly_collision(
+                dimensions,
+                identity,
+                identity,
+                Vec3::new(-3.0, 0.0, 0.0),
+                Vec3::new(-10.0, 0.0, 0.0),
+                &occupancy,
+            ),
+            Vec3::new(-13.0, 0.0, 0.0),
+            1.0e-6,
+        );
+        assert_vec3_close(
+            resolve_fly_collision(
+                dimensions,
+                identity,
+                identity,
+                Vec3::new(-3.0, 0.0, 0.0),
+                Vec3::new(12.0, 0.0, 0.0),
+                &occupancy,
+            ),
+            Vec3::new(9.0, 0.0, 0.0),
+            1.0e-6,
+        );
+        drop(occupancy);
+
+        let long_dimensions = [70_000, 1, 1];
+        let long_bytes = vec![0; long_dimensions[0] as usize];
+        let (long_occupancy, _) =
+            SharedOccupancy::from_binary(long_dimensions, &long_bytes).unwrap();
+        let long_occupancy = long_occupancy.try_read().unwrap();
+        assert_eq!(
+            resolve_fly_collision(
+                long_dimensions,
+                identity,
+                identity,
+                Vec3::ZERO,
+                Vec3::new(69_999.0, 0.0, 0.0),
+                &long_occupancy,
+            ),
+            Vec3::ZERO,
+            "an unproven path must stop conservatively when its traversal budget is exhausted"
+        );
+    }
+
+    #[test]
+    fn fly_collision_recovers_from_live_edits_and_survives_document_resets() {
+        let dimensions = [5; 3];
+        let mut document = test_document(
+            dimensions,
+            vec![0; dimensions.into_iter().product::<u32>() as usize],
+        );
+        let geometry = document.geometry().clone();
+        let bridge = SceneBridge::default();
+        bridge.reset(
+            1,
+            document.revision(),
+            dimensions,
+            geometry.index_to_world,
+            geometry.world_to_index,
+            document.shared_occupancy(),
+        );
+        bridge.set_view_mode(VolumeViewMode::Fly);
+        bridge.set_fly_collision_mode(FlyCollisionMode::SolidVoxels);
+        let (home, yaw, pitch, speed) = {
+            let mut state = bridge.state.lock().unwrap();
+            let fly = state.fly.as_mut().unwrap();
+            fly.position = Vec3::new(2.0, 2.0, 2.0);
+            fly.yaw = 0.7;
+            fly.pitch = -0.2;
+            fly.speed = 3.5;
+            (fly.home.position, fly.yaw, fly.pitch, fly.speed)
+        };
+        document.begin_stroke(1).unwrap();
+        document
+            .apply_stroke_indices([linear_index(dimensions, [2; 3]).unwrap()])
+            .unwrap();
+
+        assert!(bridge.reconcile_fly_collision());
+        let recovered = bridge.state.lock().unwrap().fly.unwrap();
+        assert_eq!(recovered.position, home);
+        assert_eq!(recovered.yaw, yaw);
+        assert_eq!(recovered.pitch, pitch);
+        assert_eq!(recovered.speed, speed);
+
+        bridge.set_fly_collision_mode(FlyCollisionMode::PassThrough);
+        bridge.state.lock().unwrap().fly.as_mut().unwrap().position = Vec3::new(2.0, 2.0, 2.0);
+        bridge.set_fly_collision_mode(FlyCollisionMode::SolidVoxels);
+        let recovered_on_enable = bridge.state.lock().unwrap().fly.unwrap();
+        assert_eq!(recovered_on_enable.position, home);
+        assert_eq!(recovered_on_enable.yaw, yaw);
+        assert_eq!(recovered_on_enable.pitch, pitch);
+        assert_eq!(recovered_on_enable.speed, speed);
+
+        reset_bridge(&bridge, 2, 1, dimensions, SceneState::default().affine);
+        assert_eq!(bridge.fly_collision_mode(), FlyCollisionMode::SolidVoxels);
+        bridge.clear();
+        assert_eq!(bridge.fly_collision_mode(), FlyCollisionMode::SolidVoxels);
     }
 
     #[test]
@@ -4554,7 +5177,7 @@ mod tests {
     fn navigation_survives_remesh_reset_and_clears_for_a_new_document() {
         let bridge = SceneBridge::default();
         let affine = SceneState::default().affine;
-        bridge.reset(4, 1, [32; 3], affine);
+        reset_bridge(&bridge, 4, 1, [32; 3], affine);
         bridge.pan(egui::vec2(40.0, -30.0), egui::vec2(800.0, 600.0));
         bridge.orbit(egui::vec2(25.0, 10.0));
         bridge.zoom(1.5);
@@ -4563,13 +5186,13 @@ mod tests {
             state.orbit
         };
 
-        bridge.reset(4, 2, [32; 3], affine);
+        reset_bridge(&bridge, 4, 2, [32; 3], affine);
         {
             let state = bridge.state.lock().unwrap();
             assert_eq!(state.orbit, navigation);
         }
 
-        bridge.reset(5, 1, [32; 3], affine);
+        reset_bridge(&bridge, 5, 1, [32; 3], affine);
         let state = bridge.state.lock().unwrap();
         let defaults = SceneState::default();
         assert_eq!(state.orbit, defaults.orbit);
@@ -4579,7 +5202,7 @@ mod tests {
     fn reset_view_restores_navigation_defaults_without_changing_the_document() {
         let bridge = SceneBridge::default();
         let affine = SceneState::default().affine;
-        bridge.reset(7, 12, [32; 3], affine);
+        reset_bridge(&bridge, 7, 12, [32; 3], affine);
         bridge.orbit(egui::vec2(40.0, 25.0));
         bridge.pan(egui::vec2(80.0, -30.0), egui::vec2(800.0, 600.0));
         bridge.zoom(2.0);

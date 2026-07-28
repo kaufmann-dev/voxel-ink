@@ -1,4 +1,9 @@
-use std::{collections::HashSet, path::PathBuf, time::SystemTime};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
+    time::SystemTime,
+};
 
 use crate::{
     AppError, Result,
@@ -17,6 +22,87 @@ const SEALED_LEAK_DISTANCE: u16 = u16::MAX;
 const LEAK_DISTANCE_DIAGONALS: f64 = 8.0;
 
 pub type Matrix4 = [[f64; 4]; 4];
+
+/// A compact, read-only view of the document's live binary occupancy.
+///
+/// The document keeps this one-bit-per-voxel mask synchronized with its byte
+/// storage under a write lock. Consumers use [`Self::try_read`] so latency
+/// sensitive work can conservatively defer rather than block during an edit.
+#[derive(Clone)]
+pub struct SharedOccupancy {
+    dimensions: [u32; 3],
+    mask: Arc<RwLock<VoxelBitSet>>,
+}
+
+impl std::fmt::Debug for SharedOccupancy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SharedOccupancy")
+            .field("dimensions", &self.dimensions)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SharedOccupancy {
+    pub(crate) fn from_binary(dimensions: [u32; 3], occupancy: &[u8]) -> Result<(Self, u64)> {
+        let mut mask = VoxelBitSet::zeroed(occupancy.len())?;
+        let mut occupied_count = 0_u64;
+        for (index, &value) in occupancy.iter().enumerate() {
+            if value > 1 {
+                return Err(AppError::InvalidDimensions(
+                    "occupancy must contain only zero or one".into(),
+                ));
+            }
+            if value == 1 {
+                mask.insert(index);
+                occupied_count += 1;
+            }
+        }
+        Ok((
+            Self {
+                dimensions,
+                mask: Arc::new(RwLock::new(mask)),
+            },
+            occupied_count,
+        ))
+    }
+
+    #[must_use]
+    pub const fn dimensions(&self) -> [u32; 3] {
+        self.dimensions
+    }
+
+    /// Acquires a coherent occupancy snapshot without waiting for an edit.
+    #[must_use]
+    pub fn try_read(&self) -> Option<SharedOccupancyRead<'_>> {
+        self.mask.try_read().ok().map(|mask| SharedOccupancyRead {
+            dimensions: self.dimensions,
+            mask,
+        })
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, VoxelBitSet> {
+        self.mask.write().expect("shared occupancy mask poisoned")
+    }
+}
+
+pub struct SharedOccupancyRead<'a> {
+    dimensions: [u32; 3],
+    mask: RwLockReadGuard<'a, VoxelBitSet>,
+}
+
+impl SharedOccupancyRead<'_> {
+    #[must_use]
+    pub const fn dimensions(&self) -> [u32; 3] {
+        self.dimensions
+    }
+
+    #[must_use]
+    pub fn occupied(&self, index: u32) -> Option<bool> {
+        let index = usize::try_from(index).ok()?;
+        (index < self.mask.len).then(|| self.mask.contains(index))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SpatialUnits {
@@ -255,6 +341,7 @@ struct ActiveStroke {
 pub struct VolumeDocument {
     geometry: VolumeGeometry,
     occupancy: Vec<u8>,
+    shared_occupancy: SharedOccupancy,
     source_identity: SourceIdentity,
     source_variant: SourceVariant,
     save_state: CodecSaveState,
@@ -286,20 +373,14 @@ impl VolumeDocument {
                 occupancy.len()
             )));
         }
-        let mut occupied_count = 0_u64;
-        for &value in &occupancy {
-            if value > 1 {
-                return Err(AppError::InvalidDimensions(
-                    "occupancy must contain only zero or one".into(),
-                ));
-            }
-            occupied_count += u64::from(value);
-        }
+        let (shared_occupancy, occupied_count) =
+            SharedOccupancy::from_binary(geometry.dimensions, &occupancy)?;
         let revision = 1;
         Ok(Self {
             cursor: geometry.dimensions.map(|axis| axis / 2),
             geometry,
             occupancy,
+            shared_occupancy,
             source_identity,
             source_variant,
             save_state,
@@ -363,6 +444,11 @@ impl VolumeDocument {
     }
 
     #[must_use]
+    pub fn shared_occupancy(&self) -> SharedOccupancy {
+        self.shared_occupancy.clone()
+    }
+
+    #[must_use]
     pub const fn revision(&self) -> u64 {
         self.revision
     }
@@ -420,6 +506,7 @@ impl VolumeDocument {
         let stroke = self.active_stroke.as_mut().ok_or_else(|| {
             AppError::InvalidDimensions("a stroke must begin before samples are applied".into())
         })?;
+        let mut shared_occupancy = self.shared_occupancy.write();
         let mut changed = 0;
         for index in indices {
             let offset = usize::try_from(index).map_err(|_| {
@@ -464,6 +551,7 @@ impl VolumeDocument {
                 self.occupied_count -= 1;
             }
             *cell = stroke.value;
+            shared_occupancy.set(offset, stroke.value == 1);
             stroke.indices.push(index);
             changed += 1;
         }
@@ -517,8 +605,10 @@ impl VolumeDocument {
             return;
         };
         let old_value = 1 - stroke.value;
+        let mut shared_occupancy = self.shared_occupancy.write();
         for index in stroke.indices {
             self.occupancy[index as usize] = old_value;
+            shared_occupancy.set(index as usize, old_value == 1);
             if old_value == 1 {
                 self.occupied_count += 1;
             } else {
@@ -594,11 +684,14 @@ impl VolumeDocument {
             return Ok(0);
         }
         let added = spans.iter().map(|span| u64::from(span.len)).sum();
+        let mut shared_occupancy = self.shared_occupancy.write();
         for span in &spans {
             let start = span.start as usize;
             let end = start + span.len as usize;
             self.occupancy[start..end].fill(1);
+            shared_occupancy.fill(start, end, true);
         }
+        drop(shared_occupancy);
         self.occupied_count += added;
         let before_revision = self.revision;
         let after_revision = self.allocate_revision();
@@ -743,10 +836,12 @@ impl VolumeDocument {
     }
 
     fn apply_transaction(&mut self, transaction: &Transaction, value: u8) {
+        let mut shared_occupancy = self.shared_occupancy.write();
         match &transaction.changes {
             TransactionChanges::Indices(indices) => {
                 for &index in indices {
                     self.occupancy[index as usize] = value;
+                    shared_occupancy.set(index as usize, value == 1);
                 }
             }
             TransactionChanges::Spans(spans) => {
@@ -754,6 +849,7 @@ impl VolumeDocument {
                     let start = span.start as usize;
                     let end = start + span.len as usize;
                     self.occupancy[start..end].fill(value);
+                    shared_occupancy.fill(start, end, value == 1);
                 }
             }
         }
@@ -785,6 +881,7 @@ pub(crate) fn compute_leak_distance(
 
 #[derive(Debug)]
 struct VoxelBitSet {
+    len: usize,
     words: Vec<u64>,
 }
 
@@ -799,19 +896,75 @@ impl VoxelBitSet {
             .try_reserve_exact(word_count)
             .map_err(|_| AppError::Allocation { bytes })?;
         words.resize(word_count, 0);
-        Ok(Self { words })
+        Ok(Self { len, words })
     }
 
     fn contains(&self, index: usize) -> bool {
+        debug_assert!(index < self.len);
         let word = index / u64::BITS as usize;
         let bit = index % u64::BITS as usize;
         self.words[word] & (1_u64 << bit) != 0
     }
 
     fn insert(&mut self, index: usize) {
+        self.set(index, true);
+    }
+
+    fn set(&mut self, index: usize, occupied: bool) {
+        debug_assert!(index < self.len);
         let word = index / u64::BITS as usize;
         let bit = index % u64::BITS as usize;
-        self.words[word] |= 1_u64 << bit;
+        let bit = 1_u64 << bit;
+        if occupied {
+            self.words[word] |= bit;
+        } else {
+            self.words[word] &= !bit;
+        }
+    }
+
+    fn fill(&mut self, start: usize, end: usize, occupied: bool) {
+        debug_assert!(start <= end && end <= self.len);
+        if start == end {
+            return;
+        }
+        let first_word = start / u64::BITS as usize;
+        let last_word = (end - 1) / u64::BITS as usize;
+        let first_bit = start % u64::BITS as usize;
+        let last_bit = end % u64::BITS as usize;
+        if first_word == last_word {
+            let end_mask = if last_bit == 0 {
+                u64::MAX
+            } else {
+                (1_u64 << last_bit) - 1
+            };
+            let mask = end_mask & (u64::MAX << first_bit);
+            if occupied {
+                self.words[first_word] |= mask;
+            } else {
+                self.words[first_word] &= !mask;
+            }
+            return;
+        }
+
+        let first_mask = u64::MAX << first_bit;
+        if occupied {
+            self.words[first_word] |= first_mask;
+        } else {
+            self.words[first_word] &= !first_mask;
+        }
+        if first_word + 1 < last_word {
+            self.words[first_word + 1..last_word].fill(if occupied { u64::MAX } else { 0 });
+        }
+        let last_mask = if last_bit == 0 {
+            u64::MAX
+        } else {
+            (1_u64 << last_bit) - 1
+        };
+        if occupied {
+            self.words[last_word] |= last_mask;
+        } else {
+            self.words[last_word] &= !last_mask;
+        }
     }
 }
 
@@ -1393,6 +1546,28 @@ mod tests {
         assert_eq!(linear_index([4, 3, 2], [0, 1, 0]), Some(4));
         assert_eq!(linear_index([4, 3, 2], [0, 0, 1]), Some(12));
         assert_eq!(linear_index([4, 3, 2], [4, 0, 0]), None);
+    }
+
+    #[test]
+    fn packed_voxel_fill_handles_partial_and_complete_words() {
+        let mut mask = VoxelBitSet::zeroed(130).unwrap();
+        mask.fill(3, 129, true);
+        for index in 0..130 {
+            assert_eq!(
+                mask.contains(index),
+                (3..129).contains(&index),
+                "unexpected bit at {index}"
+            );
+        }
+
+        mask.fill(63, 66, false);
+        for index in 0..130 {
+            assert_eq!(
+                mask.contains(index),
+                (3..129).contains(&index) && !(63..66).contains(&index),
+                "unexpected bit after clearing {index}"
+            );
+        }
     }
 
     #[test]

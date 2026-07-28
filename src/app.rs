@@ -17,8 +17,8 @@ use crate::{
     },
     io::SaveMode,
     renderer::{
-        FlyMovement, FlyMovementBasis, SceneBridge, VolumePaintCallback, VolumeViewMode,
-        VoxelHighlightKind, leak_compute_supported,
+        FlyCollisionMode, FlyMovement, FlyMovementBasis, SceneBridge, VolumePaintCallback,
+        VolumeViewMode, VoxelHighlightKind, leak_compute_supported,
     },
     volume::{DocumentSummary, SliceAxis, SliceImage, SpatialUnits, Tool},
 };
@@ -881,10 +881,18 @@ impl VoxelInkApp {
                     revision,
                     dimensions,
                     index_to_world,
+                    world_to_index,
+                    occupancy,
                 } => {
                     self.mesh_preview_failed = false;
-                    self.scene
-                        .reset(epoch, revision, dimensions, index_to_world);
+                    self.scene.reset(
+                        epoch,
+                        revision,
+                        dimensions,
+                        index_to_world,
+                        world_to_index,
+                        occupancy,
+                    );
                 }
                 EngineEvent::MeshInvalidated {
                     epoch,
@@ -1779,7 +1787,7 @@ impl VoxelInkApp {
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(
-                                        "Adjust flight movement and voxel surface detail.",
+                                        "Adjust flight movement, collision, and voxel surface detail.",
                                     )
                                     .color(MUTED),
                                 )
@@ -1830,6 +1838,33 @@ impl VoxelInkApp {
                                 }
                             };
                             ui.label(egui::RichText::new(movement_help).small().color(MUTED));
+                            ui.add_space(8.0);
+
+                            let mut collide_with_voxels =
+                                self.scene.fly_collision_mode() == FlyCollisionMode::SolidVoxels;
+                            if ui
+                                .checkbox(
+                                    &mut collide_with_voxels,
+                                    "Collide with solid voxels",
+                                )
+                                .on_hover_text(
+                                    "Prevent the Fly camera from entering occupied voxels while allowing movement along their surfaces",
+                                )
+                                .changed()
+                            {
+                                self.scene.set_fly_collision_mode(if collide_with_voxels {
+                                    FlyCollisionMode::SolidVoxels
+                                } else {
+                                    FlyCollisionMode::PassThrough
+                                });
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "Off by default; collision affects Fly movement only.",
+                                )
+                                .small()
+                                .color(MUTED),
+                            );
                             ui.add_space(8.0);
 
                             let speed_label = ui.add(
@@ -3144,8 +3179,7 @@ impl VoxelInkApp {
                     }
                     if movement.forward != 0.0 || movement.right != 0.0 || movement.world_up != 0.0
                     {
-                        self.scene.fly_move(movement, delta_seconds);
-                        fly_camera_changed = true;
+                        fly_camera_changed |= self.scene.fly_move(movement, delta_seconds);
                     }
                     if speed_wheel != 0.0 {
                         self.scene.adjust_fly_speed(speed_wheel);
@@ -4236,6 +4270,7 @@ impl eframe::App for VoxelInkApp {
         let ctx = ui.ctx().clone();
         self.suppress_fly_vertical_this_frame = false;
         self.process_engine_events(&ctx);
+        let _ = self.scene.reconcile_fly_collision();
         self.enforce_fly_capture_invariants(&ctx);
         let close_requested = ctx.input(|input| input.viewport().close_requested());
         let had_edit_interaction = self.has_edit_interaction();

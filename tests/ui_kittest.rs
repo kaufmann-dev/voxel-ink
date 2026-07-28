@@ -197,7 +197,8 @@ fn repair_panel_guidance_and_controls_stay_inside_the_panel() {
     for label in [
         "Choose the repair workflow that fits the volume.",
         "Paint missing voxels or bridge gaps.",
-        "Adjust flight movement and voxel surface detail.",
+        "Adjust flight movement, collision, and voxel surface detail.",
+        "Collide with solid voxels",
         "Show voxel outlines (V)",
         "Show leak light (C)",
         "Fill empty regions that cannot reach a volume boundary.",
@@ -753,6 +754,13 @@ fn fly_selector_is_accessible_without_resizing_and_expand_stays_independent() {
         view_relative_movement.accesskit_node().toggled(),
         Some(Toggled::False)
     );
+    assert_eq!(
+        harness
+            .get_by_label("Collide with solid voxels")
+            .accesskit_node()
+            .toggled(),
+        Some(Toggled::False)
+    );
 
     let initial_editor = harness.get_by_label("Interactive 3D volume editor").rect();
     view_relative_movement.click_accesskit();
@@ -780,6 +788,33 @@ fn fly_selector_is_accessible_without_resizing_and_expand_stays_independent() {
     assert_eq!(
         harness.get_by_label("Level").accesskit_node().toggled(),
         Some(Toggled::True)
+    );
+
+    harness
+        .get_by_label("Collide with solid voxels")
+        .click_accesskit();
+    harness.step();
+    assert_eq!(
+        harness
+            .get_by_label("Collide with solid voxels")
+            .accesskit_node()
+            .toggled(),
+        Some(Toggled::True)
+    );
+    assert_rect_near(
+        harness.get_by_label("Interactive 3D volume editor").rect(),
+        initial_editor,
+    );
+    harness
+        .get_by_label("Collide with solid voxels")
+        .click_accesskit();
+    harness.step();
+    assert_eq!(
+        harness
+            .get_by_label("Collide with solid voxels")
+            .accesskit_node()
+            .toggled(),
+        Some(Toggled::False)
     );
 
     let fly_speed = harness.get_by_role_and_label(Role::Slider, "Flight speed");

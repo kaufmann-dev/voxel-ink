@@ -3,12 +3,22 @@ mod common;
 use std::{path::PathBuf, time::SystemTime};
 
 use voxel_ink::{
+    VolumeDocument,
     cancel::CancellationToken,
     codecs::SourceVariant,
     volume::{HISTORY_BYTES, HISTORY_TRANSACTIONS, SourceIdentity},
 };
 
 use common::{make_document, try_make_document};
+
+fn shared_values(document: &VolumeDocument) -> Vec<u8> {
+    let shared = document.shared_occupancy();
+    let occupancy = shared.try_read().unwrap();
+    let count = document.geometry().dimensions.into_iter().product::<u32>();
+    (0..count)
+        .map(|index| u8::from(occupancy.occupied(index).unwrap()))
+        .collect()
+}
 
 #[test]
 fn construction_requires_exact_binary_occupancy() {
@@ -32,6 +42,36 @@ fn strokes_update_count_once_and_cancel_restores_every_change() {
     assert_eq!(document.occupied_count(), 1);
     assert_eq!(document.revision(), 1);
     assert!(!document.summary().can_undo);
+}
+
+#[test]
+fn shared_occupancy_stays_coherent_through_preview_cancel_undo_and_redo() {
+    let initial = vec![0, 1, 0, 1, 0];
+    let mut document = make_document([5, 1, 1], initial.clone(), false);
+    let shared = document.shared_occupancy();
+    assert_eq!(shared.dimensions(), [5, 1, 1]);
+    assert_eq!(shared_values(&document), initial);
+
+    document.begin_stroke(1).unwrap();
+    document.apply_stroke_indices([0, 2]).unwrap();
+    assert_eq!(shared_values(&document), [1, 1, 1, 1, 0]);
+    document.cancel_stroke();
+    assert_eq!(shared_values(&document), initial);
+
+    document.begin_stroke(0).unwrap();
+    document.apply_stroke_indices([1, 3]).unwrap();
+    assert_eq!(document.finish_stroke(), Some(2));
+    assert_eq!(shared_values(&document), [0; 5]);
+    assert_eq!(document.undo(), Some(1));
+    assert_eq!(shared_values(&document), initial);
+    assert_eq!(document.redo(), Some(2));
+    assert_eq!(shared_values(&document), [0; 5]);
+
+    let retained = shared.try_read().unwrap();
+    assert!(
+        (0..5).all(|index| retained.occupied(index).is_some_and(|occupied| !occupied)),
+        "previously published handles must observe the live document state"
+    );
 }
 
 #[test]
@@ -164,6 +204,7 @@ fn enclosed_cavity_is_one_undoable_edit_and_is_idempotent() {
         1
     );
     assert_eq!(document.value([2, 2, 2]), Some(1));
+    assert_eq!(shared_values(&document)[index(dimensions, [2, 2, 2])], 1);
     assert_eq!(document.value([0, 0, 0]), Some(0));
     assert_eq!(document.revision(), 2);
     assert_eq!(document.occupied_count(), original_count + 1);
@@ -171,8 +212,10 @@ fn enclosed_cavity_is_one_undoable_edit_and_is_idempotent() {
 
     assert_eq!(document.undo(), Some(1));
     assert_eq!(document.view().occupancy, occupancy);
+    assert_eq!(shared_values(&document)[index(dimensions, [2, 2, 2])], 0);
     assert_eq!(document.redo(), Some(2));
     assert_eq!(document.value([2, 2, 2]), Some(1));
+    assert_eq!(shared_values(&document)[index(dimensions, [2, 2, 2])], 1);
     assert_eq!(
         document
             .fill_enclosed_cavities(&CancellationToken::default())

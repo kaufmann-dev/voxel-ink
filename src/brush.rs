@@ -89,6 +89,33 @@ pub struct SurfaceHit {
     pub face_normal: [i8; 3],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SegmentSurfaceHit {
+    pub voxel: [u32; 3],
+    pub entry_t: f64,
+    pub entry_axes: [bool; 3],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SegmentSweep {
+    Clear,
+    Hit(SegmentSurfaceHit),
+    Indeterminate,
+}
+
+#[derive(Clone, Copy)]
+struct TraversalSurfaceHit {
+    surface: SurfaceHit,
+    entry_t: f64,
+    entry_axes: [bool; 3],
+}
+
+enum TraversalOutcome {
+    Clear,
+    Hit(TraversalSurfaceHit),
+    Indeterminate,
+}
+
 pub fn walk_supercover(
     start: [u32; 3],
     end: [u32; 3],
@@ -442,11 +469,62 @@ pub fn ray_surface_hit(
 fn ray_surface_hit_with_occupancy(
     geometry: &VolumeGeometry,
     world_ray: Ray,
-    mut occupied: impl FnMut(u32) -> Option<bool>,
+    occupied: impl FnMut(u32) -> Option<bool>,
 ) -> Option<SurfaceHit> {
     let dimensions = geometry.dimensions;
     let origin = geometry.world_point_to_index(world_ray.origin);
     let direction = geometry.world_vector_to_index(world_ray.direction);
+    match surface_hit_index_with_occupancy(
+        dimensions,
+        origin,
+        direction,
+        f64::INFINITY,
+        usize::MAX,
+        occupied,
+    ) {
+        TraversalOutcome::Hit(hit) => Some(hit.surface),
+        TraversalOutcome::Clear | TraversalOutcome::Indeterminate => None,
+    }
+}
+
+/// Sweeps a finite index-space segment through occupied voxels.
+///
+/// `direction` is the full segment displacement, so `entry_t` is in `0.0..=1.0`.
+/// An indeterminate result means validation, occupancy access, or the traversal
+/// budget prevented proving the remaining segment clear.
+pub(crate) fn segment_surface_hit_with_occupancy(
+    dimensions: [u32; 3],
+    origin: [f64; 3],
+    direction: [f64; 3],
+    maximum_steps: usize,
+    occupied: impl FnMut(u32) -> Option<bool>,
+) -> SegmentSweep {
+    match surface_hit_index_with_occupancy(
+        dimensions,
+        origin,
+        direction,
+        1.0,
+        maximum_steps,
+        occupied,
+    ) {
+        TraversalOutcome::Clear => SegmentSweep::Clear,
+        TraversalOutcome::Hit(hit) => SegmentSweep::Hit(SegmentSurfaceHit {
+            voxel: hit.surface.voxel,
+            entry_t: hit.entry_t,
+            entry_axes: hit.entry_axes,
+        }),
+        TraversalOutcome::Indeterminate => SegmentSweep::Indeterminate,
+    }
+}
+
+fn surface_hit_index_with_occupancy(
+    dimensions: [u32; 3],
+    origin: [f64; 3],
+    direction: [f64; 3],
+    maximum_t: f64,
+    maximum_steps: usize,
+    mut occupied: impl FnMut(u32) -> Option<bool>,
+) -> TraversalOutcome {
     if direction
         .iter()
         .all(|component| component.abs() <= f64::EPSILON)
@@ -454,15 +532,20 @@ fn ray_surface_hit_with_occupancy(
             .iter()
             .chain(&direction)
             .all(|value| value.is_finite())
+        || maximum_t.is_nan()
+        || maximum_t < 0.0
     {
-        return None;
+        return TraversalOutcome::Indeterminate;
     }
     let bounds_min = [-0.5; 3];
     let bounds_max = dimensions.map(|axis| f64::from(axis) - 0.5);
-    let (entry, exit, entry_axis) = ray_box(origin, direction, bounds_min, bounds_max)?;
+    let Some((entry, exit, entry_axis)) = ray_box(origin, direction, bounds_min, bounds_max) else {
+        return TraversalOutcome::Clear;
+    };
+    let exit = exit.min(maximum_t);
     let start_t = entry.max(0.0);
     if start_t > exit {
-        return None;
+        return TraversalOutcome::Clear;
     }
     let epsilon = 1.0e-9;
     let position = [
@@ -492,30 +575,55 @@ fn ray_surface_hit_with_occupancy(
             t_delta[axis] = 1.0 / direction[axis].abs();
         }
     }
-    let initial = checked_voxel(voxel, dimensions)?;
-    let initial_index = linear_index(dimensions, initial)?;
-    let seeking_exit = entry < 0.0 && occupied(initial_index)?;
+    let Some(initial) = checked_voxel(voxel, dimensions) else {
+        return TraversalOutcome::Indeterminate;
+    };
+    let Some(initial_index) = linear_index(dimensions, initial) else {
+        return TraversalOutcome::Indeterminate;
+    };
+    let Some(initial_occupied) = occupied(initial_index) else {
+        return TraversalOutcome::Indeterminate;
+    };
+    let seeking_exit = entry < 0.0 && initial_occupied;
     let mut previous = None;
     let mut face_normal = [0_i8; 3];
+    let mut current_entry_t = start_t;
+    let mut current_entry_axes = [false; 3];
     if entry >= 0.0
         && let Some(axis) = entry_axis
     {
         face_normal[axis] = if direction[axis] > 0.0 { -1 } else { 1 };
+        current_entry_axes[axis] = true;
     }
+    let mut traversed = 0_usize;
     loop {
-        let current = checked_voxel(voxel, dimensions)?;
-        let index = linear_index(dimensions, current)?;
-        let current_occupied = occupied(index)?;
+        if traversed == maximum_steps {
+            return TraversalOutcome::Indeterminate;
+        }
+        traversed = traversed.saturating_add(1);
+        let Some(current) = checked_voxel(voxel, dimensions) else {
+            return TraversalOutcome::Clear;
+        };
+        let Some(index) = linear_index(dimensions, current) else {
+            return TraversalOutcome::Indeterminate;
+        };
+        let Some(current_occupied) = occupied(index) else {
+            return TraversalOutcome::Indeterminate;
+        };
         if current_occupied && !seeking_exit {
-            return Some(SurfaceHit {
-                voxel: current,
-                exterior: previous,
-                face_normal,
+            return TraversalOutcome::Hit(TraversalSurfaceHit {
+                surface: SurfaceHit {
+                    voxel: current,
+                    exterior: previous,
+                    face_normal,
+                },
+                entry_t: current_entry_t,
+                entry_axes: current_entry_axes,
             });
         }
         let next_t = t_max.into_iter().fold(f64::INFINITY, f64::min);
         if next_t > exit {
-            return None;
+            return TraversalOutcome::Clear;
         }
         let tolerance = f64::EPSILON * next_t.abs().max(1.0) * 8.0;
         let tied = t_max.map(|value| (value - next_t).abs() <= tolerance);
@@ -528,7 +636,13 @@ fn ray_surface_hit_with_occupancy(
         if seeking_exit && current_occupied {
             let next = checked_voxel(voxel, dimensions);
             let next_is_occupied = if let Some(next) = next {
-                occupied(linear_index(dimensions, next)?)?
+                let Some(index) = linear_index(dimensions, next) else {
+                    return TraversalOutcome::Indeterminate;
+                };
+                let Some(occupied) = occupied(index) else {
+                    return TraversalOutcome::Indeterminate;
+                };
+                occupied
             } else {
                 false
             };
@@ -537,7 +651,8 @@ fn ray_surface_hit_with_occupancy(
                 let mut outward_axis = tied
                     .iter()
                     .enumerate()
-                    .find_map(|(axis, &is_tied)| is_tied.then_some(axis))?;
+                    .find_map(|(axis, &is_tied)| is_tied.then_some(axis))
+                    .expect("a voxel traversal boundary crosses at least one axis");
                 for axis in 0..3 {
                     if !tied[axis] {
                         continue;
@@ -548,23 +663,37 @@ fn ray_surface_hit_with_occupancy(
                         outward_axis = axis;
                         continue;
                     };
-                    let candidate_index = linear_index(dimensions, candidate)?;
-                    if !occupied(candidate_index)? {
+                    let Some(candidate_index) = linear_index(dimensions, candidate) else {
+                        return TraversalOutcome::Indeterminate;
+                    };
+                    let Some(candidate_occupied) = occupied(candidate_index) else {
+                        return TraversalOutcome::Indeterminate;
+                    };
+                    if !candidate_occupied {
                         exterior = Some(candidate);
                         outward_axis = axis;
                         break;
                     }
                 }
                 let mut face_normal = [0; 3];
-                face_normal[outward_axis] = i8::try_from(step[outward_axis]).ok()?;
-                return Some(SurfaceHit {
-                    voxel: current,
-                    exterior,
-                    face_normal,
+                let Ok(normal) = i8::try_from(step[outward_axis]) else {
+                    return TraversalOutcome::Indeterminate;
+                };
+                face_normal[outward_axis] = normal;
+                return TraversalOutcome::Hit(TraversalSurfaceHit {
+                    surface: SurfaceHit {
+                        voxel: current,
+                        exterior,
+                        face_normal,
+                    },
+                    entry_t: next_t,
+                    entry_axes: tied,
                 });
             }
             continue;
         }
+        current_entry_t = next_t;
+        current_entry_axes = tied;
         face_normal = [0; 3];
         previous = None;
         for axis in 0..3 {
@@ -576,10 +705,18 @@ fn ray_surface_hit_with_occupancy(
             let Some(neighbor) = checked_voxel(neighbor, dimensions) else {
                 continue;
             };
-            let neighbor_index = linear_index(dimensions, neighbor)?;
-            if !occupied(neighbor_index)? {
+            let Some(neighbor_index) = linear_index(dimensions, neighbor) else {
+                return TraversalOutcome::Indeterminate;
+            };
+            let Some(neighbor_occupied) = occupied(neighbor_index) else {
+                return TraversalOutcome::Indeterminate;
+            };
+            if !neighbor_occupied {
                 previous = Some(neighbor);
-                face_normal[axis] = i8::try_from(-step[axis]).ok()?;
+                let Ok(normal) = i8::try_from(-step[axis]) else {
+                    return TraversalOutcome::Indeterminate;
+                };
+                face_normal[axis] = normal;
                 break;
             }
         }

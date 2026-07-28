@@ -25,8 +25,8 @@ use crate::{
         invalidated_chunks_for_index_spans, invalidated_chunks_for_indices, mesh_chunk,
     },
     volume::{
-        ChangedVoxels, DocumentSummary, LeakDistanceField, Matrix4, SliceAxis, SliceImage, Tool,
-        VolumeDocument, compute_leak_distance, linear_index,
+        ChangedVoxels, DocumentSummary, LeakDistanceField, Matrix4, SharedOccupancy, SliceAxis,
+        SliceImage, Tool, VolumeDocument, compute_leak_distance, linear_index,
     },
 };
 
@@ -249,6 +249,8 @@ pub enum EngineEvent {
         revision: u64,
         dimensions: [u32; 3],
         index_to_world: Matrix4,
+        world_to_index: Matrix4,
+        occupancy: SharedOccupancy,
     },
     MeshInvalidated {
         epoch: u64,
@@ -2012,6 +2014,8 @@ impl EngineState {
         let dimensions = document.geometry().dimensions;
         let revision = document.revision();
         let index_to_world = document.geometry().index_to_world;
+        let world_to_index = document.geometry().world_to_index;
+        let occupancy = document.shared_occupancy();
         self.mesh_scan_grid = chunk_grid(dimensions);
         self.mesh_dirty.configure(self.mesh_scan_grid);
         self.mesh_scan_next = 0;
@@ -2023,6 +2027,8 @@ impl EngineState {
             revision,
             dimensions,
             index_to_world,
+            world_to_index,
+            occupancy,
         });
         if let Some((cached_revision, field)) = self.leak_distance_field.clone()
             && cached_revision == revision
