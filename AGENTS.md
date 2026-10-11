@@ -34,4 +34,4 @@ Run `shellcheck` for changed packaging scripts. Validate changed desktop metadat
 
 ## Packaging
 
-Build `target/release/voxel-ink` before invoking packaging scripts. AppImage inputs live under `packaging/appimage/`; Fedora RPM inputs live under `packaging/rpm/` and are built with Podman. Keep the package version synchronized across Cargo and packaging metadata, and keep the application ID `app.voxelink.editor` consistent across the desktop entry, MIME definition, metainfo, icon, and native window.
+Build `target/release/voxel-ink` before invoking packaging scripts. AppImage inputs live under `packaging/appimage/`; Fedora RPM inputs live under `packaging/rpm/` and are built with Podman. Keep the package version synchronized across Cargo and packaging metadata (CI enforces this and requires release tags to match), and keep the application ID `app.voxelink.editor` consistent across the desktop entry, MIME definition, metainfo, icon, and native window.

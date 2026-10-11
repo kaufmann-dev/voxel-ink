@@ -56,5 +56,5 @@ xmllint --noout %{SOURCE2} %{SOURCE3}
 %{_datadir}/icons/hicolor/512x512/apps/%{app_id}.png
 
 %changelog
-* Sat Jul 18 2026 VoxelInk maintainers <maintainers@voxelink.invalid> - 0.1.0-1
+* Sun Oct 11 2026 VoxelInk maintainers <maintainers@voxelink.invalid> - 0.1.0-1
 - Build the first native Linux package

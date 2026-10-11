@@ -15,9 +15,29 @@ VoxelInk is a native, local-only Linux editor for binary voxel volumes. It combi
 
 VoxelInk treats every nonzero source value as occupied. Saving a non-binary source replaces its original scalar values with canonical binary values after showing a warning. Save As stays within the document's existing format family; it is not a format converter. Detached or multivolume NIfTI data and multi-model or colored MagicaVoxel editing are not supported.
 
-## Install for your user
+## Install a release
 
-The installer builds VoxelInk from source and places it below `~/.local`, so it does not need `sudo`. When `~/.local/bin` comes before `/usr/bin` in `PATH`, this user copy takes precedence over a system package.
+On Fedora x86_64, install or update to the latest release with dnf. The package adds the `voxel-ink` command, application launcher, icon, and desktop metadata:
+
+```sh
+sudo dnf install https://github.com/kaufmann-dev/voxel-ink/releases/latest/download/voxel-ink.x86_64.rpm
+```
+
+Run the same command again to update after a new release. To uninstall, run `sudo dnf remove voxel-ink`.
+
+On other x86_64 Linux distributions, download and run the AppImage:
+
+```sh
+curl -fLO https://github.com/kaufmann-dev/voxel-ink/releases/latest/download/voxel-ink-x86_64.AppImage
+chmod +x voxel-ink-x86_64.AppImage
+./voxel-ink-x86_64.AppImage
+```
+
+To uninstall the AppImage, delete the file.
+
+## Install from source
+
+The installer builds VoxelInk from source and places it below `~/.local`, so it does not need `sudo`. When `~/.local/bin` comes before `/usr/bin` in `PATH`, this user copy takes precedence over the RPM package.
 
 On Fedora, install the build and desktop-integration prerequisites once, then set up Rust and open a new terminal:
 
@@ -104,3 +124,14 @@ cargo bench --locked --bench hot_paths -- --noplot
 ```
 
 The Linux CI workflow also builds an x86_64 AppImage, builds a Fedora RPM with Podman, and smoke-tests the native application.
+
+## Publish a release
+
+Set the new version in `Cargo.toml`, `packaging/rpm/voxel-ink.spec` (including a `%changelog` entry), and the first `<release>` in `packaging/linux/app.voxelink.editor.metainfo.xml`. After the commit is on `main`, tag and push it:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The Linux workflow verifies that the tag matches all three versions, builds the RPM and AppImage, and publishes them to a GitHub release with the stable asset names used above.
