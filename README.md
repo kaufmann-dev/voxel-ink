@@ -17,9 +17,9 @@ VoxelInk treats every nonzero source value as occupied. Saving a non-binary sour
 
 ## Install for your user
 
-The following source installation places VoxelInk itself below `~/.local`, so it does not need `sudo`. When `~/.local/bin` comes before `/usr/bin` in `PATH`, this user copy takes precedence over a system package. Run the project commands from a VoxelInk checkout.
+The installer builds VoxelInk from source and places it below `~/.local`, so it does not need `sudo`. When `~/.local/bin` comes before `/usr/bin` in `PATH`, this user copy takes precedence over a system package.
 
-On Fedora, install the build and desktop-integration prerequisites once:
+On Fedora, install the build and desktop-integration prerequisites once, then set up Rust and open a new terminal:
 
 ```sh
 sudo dnf install \
@@ -28,10 +28,10 @@ sudo dnf install \
   libXrandr-devel libxkbcommon-devel make mesa-libGL-devel \
   pkgconf-pkg-config rustup shared-mime-info vulkan-loader-devel \
   wayland-devel
-rustup toolchain install 1.96.0 --profile minimal
+rustup-init -y --profile minimal --default-toolchain 1.96.0
 ```
 
-Clone the project if necessary, then install or replace the current user copy:
+Clone the project, then install or replace the current user copy:
 
 ```sh
 git clone https://github.com/kaufmann-dev/voxel-ink.git
@@ -46,10 +46,16 @@ command -v voxel-ink
 # Expected: /home/your-user/.local/bin/voxel-ink
 ```
 
-If the command is not found, add `~/.local/bin` to your shell's `PATH` and open a new terminal:
+If the installer warns that `~/.local/bin` is not first in `PATH`, add it to your shell profile and open a new terminal:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
+```
+
+To remove the executable, launcher, icon, metadata, and file associations, run:
+
+```sh
+./install --uninstall
 ```
 
 ## Start VoxelInk
